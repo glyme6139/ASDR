@@ -13,6 +13,10 @@ import numpy as np
 from PySide6.QtCore import QObject, QRectF, QTimer, Signal
 from PySide6.QtWidgets import QWidget, QVBoxLayout
 import pyqtgraph as pg
+import logging
+import time
+
+logger = logging.getLogger(__name__)
 
 VFO_COLORS = [
     '#00ffff',  # cyan
@@ -431,7 +435,7 @@ class VisualizationPanel(QWidget):
     The X axes are linked — panning/zooming one tracks the other.
     """
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, display_buffers=None):
         super().__init__(parent)
 
         layout = QVBoxLayout()
@@ -446,11 +450,11 @@ class VisualizationPanel(QWidget):
         spec_plot = self._glw.addPlot(row=0, col=0)
         # spec_plot.setDecimationMode(pg.ViewBox.DecimationMode.Subsample)
         # spec_plot.setDownsampling(ds=8, auto=False)
-        self._glw.ci.layout.setRowStretchFactor(0, 1)   # 10 %
+        self._glw.ci.layout.setRowStretchFactor(0, 4)   # 40 %
 
 
         wf_plot = self._glw.addPlot(row=1, col=0)
-        self._glw.ci.layout.setRowStretchFactor(1, 9)   # 90 %
+        self._glw.ci.layout.setRowStretchFactor(1, 6)   # 60 %
 
         # Link X so zoom/pan in one view mirrors the other
         wf_plot.setXLink(spec_plot)
@@ -460,6 +464,8 @@ class VisualizationPanel(QWidget):
 
         self._pending_spectrum:  Optional[np.ndarray] = None
         self._pending_waterfall: Optional[np.ndarray] = None
+        # Optional shared buffers (dict with 'spectrum' and 'waterfall' SharedLatest)
+        self._display_buffers = display_buffers
 
         self._render_timer = QTimer(self)
         self._render_timer.setInterval(50)   # 20 fps cap — rendering never blocks signal delivery
@@ -477,12 +483,36 @@ class VisualizationPanel(QWidget):
         self._pending_waterfall = data
 
     def _flush_pending(self):
+        t0 = time.monotonic()
+        # First, prefer data from shared buffers if available (producer writes latest).
+        if self._display_buffers:
+            try:
+                sb = self._display_buffers.get('spectrum')
+                if sb is not None:
+                    latest = sb.get_and_clear()
+                    if latest is not None:
+                        self.spectrum.update_spectrum(latest)
+                        self._pending_spectrum = None
+
+                wb = self._display_buffers.get('waterfall')
+                if wb is not None:
+                    latest_w = wb.get_and_clear()
+                    if latest_w is not None:
+                        self.waterfall.update_waterfall(latest_w)
+                        self._pending_waterfall = None
+            except Exception:
+                # Fall back to existing pending buffers on error
+                pass
+
         if self._pending_spectrum is not None:
             self.spectrum.update_spectrum(self._pending_spectrum)
             self._pending_spectrum = None
         if self._pending_waterfall is not None:
             self.waterfall.update_waterfall(self._pending_waterfall)
             self._pending_waterfall = None
+        dt = (time.monotonic() - t0) * 1000.0
+        if dt > 30.0:
+            logger.warning(f"[Visualization] render slow: {dt:.1f} ms (spectrum/waterfall update)")
 
     # ------------------------------------------------------------------
     # Proxy helpers so callers don't need to reach into .spectrum/.waterfall

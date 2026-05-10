@@ -301,7 +301,19 @@ class VFO:
 
         audio = np.clip(audio, -1.0, 1.0).astype(np.float32)
         self._update_spectrum(audio)
-        return audio, []
+
+        # Run registered decoders on the audio (and optionally IQ)
+        decoder_results = []
+        for decoder in self.decoders:
+            try:
+                # Pass audio and optionally IQ to decoder
+                result = decoder.process(iq, audio=audio)
+                if result is not None:
+                    decoder_results.append(result)
+            except Exception as e:
+                logger.error(f"Decoder {decoder.name} error: {e}", exc_info=True)
+
+        return audio, decoder_results
 
     # ------------------------------------------------------------------
     # Channel filter (I/Q separately to keep dtype simple)

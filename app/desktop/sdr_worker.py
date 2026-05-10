@@ -23,6 +23,7 @@ import numpy as np
 from scipy.signal import resample as scipy_resample
 from PySide6.QtCore import QThread, Signal
 import logging
+from .audio_output import CHUNK, AUDIO_RATE
 
 logger = logging.getLogger(__name__)
 
@@ -44,10 +45,12 @@ class SDRWorkerThread(QThread):
     DEMO_SAMPLE_RATE = 96_000
     DEMO_TICK        = 0.05
 
-    def __init__(self, vfo_manager=None, audio_mixer=None, parent=None):
+    def __init__(self, vfo_manager=None, audio_mixer=None, display_buffers=None, parent=None):
         super().__init__(parent)
         self.vfo_manager = vfo_manager
         self.audio_mixer = audio_mixer
+        # Optional dict of SharedLatest buffers: {'spectrum': SharedLatest, 'waterfall': SharedLatest}
+        self.display_buffers = display_buffers
         self.receiver    = None
         self.running     = False
 
@@ -62,6 +65,11 @@ class SDRWorkerThread(QThread):
         self._audio_target  = 20   # 48 kHz samples per FFT block
 
         self._cmd_queue: queue.Queue = queue.Queue()
+        # Per-VFO audio accumulation to reduce push_audio call rate.
+        # Maps vfo_id -> list[np.ndarray] (pending fragments)
+        self._vfo_audio_accum = {}
+        # Maps vfo_id -> float (cumulative fractional samples for rate correction)
+        self._vfo_frac_samples = {}
 
     # ------------------------------------------------------------------
     # Thread entry point
@@ -213,6 +221,7 @@ class SDRWorkerThread(QThread):
     # ------------------------------------------------------------------
 
     def _process_block(self, block: np.ndarray):
+        start_t = time.monotonic()
         sr     = self._sample_rate
         N      = FFT_SIZE
         bin_hz = sr / N
@@ -225,8 +234,20 @@ class SDRWorkerThread(QThread):
         if self._display_tick >= self._display_skip:
             self._display_tick = 0
             spectrum = (10.0 * np.log10(np.abs(fft_out) ** 2 + 1e-10)).astype(np.float32)
-            self.spectrum_updated.emit(spectrum)
-            self.waterfall_updated.emit(self._make_waterfall_row(spectrum))
+            # Prefer writing to shared buffers if provided to avoid filling the Qt event queue.
+            if self.display_buffers:
+                try:
+                    self.display_buffers.get('spectrum') and self.display_buffers['spectrum'].set(spectrum)
+                    self.display_buffers.get('waterfall') and self.display_buffers['waterfall'].set(
+                        self._make_waterfall_row(spectrum)
+                    )
+                except Exception:
+                    # Fall back to Qt signals on unexpected error
+                    self.spectrum_updated.emit(spectrum)
+                    self.waterfall_updated.emit(self._make_waterfall_row(spectrum))
+            else:
+                self.spectrum_updated.emit(spectrum)
+                self.waterfall_updated.emit(self._make_waterfall_row(spectrum))
 
         # ---- Audio: per-VFO channelizer ----
         if self.vfo_manager is None:
@@ -243,10 +264,18 @@ class SDRWorkerThread(QThread):
             audio, dec_results = vfo.process_narrowband_iq(iq_nb, nb_sr, audio_target)
 
             if audio is not None and len(audio) > 0:
-                self._push_audio(vfo.id, audio)
+                self._accumulate_and_push(vfo.id, audio)
 
             for result in dec_results:
                 self.decoder_result.emit(vfo.id, result.decoder_name, str(result.data))
+
+        # Measure total time for this block (FFT + display prep + per-VFO work).
+        try:
+            elapsed = (time.monotonic() - start_t) * 1000.0
+            # if elapsed > 10.0:
+                # logger.warning(f"[SDRWorker] slow block processing: {elapsed:.1f} ms")
+        except Exception:
+            pass
 
     def _extract_vfo_iq(self, fft_shifted, vfo, sr, N, bin_hz, center_freq):
         """
@@ -309,6 +338,57 @@ class SDRWorkerThread(QThread):
             self.audio_mixer.push_audio(vfo_id, audio)
         else:
             self.audio_ready.emit(vfo_id, audio)
+
+    def _accumulate_and_push(self, vfo_id: int, audio: np.ndarray):
+        """Accumulate small audio fragments per-VFO and push CHUNK blocks at 48 kHz.
+
+        Fragments arrive at varying rates (~40–45 kHz); when accumulated to CHUNK
+        size, we resample once to exactly 48 kHz. This is much cheaper than
+        per-fragment resampling and stays in sync automatically.
+        """
+        if audio is None or len(audio) == 0:
+            return
+
+        frag = np.asarray(audio, dtype=np.float32)
+
+        # Initialize accumulator state for this VFO if needed
+        if vfo_id not in self._vfo_audio_accum:
+            self._vfo_audio_accum[vfo_id] = []
+            self._vfo_frac_samples[vfo_id] = 0.0  # Track the last fragment's native sr
+
+        # Store fragment and estimate its native sample rate
+        self._vfo_audio_accum[vfo_id].append(frag)
+
+        total_len = sum(len(f) for f in self._vfo_audio_accum[vfo_id])
+        if total_len < CHUNK:
+            return
+
+        # Concatenate accumulated fragments
+        buf = np.concatenate(self._vfo_audio_accum[vfo_id])
+
+        # Estimate native sample rate from the accumulated length.
+        # Heuristic: assume each FFT block produces ~9 samples at ~43.9 kHz.
+        # With CHUNK=2048, we need ~227 FFT blocks, each taking ~0.2 ms,
+        # so total time ≈ 45 ms. Thus est_sr ≈ CHUNK / (total_len / AUDIO_RATE)
+        # But simpler: assume all fragments are at ~43900 Hz (hardcode based on SDR rate)
+        est_sr = 43900.0
+
+        # Resample to exactly AUDIO_RATE (48 kHz)
+        n_out = max(CHUNK, round(len(buf) * AUDIO_RATE / est_sr))
+        resampled = scipy_resample(buf, n_out)
+
+        # Emit CHUNK-sized blocks from resampled data
+        pos = 0
+        while pos + CHUNK <= len(resampled):
+            chunk = resampled[pos:pos + CHUNK].astype(np.float32)
+            self._push_audio(vfo_id, chunk)
+            pos += CHUNK
+
+        # Keep remainder
+        if pos < len(resampled):
+            self._vfo_audio_accum[vfo_id] = [resampled[pos:].astype(np.float32)]
+        else:
+            self._vfo_audio_accum[vfo_id] = []
 
     # ------------------------------------------------------------------
     # Display helpers

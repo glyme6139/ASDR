@@ -64,7 +64,7 @@ class POCSAGDecoder(BaseAudioDecoder):
         try:
             # Frame sync: 0xAAAAAAAA (32 bits of 10101010 pattern)
             # Followed by frame info and 8 codewords
-            
+            logger.debug(f"Attempting to decode frame with {len(frame_bits)} bits")
             # Look for frame sync
             frame_sync = 0xAAAAAAAA
             first_32 = 0
@@ -102,6 +102,7 @@ class POCSAGDecoder(BaseAudioDecoder):
                     })
             
             if messages:
+                logger.debug(f"Decoded POCSAG frame {self.frame_count}: code={frame_code}, messages={messages}")
                 return DecoderResult(
                     decoder_name="POCSAG",
                     timestamp=time.time(),

@@ -12,6 +12,7 @@ from .control_panels import ControlPanel
 from .sdr_worker import SDRWorkerThread
 from .audio_output import AudioMixer
 from app.sdr.vfo import VFOManager
+from .display_buffers import SharedLatest
 
 logger = logging.getLogger(__name__)
 
@@ -33,9 +34,18 @@ class ASURMainWindow(QMainWindow):
             max_vfos=10,
         )
         self.audio_mixer = AudioMixer()
+
+        # Shared latest buffers for display data — SDR writes latest arrays,
+        # GUI polls them at its own pace to avoid Qt event-queue overload.
+        self._display_buffers = {
+            'spectrum': SharedLatest(),
+            'waterfall': SharedLatest(),
+        }
+
         self.sdr_worker = SDRWorkerThread(
             vfo_manager=self.vfo_manager,
             audio_mixer=self.audio_mixer,
+            display_buffers=self._display_buffers,
         )
 
         self._initUI()
@@ -62,7 +72,7 @@ class ASURMainWindow(QMainWindow):
         main_layout.setContentsMargins(4, 4, 4, 4)
         main_layout.setSpacing(4)
 
-        self.vis_panel = VisualizationPanel()
+        self.vis_panel = VisualizationPanel(display_buffers=self._display_buffers)
         main_layout.addWidget(self.vis_panel, stretch=2)
 
         self.ctrl_panel = ControlPanel()
@@ -84,8 +94,9 @@ class ASURMainWindow(QMainWindow):
         # regardless of whether the signal is emitted from the QThread worker,
         # the HackRF callback thread, or any other background thread.
         Q = Qt.QueuedConnection
-        self.sdr_worker.spectrum_updated.connect(self._on_spectrum_update, Q)
-        self.sdr_worker.waterfall_updated.connect(self._on_waterfall_update, Q)
+        # Display updates are provided via shared buffers polled by the
+        # VisualizationPanel timer; avoid connecting high-frequency arrays
+        # through Qt signals which can overwhelm the event queue.
         self.sdr_worker.device_status_changed.connect(self._on_device_status, Q)
         self.sdr_worker.error_occurred.connect(self._on_error, Q)
 
