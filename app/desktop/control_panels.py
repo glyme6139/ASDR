@@ -7,14 +7,50 @@ from typing import Dict, Optional
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QSlider,
-    QPushButton, QComboBox, QDoubleSpinBox, QGroupBox,
+    QPushButton, QComboBox, QGroupBox,
     QListWidget, QListWidgetItem, QTextEdit, QTabWidget, QSizePolicy,
     QCheckBox,
 )
+from .widgets import AcceptCommaDoubleSpinBox
+QDoubleSpinBox = AcceptCommaDoubleSpinBox
 from PySide6.QtCore import Qt, Signal
 import logging
 
 logger = logging.getLogger(__name__)
+
+from PySide6.QtGui import QValidator
+
+
+# Subclass QDoubleSpinBox to accept both comma and dot as decimal separators.
+class AcceptCommaDoubleSpinBox(QDoubleSpinBox):
+    def valueFromText(self, text: str) -> float:
+        # Convert comma to dot before parsing
+        t = text.replace(',', '.')
+        try:
+            return float(t)
+        except Exception:
+            return super().valueFromText(t)
+
+    def validate(self, text: str, pos: int):
+        # Accept empty or a lone '-' as intermediate
+        if text == '' or text == '-' or text == ',':
+            return QValidator.Intermediate, text, pos
+        t = text.replace(',', '.')
+        try:
+            # allow numbers with trailing decimal separator
+            if t.endswith('.'):
+                float(t[:-1])
+                return QValidator.Intermediate, text, pos
+            val = float(t)
+        except Exception:
+            return QValidator.Invalid, text, pos
+        if self.minimum() <= val <= self.maximum():
+            return QValidator.Acceptable, text, pos
+        return QValidator.Intermediate, text, pos
+
+
+# Use our subclass throughout this module wherever QDoubleSpinBox is used.
+QDoubleSpinBox = AcceptCommaDoubleSpinBox
 
 DECODER_NAMES = ['POCSAG', 'RDS', 'AIS', 'ADSB']
 

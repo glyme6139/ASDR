@@ -15,7 +15,6 @@ from scipy import signal
 from scipy.signal import resample_poly, firwin, lfilter
 from scipy.signal import resample as scipy_resample
 import logging
-from app.sdr.fm_demod import FMDemod, FMDemodConfig
 
 logger = logging.getLogger(__name__)
 
@@ -61,10 +60,10 @@ class VFO:
         # Stateful DSP — all preserved across process_iq() calls
         self._osc_phase:   float       = 0.0                    # frequency-shift oscillator
         self._prev_sample: np.complex64 = np.complex64(1 + 0j)  # FM discriminator (legacy)
+        # Whether this VFO should produce audio. When False, demodulation
+        # and audio resampling are skipped (useful for mute to save CPU).
+        self.audio_enabled: bool = True
         
-        # High-performance FM demodulator (proven in testpocsag_realtime.py)
-        self._fm_demod: Optional[FMDemod] = None
-
         # Filter coefficients and state (built by _build_filters)
         self._ch_filter: Optional[np.ndarray] = None
         self._ch_zi_i:   Optional[np.ndarray] = None
@@ -180,6 +179,11 @@ class VFO:
     def set_volume(self, volume: float):
         self.settings.volume = max(0.0, min(1.0, volume))
 
+    def set_audio_enabled(self, enabled: bool):
+        """Enable or disable audio production for this VFO."""
+        self.audio_enabled = bool(enabled)
+        logger.debug("VFO %s: audio_enabled=%s", self.id, self.audio_enabled)
+
     def set_squelch(self, level: float, enabled: bool = True):
         self.settings.squelch_level   = level
         self.settings.squelch_enabled = enabled
@@ -200,6 +204,8 @@ class VFO:
 
     def process_iq(self, iq_data: np.ndarray) -> Tuple[Optional[np.ndarray], list]:
         if not self.settings.enabled:
+            return None, []
+        if not self.audio_enabled:
             return None, []
 
         # 1. Coherent frequency shift (maintains phase across block boundaries)
@@ -273,6 +279,8 @@ class VFO:
         combination regardless of VFO bandwidth.
         """
         if not self.settings.enabled or len(iq) == 0:
+            return None, []
+        if not self.audio_enabled:
             return None, []
 
         # Signal strength + squelch (on the already-narrow IQ)
@@ -376,55 +384,11 @@ class VFO:
         return np.angle(iq_ext[1:] * np.conj(iq_ext[:-1]))
 
     def _demod_fm(self, iq_data: np.ndarray) -> np.ndarray:
-        """FM demodulation using high-performance atan2-based discriminator at IF rate."""
-        # Initialize or rebuild FM demodulator if needed
-        if self._fm_demod is None:
-            logger.debug("VFO %s: creating FMDemod with proc_rate=%s bandwidth=%s", self.id, self._proc_rate, self.settings.bandwidth)
-            cfg = FMDemodConfig(
-                sample_rate=self._proc_rate,
-                audio_rate=AUDIO_RATE,
-                if_rate=50_000,
-                bandwidth=self.settings.bandwidth,
-                channel_lpf_cutoff=12_000,
-                post_demod_lpf_cutoff=6_000,
-                decim_factor=1
-            )
-            self._fm_demod = FMDemod(cfg)
-            logger.debug("VFO %s: FMDemod created: resample sample->if %s/%s if->audio %s/%s", 
-                         self.id, self._fm_demod.resamp_if_up, self._fm_demod.resamp_if_down,
-                         self._fm_demod.resamp_audio_up, self._fm_demod.resamp_audio_down)
-        
-        # Rebuild if bandwidth changed significantly
-        if abs(self.settings.bandwidth - self._fm_demod.cfg.bandwidth) > 100:
-            logger.debug("VFO %s: rebuilding FMDemod due to bandwidth change %s->%s", 
-                         self.id, self._fm_demod.cfg.bandwidth, self.settings.bandwidth)
-            cfg = FMDemodConfig(
-                sample_rate=self._proc_rate,
-                audio_rate=AUDIO_RATE,
-                if_rate=50_000,
-                bandwidth=self.settings.bandwidth,
-                channel_lpf_cutoff=12_000,
-                post_demod_lpf_cutoff=6_000,
-                decim_factor=1
-            )
-            self._fm_demod = FMDemod(cfg)
-            logger.debug("VFO %s: FMDemod rebuilt: resample sample->if %s/%s if->audio %s/%s", 
-                         self.id, self._fm_demod.resamp_if_up, self._fm_demod.resamp_if_down,
-                         self._fm_demod.resamp_audio_up, self._fm_demod.resamp_audio_down)
-        
-        # Process with high-performance pipeline
-        audio_48k = self._fm_demod.process(iq_data)
-        
-        # Resample from 48 kHz to proc_rate if needed (should be a no-op in most cases)
-        if abs(self._proc_rate - AUDIO_RATE) > 100:
-            try:
-                ratio_up, ratio_down = self._compute_resample_ratio(int(AUDIO_RATE), int(self._proc_rate))
-                audio = resample_poly(audio_48k, ratio_up, ratio_down)
-                return audio.astype(np.float32)
-            except Exception:
-                return audio_48k
-        
-        return audio_48k
+        fm_rad = self._fm_discriminator(iq_data)
+        max_dev = 2.0 * np.pi * (self.settings.bandwidth / 2.0) / self._proc_rate
+        audio = fm_rad / max(max_dev, 1e-9)
+        audio -= np.mean(audio)
+        return np.clip(audio, -1.0, 1.0).astype(np.float32)
 
     def _demod_wfm(self, iq_data: np.ndarray) -> np.ndarray:
         fm_rad  = self._fm_discriminator(iq_data)

@@ -14,6 +14,8 @@ from .audio_output import AudioMixer
 from app.sdr.vfo import VFOManager
 from .display_buffers import SharedLatest
 
+from PySide6.QtWidgets import QWidget, QVBoxLayout, QLabel, QTextEdit
+from PySide6.QtCore import Qt
 logger = logging.getLogger(__name__)
 
 DEFAULT_CENTER_HZ = 100e6
@@ -68,17 +70,66 @@ class ASURMainWindow(QMainWindow):
         central = QWidget()
         self.setCentralWidget(central)
 
-        main_layout = QHBoxLayout()
-        main_layout.setContentsMargins(4, 4, 4, 4)
-        main_layout.setSpacing(4)
+        # Top area: visualization + controls
+        top_widget = QWidget()
+        top_layout = QHBoxLayout()
+        top_layout.setContentsMargins(4, 4, 4, 4)
+        top_layout.setSpacing(4)
 
         self.vis_panel = VisualizationPanel(display_buffers=self._display_buffers)
-        main_layout.addWidget(self.vis_panel, stretch=2)
+        top_layout.addWidget(self.vis_panel, stretch=2)
 
         self.ctrl_panel = ControlPanel()
-        main_layout.addWidget(self.ctrl_panel, stretch=1)
+        top_layout.addWidget(self.ctrl_panel, stretch=1)
 
-        central.setLayout(main_layout)
+        top_widget.setLayout(top_layout)
+
+        # Bottom area: aggregated decoder output panel
+        self.decoder_panel = None
+
+
+        class DecoderAggregator(QWidget):
+            def __init__(self, parent=None):
+                from PySide6.QtWidgets import QVBoxLayout
+                super().__init__(parent)
+                layout = QVBoxLayout()
+                layout.setContentsMargins(4, 4, 4, 4)
+                layout.setSpacing(4)
+                header = QLabel("Decoder Output (aggregated)")
+                header.setAlignment(Qt.AlignLeft)
+                layout.addWidget(header)
+                self.output = QTextEdit()
+                self.output.setReadOnly(True)
+                layout.addWidget(self.output)
+                self.setLayout(layout)
+
+            def append(self, vfo_id: int, decoder_name: str, text: str):
+                import time
+                ts = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
+                line = f"[{ts}] VFO{vfo_id} [{decoder_name}] {text}"
+                self.output.append(line)
+                # Limit to ~1000 lines
+                doc = self.output.document()
+                if doc.blockCount() > 1000:
+                    cursor = self.output.textCursor()
+                    cursor.movePosition(cursor.MoveOperation.Start)
+                    cursor.select(cursor.SelectionType.LineUnderCursor)
+                    cursor.removeSelectedText()
+                    cursor.deleteChar()
+
+        self.decoder_panel = DecoderAggregator()
+        # Main vertical layout: top area (≈70%) + bottom decoder panel (≈30%)
+        main_layout = QHBoxLayout() if False else None
+        # We'll create a vertical layout for central widget
+        from PySide6.QtWidgets import QVBoxLayout
+        vlayout = QVBoxLayout()
+        vlayout.setContentsMargins(4, 4, 4, 4)
+        vlayout.setSpacing(4)
+        vlayout.addWidget(top_widget, stretch=7)
+
+        vlayout.addWidget(self.decoder_panel, stretch=3)
+
+        central.setLayout(vlayout)
 
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
@@ -126,6 +177,8 @@ class ASURMainWindow(QMainWindow):
         self.ctrl_panel.vfo_tab.mute_changed.connect(
             lambda vid, m: self.audio_mixer.set_muted(vid, m)
         )
+        # Also inform the SDR worker to stop producing audio when muted
+        self.ctrl_panel.vfo_tab.mute_changed.connect(self.sdr_worker.set_vfo_muted)
 
         # ---- Decoder toggles ----
         self.ctrl_panel.vfo_tab.decoder_toggled.connect(self._on_decoder_toggled)
@@ -256,7 +309,15 @@ class ASURMainWindow(QMainWindow):
         return None
 
     def _on_decoder_result(self, vfo_id: int, decoder_name: str, text: str):
+        # Add to per-VFO panel
         self.ctrl_panel.vfo_tab.add_decoder_output(vfo_id, decoder_name, text)
+        # Add to aggregated global decoder panel
+        try:
+            if self.decoder_panel is not None:
+                self.decoder_panel.append(vfo_id, decoder_name, text)
+        except Exception:
+            logger.exception("Failed to append to global decoder panel")
+
 
     # ------------------------------------------------------------------
     # Spectrum / waterfall
