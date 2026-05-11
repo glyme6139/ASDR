@@ -3,8 +3,17 @@ Main application window for ASDR desktop client.
 """
 
 import logging
+from html import escape
 
-from PySide6.QtWidgets import QMainWindow, QWidget, QHBoxLayout, QStatusBar, QLabel
+from PySide6.QtWidgets import (
+    QMainWindow,
+    QWidget,
+    QHBoxLayout,
+    QVBoxLayout,
+    QStatusBar,
+    QLabel,
+    QTextBrowser,
+)
 from PySide6.QtCore import Qt
 
 from .visualizations import VisualizationPanel, VFO_COLORS
@@ -13,9 +22,6 @@ from .sdr_worker import SDRWorkerThread
 from .audio_output import AudioMixer
 from app.sdr.vfo import VFOManager
 from .display_buffers import SharedLatest
-
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QLabel, QTextEdit
-from PySide6.QtCore import Qt
 logger = logging.getLogger(__name__)
 
 DEFAULT_CENTER_HZ = 100e6
@@ -85,43 +91,8 @@ class ASURMainWindow(QMainWindow):
         top_widget.setLayout(top_layout)
 
         # Bottom area: aggregated decoder output panel
-        self.decoder_panel = None
-
-
-        class DecoderAggregator(QWidget):
-            def __init__(self, parent=None):
-                from PySide6.QtWidgets import QVBoxLayout
-                super().__init__(parent)
-                layout = QVBoxLayout()
-                layout.setContentsMargins(4, 4, 4, 4)
-                layout.setSpacing(4)
-                header = QLabel("Decoder Output (aggregated)")
-                header.setAlignment(Qt.AlignLeft)
-                layout.addWidget(header)
-                self.output = QTextEdit()
-                self.output.setReadOnly(True)
-                layout.addWidget(self.output)
-                self.setLayout(layout)
-
-            def append(self, vfo_id: int, decoder_name: str, text: str):
-                import time
-                ts = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
-                line = f"[{ts}] VFO{vfo_id} [{decoder_name}] {text}"
-                self.output.append(line)
-                # Limit to ~1000 lines
-                doc = self.output.document()
-                if doc.blockCount() > 1000:
-                    cursor = self.output.textCursor()
-                    cursor.movePosition(cursor.MoveOperation.Start)
-                    cursor.select(cursor.SelectionType.LineUnderCursor)
-                    cursor.removeSelectedText()
-                    cursor.deleteChar()
-
-        self.decoder_panel = DecoderAggregator()
+        self.decoder_panel = self._create_decoder_panel()
         # Main vertical layout: top area (≈70%) + bottom decoder panel (≈30%)
-        main_layout = QHBoxLayout() if False else None
-        # We'll create a vertical layout for central widget
-        from PySide6.QtWidgets import QVBoxLayout
         vlayout = QVBoxLayout()
         vlayout.setContentsMargins(4, 4, 4, 4)
         vlayout.setSpacing(4)
@@ -138,6 +109,40 @@ class ASURMainWindow(QMainWindow):
 
         # Set initial frequency range on both spectrum and waterfall
         self.vis_panel.set_freq_range(DEFAULT_CENTER_HZ, DEFAULT_SAMPLE_RATE)
+
+    def _create_decoder_panel(self):
+        """Create the aggregated decoder output panel."""
+
+        class DecoderAggregator(QWidget):
+            def __init__(self, parent=None):
+                super().__init__(parent)
+                layout = QVBoxLayout(self)
+                layout.setContentsMargins(4, 4, 4, 4)
+                layout.setSpacing(4)
+
+                header = QLabel("Decoder Output (aggregated)")
+                header.setAlignment(Qt.AlignLeft)
+                layout.addWidget(header)
+
+                self.output = QTextBrowser()
+                self.output.setReadOnly(True)
+                self.output.document().setMaximumBlockCount(1000)
+                layout.addWidget(self.output)
+
+            def append(self, vfo_id: int, decoder_name: str, text: str, vfo_color: str):
+                import time
+
+                ts = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
+                vfo_label = escape(f"VFO{vfo_id}")
+                line = (
+                    f'<span style="color:#9aa0a6">[{escape(ts)}]</span> '
+                    f'<span style="color:{vfo_color}; font-weight:600">{vfo_label}</span> '
+                    f'<span style="color:#7dd3fc">[{escape(decoder_name)}]</span> '
+                    f'<span style="color:#ffffff">{escape(text)}</span>'
+                )
+                self.output.append(line)
+
+        return DecoderAggregator()
 
     def _connect_signals(self):
         # ---- SDR worker → UI ----
@@ -211,6 +216,7 @@ class ASURMainWindow(QMainWindow):
             color=color,
             label=f"VFO {vfo_id + 1}",
         )
+        self.ctrl_panel.vfo_tab.set_vfo_color(vfo_id, color)
         self.audio_mixer.add_vfo(vfo_id)
         self._check_vfo_ranges()
 
@@ -314,7 +320,8 @@ class ASURMainWindow(QMainWindow):
         # Add to aggregated global decoder panel
         try:
             if self.decoder_panel is not None:
-                self.decoder_panel.append(vfo_id, decoder_name, text)
+                vfo_color = VFO_COLORS[vfo_id % len(VFO_COLORS)]
+                self.decoder_panel.append(vfo_id, decoder_name, text, vfo_color)
         except Exception:
             logger.exception("Failed to append to global decoder panel")
 

@@ -4,7 +4,7 @@ Control panels for VFO tabs, decoders, and device settings.
 
 from typing import Dict, Optional
 
-from PySide6.QtGui import QColor
+from PySide6.QtGui import QColor, QIcon, QPixmap, QPainter
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QSlider,
     QPushButton, QComboBox, QGroupBox,
@@ -271,6 +271,7 @@ class VFOTabPanel(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._tabs: Dict[int, SingleVFOTab] = {}   # vfo_id → widget
+        self._vfo_colors: Dict[int, str] = {}
 
         self._tab_widget = QTabWidget()
         self._tab_widget.setTabsClosable(True)
@@ -359,6 +360,29 @@ class VFOTabPanel(QWidget):
         if tab:
             tab.append_decoder_output(decoder_name, text)
 
+    def set_vfo_color(self, vfo_id: int, color: str):
+        """Set a small colored dot next to the VFO tab label."""
+        self._vfo_colors[vfo_id] = color
+        idx = self._vfo_id_to_tab_index(vfo_id)
+        if idx < 0:
+            return
+
+        icon = self._make_color_icon(color)
+        self._tab_widget.setTabIcon(idx, icon)
+
+    def _make_color_icon(self, color: str) -> QIcon:
+        pixmap = QPixmap(10, 10)
+        pixmap.fill(Qt.transparent)
+
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(color))
+        painter.drawEllipse(1, 1, 8, 8)
+        painter.end()
+
+        return QIcon(pixmap)
+
     def set_vfo_out_of_range(self, vfo_id: int, out_of_range: bool):
         """Gray the tab label and disable only decoding when the VFO is outside the SDR bandwidth."""
         tab = self._tabs.get(vfo_id)
@@ -369,6 +393,12 @@ class VFOTabPanel(QWidget):
         if idx >= 0:
             color = QColor('#888888') if out_of_range else QColor('#ffffff')
             self._tab_widget.tabBar().setTabTextColor(idx, color)
+            if out_of_range:
+                self._tab_widget.setTabIcon(idx, QIcon())
+            else:
+                vfo_color = self._vfo_colors.get(vfo_id)
+                if vfo_color:
+                    self._tab_widget.setTabIcon(idx, self._make_color_icon(vfo_color))
 
     # ------------------------------------------------------------------
     # Helpers

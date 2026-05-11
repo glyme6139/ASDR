@@ -71,6 +71,12 @@ class BaseDecoder(ABC):
             'sample_rate': self.sample_rate,
         }
 
+    def format_result(self, result: DecoderResult) -> str:
+        """Format a decode result for display."""
+        if result is None:
+            return ""
+        return str(result.data)
+
 
 class BaseAudioDecoder(BaseDecoder):
     """Base class for audio-based decoders"""

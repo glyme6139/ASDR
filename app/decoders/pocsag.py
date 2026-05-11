@@ -279,6 +279,33 @@ class POCSAGDecoder(BaseAudioDecoder):
         self.symbol_buffer = np.zeros(0, dtype=np.int8)
         self.frame_count = 0
 
+    def format_result(self, result: DecoderResult) -> str:
+        """Format decoded POCSAG output for display."""
+        data = result.data if isinstance(result.data, dict) else {}
+        frame = data.get('frame')
+        messages = data.get('messages') or []
+
+        formatted_messages = []
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            address = message.get('address')
+            func = message.get('function')
+            text = str(message.get('message') or '').strip()
+            prefix = f"{address}"
+            if func is not None:
+                prefix = f"{prefix}/{func}"
+            formatted_messages.append(f"{prefix}: {text}" if text else prefix)
+
+        if formatted_messages:
+            body = " | ".join(formatted_messages)
+        else:
+            body = str(data)
+
+        if frame is not None:
+            return f"frame {frame}: {body}"
+        return body
+
 
 class POCSAGIQDecoder(BaseAudioDecoder):
     """Alternative POCSAG decoder using IQ data"""
@@ -289,7 +316,13 @@ class POCSAGIQDecoder(BaseAudioDecoder):
     
     def decode_audio(self, audio: np.ndarray) -> Optional[DecoderResult]:
         """Decode from audio"""
-        return self.pocsag_decoder.decode_audio(audio)
+        result = self.pocsag_decoder.decode_audio(audio)
+        if result is not None:
+            result.decoder_name = self.name
+        return result
+
+    def format_result(self, result: DecoderResult) -> str:
+        return self.pocsag_decoder.format_result(result)
     
     def reset(self):
         """Reset decoder"""

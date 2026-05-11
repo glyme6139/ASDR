@@ -283,7 +283,16 @@ class SDRWorkerThread(QThread):
                 if audio is not None and len(audio) > 0:
                     self._push_audio(vfo_id, audio)
                 for result in dec_results:
-                    self.decoder_result.emit(vfo_id, result.decoder_name, str(result.data))
+                    formatted = str(result.data)
+                    for decoder in vfo.decoders:
+                        if decoder.name == result.decoder_name:
+                            try:
+                                formatted = decoder.format_result(result)
+                            except Exception:
+                                logger.exception("Decoder %s formatter failed", decoder.name)
+                                formatted = str(result.data)
+                            break
+                    self.decoder_result.emit(vfo_id, result.decoder_name, formatted)
                 pos += iq_needed
 
             self._vfo_iq_accum[vfo_id] = [buf[pos:]] if pos < total else []
