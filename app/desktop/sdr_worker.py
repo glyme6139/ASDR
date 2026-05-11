@@ -225,6 +225,10 @@ class SDRWorkerThread(QThread):
         sr     = self._sample_rate
         N      = FFT_SIZE
         bin_hz = sr / N
+        logger.debug(
+            "[SDRWorker] block: sr=%s N=%s bin_hz=%.2f audio_target=%s",
+            sr, N, bin_hz, self._audio_target,
+        )
 
         # Single FFT — shared between display and VFO audio extraction
         fft_out = np.fft.fftshift(np.fft.fft(block))
@@ -261,7 +265,18 @@ class SDRWorkerThread(QThread):
             if iq_nb is None:
                 continue
 
+            logger.debug(
+                "[SDRWorker] VFO%s: iq_nb_len=%d nb_sr=%.2f bandwidth=%.2f mode=%s",
+                vfo.id, len(iq_nb), nb_sr, vfo.settings.bandwidth, vfo.settings.demod_mode,
+            )
+
             audio, dec_results = vfo.process_narrowband_iq(iq_nb, nb_sr, audio_target)
+
+            if audio is not None:
+                logger.debug(
+                    "[SDRWorker] VFO%s: demod audio_len=%d dtype=%s",
+                    vfo.id, len(audio), audio.dtype,
+                )
 
             if audio is not None and len(audio) > 0:
                 self._accumulate_and_push(vfo.id, audio)
@@ -303,6 +318,10 @@ class SDRWorkerThread(QThread):
         narrowband   = (narrowband * (N / n_bins)).astype(np.complex64)
 
         nb_sr = bin_hz * n_bins
+        logger.debug(
+            "[SDRWorker] VFO%s extract: offset_hz=%.2f n_bins=%d lo=%d hi=%d nb_sr=%.2f",
+            vfo.id, offset_hz, n_bins, lo, hi, nb_sr,
+        )
         return narrowband, nb_sr
 
     # ------------------------------------------------------------------
@@ -351,6 +370,11 @@ class SDRWorkerThread(QThread):
 
         frag = np.asarray(audio, dtype=np.float32)
 
+        logger.debug(
+            "[SDRWorker] VFO%s accumulate: frag_len=%d dtype=%s",
+            vfo_id, len(frag), frag.dtype,
+        )
+
         # Initialize accumulator state for this VFO if needed
         if vfo_id not in self._vfo_audio_accum:
             self._vfo_audio_accum[vfo_id] = []
@@ -361,6 +385,10 @@ class SDRWorkerThread(QThread):
 
         total_len = sum(len(f) for f in self._vfo_audio_accum[vfo_id])
         if total_len < CHUNK:
+            logger.debug(
+                "[SDRWorker] VFO%s accumulate: pending_len=%d (< CHUNK=%d)",
+                vfo_id, total_len, CHUNK,
+            )
             return
 
         # Concatenate accumulated fragments
@@ -372,10 +400,18 @@ class SDRWorkerThread(QThread):
         # so total time ≈ 45 ms. Thus est_sr ≈ CHUNK / (total_len / AUDIO_RATE)
         # But simpler: assume all fragments are at ~43900 Hz (hardcode based on SDR rate)
         est_sr = 43900.0
+        logger.debug(
+            "[SDRWorker] VFO%s accumulate: buf_len=%d est_sr=%.1f CHUNK=%d AUDIO_RATE=%d",
+            vfo_id, len(buf), est_sr, CHUNK, AUDIO_RATE,
+        )
 
         # Resample to exactly AUDIO_RATE (48 kHz)
         n_out = max(CHUNK, round(len(buf) * AUDIO_RATE / est_sr))
         resampled = scipy_resample(buf, n_out)
+        logger.debug(
+            "[SDRWorker] VFO%s accumulate: resampled_len=%d n_out=%d",
+            vfo_id, len(resampled), n_out,
+        )
 
         # Emit CHUNK-sized blocks from resampled data
         pos = 0
@@ -383,6 +419,11 @@ class SDRWorkerThread(QThread):
             chunk = resampled[pos:pos + CHUNK].astype(np.float32)
             self._push_audio(vfo_id, chunk)
             pos += CHUNK
+
+        logger.debug(
+            "[SDRWorker] VFO%s accumulate: pushed=%d remainder=%d",
+            vfo_id, pos // CHUNK, len(resampled) - pos,
+        )
 
         # Keep remainder
         if pos < len(resampled):

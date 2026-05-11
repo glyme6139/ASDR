@@ -360,6 +360,7 @@ class WaterfallViewer:
         text.setZValue(16)
         self._plot.addItem(line)
         self._plot.addItem(text)
+
         self._wf_markers[vfo_id] = line
         self._wf_labels[vfo_id]  = text
 
