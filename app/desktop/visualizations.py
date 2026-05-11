@@ -79,11 +79,12 @@ class SpectrumViewer(QObject):
         self._center_hz:   float = 100e6
         self._sample_rate: float = 20e6
 
-        # Broad Y limits so the user can't pan into nonsense territory
-        # plot.getViewBox().setLimits(yMin=-150, yMax=30)
-
         self._vfo_markers:   Dict[int, VFOMarker] = {}
         self._active_vfo_id: Optional[int]        = None
+
+        # Cached x-axis array — rebuilt only when freq range or bin count changes
+        self._x_cache:   Optional[np.ndarray] = None
+        self._x_cache_n: int = 0
 
         plot.scene().sigMouseClicked.connect(self._on_mouse_clicked)
 
@@ -94,12 +95,14 @@ class SpectrumViewer(QObject):
     def set_freq_range(self, center_hz: float, sample_rate: float):
         self._center_hz    = center_hz
         self._sample_rate  = sample_rate
+        self._x_cache      = None   # invalidate cached x-axis
+        self._x_cache_n    = 0
         lo = (center_hz - sample_rate / 2) / 1e6
         hi = (center_hz + sample_rate / 2) / 1e6
         span = hi - lo
         self._plot.getViewBox().setLimits(
             xMin=lo, xMax=hi,
-            minXRange=span * 0.001,   # allow zooming down to 0.1 % of bandwidth
+            minXRange=span * 0.001,
             maxXRange=span,
         )
         for marker in self._vfo_markers.values():
@@ -116,14 +119,21 @@ class SpectrumViewer(QObject):
             return
 
         n = len(spectrum_data)
+
         if freq_start is not None and freq_end is not None:
             x = np.linspace(freq_start / 1e6, freq_end / 1e6, n)
+            self._x_cache = x
+            self._x_cache_n = n
+        elif n == self._x_cache_n and self._x_cache is not None:
+            x = self._x_cache
         else:
             x = np.linspace(
                 (self._center_hz - self._sample_rate / 2) / 1e6,
                 (self._center_hz + self._sample_rate / 2) / 1e6,
                 n,
             )
+            self._x_cache   = x
+            self._x_cache_n = n
 
         self.plot_curve.setData(x, spectrum_data)
 
@@ -300,9 +310,12 @@ class WaterfallViewer:
         vb.setYRange(0, history_size, padding=0)
         vb.setLimits(yMin=0, yMax=history_size, minYRange=history_size, maxYRange=history_size)
 
-        # shape: (freq_bins, history_size) → dim0=X(freq), dim1=Y(time)
-        self.waterfall_data = np.zeros((freq_bins, history_size), dtype=np.uint8)
-        self.image_item = pg.ImageItem(self.waterfall_data)
+        # Ring buffer: (freq_bins, history_size) — written one column at a time.
+        # np.roll is avoided; np.concatenate reorders at render time (20 fps cap).
+        self._ring      = np.zeros((freq_bins, history_size), dtype=np.uint8)
+        self._write_idx = 0     # next column to overwrite
+        self._dirty     = False # True when ring has unrendered data
+        self.image_item = pg.ImageItem(self._ring)
         self.image_item.setColorMap(self._create_colormap())
         self.image_item.setLevels([0, 255])
         plot.addItem(self.image_item)
@@ -381,7 +394,7 @@ class WaterfallViewer:
         if text: self._plot.removeItem(text)
 
     # ------------------------------------------------------------------
-    # Waterfall update — new column at top (highest Y = newest)
+    # Waterfall update — writes column into ring buffer; render_pending() displays it
     # ------------------------------------------------------------------
 
     def update_waterfall(self, col_data):
@@ -399,10 +412,20 @@ class WaterfallViewer:
             col = col / (col_max + 1e-10) * 255
         col = np.clip(col, 0, 255).astype(np.uint8)
 
-        # Roll time axis: newest column goes to index -1 (top of screen)
-        self.waterfall_data = np.roll(self.waterfall_data, -1, axis=1)
-        self.waterfall_data[:, -1] = col
-        self.image_item.setImage(self.waterfall_data, autoLevels=False)
+        # In-place ring write — no allocation
+        self._ring[:, self._write_idx] = col
+        self._write_idx = (self._write_idx + 1) % self.history_size
+        self._dirty = True
+
+    def render_pending(self):
+        """Reorder ring buffer and send to GPU. Called by VisualizationPanel timer."""
+        if not self._dirty:
+            return
+        self._dirty = False
+        idx = self._write_idx
+        # Oldest column is at write_idx; concatenate so it appears at bottom (Y=0)
+        ordered = np.concatenate([self._ring[:, idx:], self._ring[:, :idx]], axis=1)
+        self.image_item.setImage(ordered, autoLevels=False)
 
     # ------------------------------------------------------------------
     # Colormap (blue→cyan→green→yellow→red)
@@ -485,7 +508,7 @@ class VisualizationPanel(QWidget):
 
     def _flush_pending(self):
         t0 = time.monotonic()
-        # First, prefer data from shared buffers if available (producer writes latest).
+
         if self._display_buffers:
             try:
                 sb = self._display_buffers.get('spectrum')
@@ -502,7 +525,6 @@ class VisualizationPanel(QWidget):
                         self.waterfall.update_waterfall(latest_w)
                         self._pending_waterfall = None
             except Exception:
-                # Fall back to existing pending buffers on error
                 pass
 
         if self._pending_spectrum is not None:
@@ -511,9 +533,13 @@ class VisualizationPanel(QWidget):
         if self._pending_waterfall is not None:
             self.waterfall.update_waterfall(self._pending_waterfall)
             self._pending_waterfall = None
+
+        # Render waterfall ring buffer → GPU (no-op if no new data since last tick)
+        self.waterfall.render_pending()
+
         dt = (time.monotonic() - t0) * 1000.0
         if dt > 30.0:
-            logger.warning(f"[Visualization] render slow: {dt:.1f} ms (spectrum/waterfall update)")
+            logger.warning(f"[Visualization] render slow: {dt:.1f} ms")
 
     # ------------------------------------------------------------------
     # Proxy helpers so callers don't need to reach into .spectrum/.waterfall
