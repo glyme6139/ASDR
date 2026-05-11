@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "bookmarks": [
+    {
+      "name": "POCSAG 3",
+      "frequency": 466206000.0,
+      "demod_mode": "NFM",
+      "bandwidth": 18500.0,
+      "squelch_level": -100.0,
+      "volume": 0.04
+    },
+    {
+      "name": "POCSAG 2",
+      "frequency": 466175000.0,
+      "demod_mode": "NFM",
+      "bandwidth": 18000.0,
+      "squelch_level": -100.0,
+      "volume": 0.06
+    },
+    {
+      "name": "POCSAG 1",
+      "frequency": 466050000.0,
+      "demod_mode": "NFM",
+      "bandwidth": 18000.0,
+      "squelch_level": -100.0,
+      "volume": 0.05
+    }
+  ]
+}

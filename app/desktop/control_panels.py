@@ -2,14 +2,17 @@
 Control panels for VFO tabs, decoders, and device settings.
 """
 
-from typing import Dict, Optional
+import json
+import os
+from dataclasses import dataclass, asdict
+from typing import Callable, Dict, Optional
 
 from PySide6.QtGui import QColor, QIcon, QPixmap, QPainter
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QSlider,
     QPushButton, QComboBox, QGroupBox,
     QListWidget, QListWidgetItem, QTextEdit, QTabWidget, QSizePolicy,
-    QCheckBox,
+    QCheckBox, QFileDialog, QInputDialog,
 )
 from .widgets import AcceptCommaDoubleSpinBox
 QDoubleSpinBox = AcceptCommaDoubleSpinBox
@@ -53,6 +56,23 @@ class AcceptCommaDoubleSpinBox(QDoubleSpinBox):
 QDoubleSpinBox = AcceptCommaDoubleSpinBox
 
 DECODER_NAMES = ['POCSAG', 'RDS', 'AIS', 'ADSB']
+
+_BOOKMARK_FILE = 'bookmarks.json'
+
+
+@dataclass
+class VFOBookmark:
+    name: str
+    frequency: float        # Hz
+    demod_mode: str  = 'NFM'
+    bandwidth: float = 12_500.0  # Hz
+    squelch_level: float = -100.0
+    volume: float    = 0.8
+
+    def display_label(self) -> str:
+        mhz = self.frequency / 1e6
+        bw  = self.bandwidth / 1e3
+        return f"{self.name}  —  {mhz:.4f} MHz  [{self.demod_mode}, {bw:.1f} kHz]"
 
 
 # ---------------------------------------------------------------------------
@@ -383,6 +403,41 @@ class VFOTabPanel(QWidget):
 
         return QIcon(pixmap)
 
+    def add_vfo(self) -> int:
+        """Public wrapper — add a VFO tab and return its vfo_id."""
+        return self._add_vfo()
+
+    def get_active_vfo_snapshot(self) -> Optional[dict]:
+        """Return current active VFO settings as a plain dict (for bookmarking)."""
+        vfo_id = self.active_vfo_id()
+        tab    = self._tabs.get(vfo_id)
+        if tab is None:
+            return None
+        return {
+            'frequency':     tab.freq_spin.value() * 1e6,
+            'demod_mode':    tab.demod_combo.currentText(),
+            'bandwidth':     tab.bw_spin.value() * 1e3,
+            'squelch_level': float(tab.squelch_slider.value()),
+            'volume':        tab.vol_slider.value() / 100.0,
+        }
+
+    def apply_settings_to_vfo(self, vfo_id: int, settings: dict):
+        """Apply a settings dict to a VFO tab, propagating all signals to the backend."""
+        tab = self._tabs.get(vfo_id)
+        if tab is None:
+            return
+        tab.freq_spin.setValue(settings.get('frequency', 100e6) / 1e6)
+        tab.demod_combo.setCurrentText(settings.get('demod_mode', 'NFM'))
+        tab.bw_spin.setValue(settings.get('bandwidth', 12_500.0) / 1e3)
+        tab.squelch_slider.setValue(int(settings.get('squelch_level', -100.0)))
+        tab.vol_slider.setValue(int(settings.get('volume', 0.8) * 100))
+        # Rename tab to bookmark name if provided (truncated to 12 chars to fit tab bar)
+        name = settings.get('name', '').strip()
+        if name:
+            idx = self._vfo_id_to_tab_index(vfo_id)
+            if idx >= 0:
+                self._tab_widget.setTabText(idx, name[:12])
+
     def set_vfo_out_of_range(self, vfo_id: int, out_of_range: bool):
         """Gray the tab label and disable only decoding when the VFO is outside the SDR bandwidth."""
         tab = self._tabs.get(vfo_id)
@@ -415,6 +470,225 @@ class VFOTabPanel(QWidget):
             if tab is widget:
                 return vfo_id
         return None
+
+
+# ---------------------------------------------------------------------------
+# Bookmark panel
+# ---------------------------------------------------------------------------
+
+class BookmarkPanel(QWidget):
+    """
+    Persistent bookmark panel — always visible in the control sidebar.
+
+    Bookmarks store a full VFO settings snapshot (frequency, mode, bandwidth,
+    squelch, volume).  The file format is plain JSON so bookmarks can be shared
+    or hand-edited.  An auto-save copy is kept at bookmarks.json alongside the
+    running process.
+
+    Signals
+    -------
+    bookmark_add_requested(dict)
+        Emitted when the user wants to create a VFO from a bookmark.
+        The dict matches the VFOBookmark field names.
+    """
+
+    bookmark_add_requested = Signal(dict)
+
+    def __init__(self, get_vfo_snapshot: Optional[Callable] = None, parent=None):
+        super().__init__(parent)
+        self._bookmarks: list = []           # List[VFOBookmark]
+        self._get_vfo_snapshot = get_vfo_snapshot
+        self._current_file: Optional[str] = None
+        self._initUI()
+        self._autoload()
+
+    # ------------------------------------------------------------------
+    # UI construction
+    # ------------------------------------------------------------------
+
+    def _initUI(self):
+        outer = QVBoxLayout()
+        outer.setContentsMargins(0, 0, 0, 0)
+
+        group = QGroupBox("Bookmarks")
+        g = QVBoxLayout()
+        g.setContentsMargins(6, 6, 6, 6)
+        g.setSpacing(4)
+
+        # ── toolbar row ──
+        toolbar = QHBoxLayout()
+        toolbar.setSpacing(3)
+        self.import_btn   = QPushButton("Import")
+        self.export_btn   = QPushButton("Export")
+        self.save_vfo_btn = QPushButton("+ Save VFO")
+        self.import_btn.setToolTip("Load bookmarks from a JSON file (merges with current list)")
+        self.export_btn.setToolTip("Save all bookmarks to a JSON file")
+        self.save_vfo_btn.setToolTip("Save the active VFO's settings as a new bookmark")
+        for btn in (self.import_btn, self.export_btn, self.save_vfo_btn):
+            toolbar.addWidget(btn)
+        g.addLayout(toolbar)
+
+        # ── bookmark list ──
+        self.list_widget = QListWidget()
+        self.list_widget.setMaximumHeight(140)
+        self.list_widget.setAlternatingRowColors(True)
+        self.list_widget.setToolTip("Double-click a bookmark to add it as a new VFO")
+        self.list_widget.itemSelectionChanged.connect(self._on_selection_changed)
+        self.list_widget.itemDoubleClicked.connect(lambda _: self._on_add_to_vfo())
+        g.addWidget(self.list_widget)
+
+        # ── action row ──
+        action_row = QHBoxLayout()
+        action_row.setSpacing(3)
+        self.add_btn    = QPushButton("Add to VFOs")
+        self.remove_btn = QPushButton("Remove")
+        self.add_btn.setEnabled(False)
+        self.remove_btn.setEnabled(False)
+        self.add_btn.setToolTip("Create a new VFO tab with this bookmark's settings")
+        self.remove_btn.setToolTip("Delete selected bookmark from the list")
+        action_row.addWidget(self.add_btn)
+        action_row.addWidget(self.remove_btn)
+        g.addLayout(action_row)
+
+        group.setLayout(g)
+        outer.addWidget(group)
+        self.setLayout(outer)
+
+        self.import_btn.clicked.connect(self._on_import)
+        self.export_btn.clicked.connect(self._on_export)
+        self.save_vfo_btn.clicked.connect(self._on_save_vfo)
+        self.add_btn.clicked.connect(self._on_add_to_vfo)
+        self.remove_btn.clicked.connect(self._on_remove)
+
+    # ------------------------------------------------------------------
+    # List helpers
+    # ------------------------------------------------------------------
+
+    def _refresh_list(self):
+        self.list_widget.clear()
+        for bm in self._bookmarks:
+            item = QListWidgetItem(bm.display_label())
+            item.setToolTip(bm.display_label())
+            self.list_widget.addItem(item)
+
+    def _on_selection_changed(self):
+        has = bool(self.list_widget.selectedItems())
+        self.add_btn.setEnabled(has)
+        self.remove_btn.setEnabled(has)
+
+    def _selected_bookmark(self) -> Optional[VFOBookmark]:
+        row = self.list_widget.currentRow()
+        if 0 <= row < len(self._bookmarks):
+            return self._bookmarks[row]
+        return None
+
+    # ------------------------------------------------------------------
+    # Button actions
+    # ------------------------------------------------------------------
+
+    def _on_add_to_vfo(self):
+        bm = self._selected_bookmark()
+        if bm:
+            self.bookmark_add_requested.emit(asdict(bm))
+
+    def _on_remove(self):
+        row = self.list_widget.currentRow()
+        if 0 <= row < len(self._bookmarks):
+            self._bookmarks.pop(row)
+            self._refresh_list()
+            self._autosave()
+
+    def _on_save_vfo(self):
+        if self._get_vfo_snapshot is None:
+            return
+        snapshot = self._get_vfo_snapshot()
+        if snapshot is None:
+            return
+        default_name = f"{snapshot.get('frequency', 100e6) / 1e6:.4f} MHz"
+        name, ok = QInputDialog.getText(
+            self, "Save Bookmark", "Bookmark name:", text=default_name
+        )
+        if not ok or not name.strip():
+            return
+        bm = VFOBookmark(
+            name=name.strip(),
+            frequency=snapshot.get('frequency', 100e6),
+            demod_mode=snapshot.get('demod_mode', 'NFM'),
+            bandwidth=snapshot.get('bandwidth', 12_500.0),
+            squelch_level=snapshot.get('squelch_level', -100.0),
+            volume=snapshot.get('volume', 0.8),
+        )
+        self._bookmarks.append(bm)
+        self._refresh_list()
+        self._autosave()
+
+    def _on_import(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Import Bookmarks", "",
+            "Bookmark files (*.json);;All files (*)"
+        )
+        if path:
+            added = self._load_file(path)
+            if added is not None:
+                self._current_file = path
+
+    def _on_export(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Bookmarks",
+            self._current_file or _BOOKMARK_FILE,
+            "Bookmark files (*.json);;All files (*)"
+        )
+        if path:
+            self._save_file(path)
+            self._current_file = path
+
+    # ------------------------------------------------------------------
+    # File I/O
+    # ------------------------------------------------------------------
+
+    def _autoload(self):
+        if os.path.exists(_BOOKMARK_FILE):
+            self._load_file(_BOOKMARK_FILE)
+            self._current_file = _BOOKMARK_FILE
+
+    def _autosave(self):
+        self._save_file(self._current_file or _BOOKMARK_FILE)
+
+    def _load_file(self, path: str) -> Optional[int]:
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            loaded = []
+            for item in data.get('bookmarks', []):
+                loaded.append(VFOBookmark(
+                    name=item.get('name', 'Unnamed'),
+                    frequency=float(item.get('frequency', 100e6)),
+                    demod_mode=item.get('demod_mode', 'NFM'),
+                    bandwidth=float(item.get('bandwidth', 12_500.0)),
+                    squelch_level=float(item.get('squelch_level', -100.0)),
+                    volume=float(item.get('volume', 0.8)),
+                ))
+            # Merge: skip entries already present (same name + frequency)
+            existing_keys = {(b.name, b.frequency) for b in self._bookmarks}
+            new = [b for b in loaded if (b.name, b.frequency) not in existing_keys]
+            self._bookmarks.extend(new)
+            self._refresh_list()
+            logger.info("Loaded %d bookmark(s) from %s", len(new), path)
+            return len(new)
+        except Exception as e:
+            logger.error("Failed to load bookmarks from %s: %s", path, e)
+            return None
+
+    def _save_file(self, path: str):
+        try:
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(
+                    {'version': 1, 'bookmarks': [asdict(b) for b in self._bookmarks]},
+                    f, indent=2,
+                )
+            logger.info("Saved %d bookmark(s) to %s", len(self._bookmarks), path)
+        except Exception as e:
+            logger.error("Failed to save bookmarks to %s: %s", path, e)
 
 
 # ---------------------------------------------------------------------------
@@ -536,10 +810,17 @@ class ControlPanel(QWidget):
     def _initUI(self):
         layout = QVBoxLayout()
         layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(4)
 
         # VFO tabs occupy most of the space
         self.vfo_tab = VFOTabPanel()
         layout.addWidget(self.vfo_tab, stretch=3)
+
+        # Bookmark panel — always visible between VFO tabs and device settings
+        self.bookmark_panel = BookmarkPanel(
+            get_vfo_snapshot=self.vfo_tab.get_active_vfo_snapshot
+        )
+        layout.addWidget(self.bookmark_panel)
 
         # Device group at the bottom
         device_group = QGroupBox("Device")

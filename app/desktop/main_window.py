@@ -188,6 +188,11 @@ class ASURMainWindow(QMainWindow):
         # ---- Decoder toggles ----
         self.ctrl_panel.vfo_tab.decoder_toggled.connect(self._on_decoder_toggled)
 
+        # ---- Bookmarks ----
+        self.ctrl_panel.bookmark_panel.bookmark_add_requested.connect(
+            self._on_bookmark_add_requested
+        )
+
         # ---- Device panel ----
         self.ctrl_panel.device_panel.center_freq_changed.connect(self._on_center_freq_changed)
         self.ctrl_panel.device_panel.sample_rate_changed.connect(self._on_sample_rate_changed)
@@ -280,6 +285,15 @@ class ASURMainWindow(QMainWindow):
             out_of_range = abs(vfo.settings.frequency - center) > half_bw
             vfo.settings.enabled = not out_of_range
             self.ctrl_panel.vfo_tab.set_vfo_out_of_range(vfo.id, out_of_range)
+
+    # ------------------------------------------------------------------
+    # Bookmark handlers
+    # ------------------------------------------------------------------
+
+    def _on_bookmark_add_requested(self, settings: dict):
+        """Create a new VFO tab pre-configured with bookmark settings."""
+        vfo_id = self.ctrl_panel.vfo_tab.add_vfo()
+        self.ctrl_panel.vfo_tab.apply_settings_to_vfo(vfo_id, settings)
 
     # ------------------------------------------------------------------
     # Decoder handlers
