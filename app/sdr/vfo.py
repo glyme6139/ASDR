@@ -55,7 +55,9 @@ class VFO:
         self.decoders: List[BaseDecoder] = []
 
         self.signal_strength = -100.0
+        self.signal_db       = -100.0   # current signal in dBFS (for UI polling)
         self.is_active       = False
+        self._sq_state       = False    # hysteresis state: True = squelch open
 
         # Stateful DSP — all preserved across process_iq() calls
         self._osc_phase:   float       = 0.0                    # frequency-shift oscillator
@@ -190,6 +192,9 @@ class VFO:
         if self.on_squelch_change:
             self.on_squelch_change(self.id, level, enabled)
 
+    def set_squelch_enabled(self, enabled: bool):
+        self.settings.squelch_enabled = bool(enabled)
+
     def enable(self):
         self.settings.enabled = True
         self.is_running = True
@@ -283,13 +288,29 @@ class VFO:
         if not self.audio_enabled:
             return None, []
 
-        # Signal strength + squelch (on the already-narrow IQ)
+        # Signal strength + squelch with hysteresis
         self.signal_strength = float(np.mean(np.abs(iq) ** 2))
         signal_db = 10.0 * np.log10(max(self.signal_strength, 1e-10))
-        if self.settings.squelch_enabled and signal_db < self.settings.squelch_level:
-            self.is_active = False
-            return None, []
-        self.is_active = True
+        self.signal_db = signal_db
+
+        if self.settings.squelch_enabled:
+            was_open = self._sq_state
+            if self._sq_state:
+                # Close if signal drops 3 dB below threshold
+                if signal_db < self.settings.squelch_level - 3.0:
+                    self._sq_state = False
+            else:
+                # Open if signal reaches threshold
+                if signal_db >= self.settings.squelch_level:
+                    self._sq_state = True
+            if not self._sq_state:
+                self.is_active = False
+                return None, []
+            self.is_active = True
+        else:
+            was_open = self._sq_state
+            self._sq_state = True
+            self.is_active = True
 
         # Update proc_rate used by demodulators for normalisation.
         # Rebuild de-emphasis filter only when rate changes significantly.
@@ -304,6 +325,11 @@ class VFO:
         audio = self._demodulate(iq)
         if audio is None:
             return None, []
+
+        # Fade in when squelch just opened to avoid click artifact
+        if not was_open and self._sq_state:
+            fade = np.linspace(0.0, 1.0, len(audio), dtype=np.float32)
+            audio = audio * fade
 
         audio = (audio * self.settings.volume).astype(np.float64)
 

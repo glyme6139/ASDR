@@ -14,7 +14,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QTextBrowser,
 )
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 
 from .visualizations import VisualizationPanel, VFO_COLORS
 from .control_panels import ControlPanel
@@ -200,6 +200,17 @@ class ASURMainWindow(QMainWindow):
         self.ctrl_panel.device_panel.vga_gain_changed.connect(self._on_vga_gain_changed)
         self.ctrl_panel.device_panel.amp_enabled_changed.connect(self._on_amp_enabled_changed)
 
+        # ---- Squelch enable toggle ----
+        self.ctrl_panel.vfo_tab.squelch_enabled_changed.connect(
+            self.sdr_worker.set_vfo_squelch_enabled
+        )
+
+        # ---- Signal strength polling timer (150 ms) ----
+        self._sq_poll_timer = QTimer(self)
+        self._sq_poll_timer.setInterval(150)
+        self._sq_poll_timer.timeout.connect(self._poll_signal_strength)
+        self._sq_poll_timer.start()
+
         # ---- Spectrum click → tune active VFO ----
         self.vis_panel.spectrum.frequency_clicked.connect(self._on_spectrum_clicked)
 
@@ -240,6 +251,13 @@ class ASURMainWindow(QMainWindow):
         bw = vfo.settings.bandwidth if vfo else None
         self.vis_panel.update_vfo_marker(vfo_id, freq_hz, bw)
         self._check_vfo_ranges()
+
+    def _poll_signal_strength(self):
+        """Update signal strength displays in all VFO tabs from the VFO backend."""
+        for vfo in self.vfo_manager.get_all_vfos():
+            self.ctrl_panel.vfo_tab.update_signal_strength(
+                vfo.id, vfo.signal_db, vfo.is_active
+            )
 
     def _on_vfo_bandwidth_changed(self, vfo_id: int, bandwidth_hz: float):
         self.sdr_worker.set_vfo_bandwidth(vfo_id, bandwidth_hz)

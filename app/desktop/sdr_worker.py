@@ -521,4 +521,10 @@ class SDRWorkerThread(QThread):
         if self.vfo_manager:
             vfo = self.vfo_manager.get_vfo(vfo_id)
             if vfo:
-                vfo.set_squelch(level_db)
+                vfo.set_squelch(level_db, enabled=vfo.settings.squelch_enabled)
+
+    def set_vfo_squelch_enabled(self, vfo_id: int, enabled: bool):
+        if self.vfo_manager:
+            vfo = self.vfo_manager.get_vfo(vfo_id)
+            if vfo:
+                vfo.set_squelch_enabled(bool(enabled))

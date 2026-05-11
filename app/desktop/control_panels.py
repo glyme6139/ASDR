@@ -83,13 +83,14 @@ class VFOBookmark:
 class SingleVFOTab(QWidget):
     """Settings widget for one VFO (shown inside a tab)."""
 
-    frequency_changed = Signal(int, float)   # vfo_id, Hz
-    demod_changed = Signal(int, str)         # vfo_id, mode
-    bandwidth_changed = Signal(int, float)   # vfo_id, Hz
-    volume_changed = Signal(int, float)      # vfo_id, 0–1
-    squelch_changed = Signal(int, float)     # vfo_id, dBFS
-    mute_changed = Signal(int, bool)         # vfo_id, muted
-    decoder_toggled = Signal(int, str, bool) # vfo_id, decoder_name, enabled
+    frequency_changed = Signal(int, float)    # vfo_id, Hz
+    demod_changed = Signal(int, str)          # vfo_id, mode
+    bandwidth_changed = Signal(int, float)    # vfo_id, Hz
+    volume_changed = Signal(int, float)       # vfo_id, 0–1
+    squelch_changed = Signal(int, float)      # vfo_id, dBFS
+    squelch_enabled_changed = Signal(int, bool) # vfo_id, enabled
+    mute_changed = Signal(int, bool)          # vfo_id, muted
+    decoder_toggled = Signal(int, str, bool)  # vfo_id, decoder_name, enabled
 
     def __init__(self, vfo_id: int, parent=None):
         super().__init__(parent)
@@ -171,9 +172,13 @@ class SingleVFOTab(QWidget):
         audio_layout.addLayout(mute_row)
 
         sq_row = QHBoxLayout()
-        sq_row.addWidget(QLabel("Squelch:"))
+        self.squelch_check = QCheckBox("SQL")
+        self.squelch_check.setToolTip("Enable squelch")
+        self.squelch_check.setChecked(True)
+        self.squelch_check.toggled.connect(self._on_squelch_enabled_changed)
+        sq_row.addWidget(self.squelch_check)
         self.squelch_slider = QSlider(Qt.Horizontal)
-        self.squelch_slider.setRange(-120, 0)
+        self.squelch_slider.setRange(-120, 120)
         self.squelch_slider.setValue(-100)
         self.squelch_slider.valueChanged.connect(self._on_squelch_changed)
         sq_row.addWidget(self.squelch_slider)
@@ -181,6 +186,15 @@ class SingleVFOTab(QWidget):
         self.squelch_label.setFixedWidth(36)
         sq_row.addWidget(self.squelch_label)
         audio_layout.addLayout(sq_row)
+
+        sig_row = QHBoxLayout()
+        sig_row.addWidget(QLabel("Signal:"))
+        self.signal_strength_label = QLabel("--- dB")
+        self.signal_strength_label.setFixedWidth(80)
+        self.signal_strength_label.setStyleSheet("color: #888888;")
+        sig_row.addWidget(self.signal_strength_label)
+        sig_row.addStretch()
+        audio_layout.addLayout(sig_row)
 
         audio_group.setLayout(audio_layout)
         layout.addWidget(audio_group)
@@ -227,6 +241,14 @@ class SingleVFOTab(QWidget):
     def get_bandwidth_hz(self) -> float:
         return self.bw_spin.value() * 1e3
 
+    def update_signal_strength(self, db: float, sq_open: bool):
+        """Update signal strength display. Called from a polling timer in main_window."""
+        self.signal_strength_label.setText(f"{db:.1f} dB")
+        if sq_open:
+            self.signal_strength_label.setStyleSheet("color: #00cc44; font-weight: bold;")
+        else:
+            self.signal_strength_label.setStyleSheet("color: #cc2222;")
+
     def append_decoder_output(self, decoder_name: str, text: str):
         self.decoder_output.append(f"[{decoder_name}] {text}")
         # Keep at most 200 lines
@@ -259,6 +281,9 @@ class SingleVFOTab(QWidget):
         self.squelch_label.setText(str(value))
         self.squelch_changed.emit(self.vfo_id, float(value))
 
+    def _on_squelch_enabled_changed(self, enabled: bool):
+        self.squelch_enabled_changed.emit(self.vfo_id, enabled)
+
     def _on_decoder_toggled(self, item: QListWidgetItem):
         name = item.text()
         enabled = item.checkState() == Qt.CheckState.Checked
@@ -286,6 +311,7 @@ class VFOTabPanel(QWidget):
     bandwidth_changed = Signal(int, float)
     volume_changed = Signal(int, float)
     squelch_changed = Signal(int, float)
+    squelch_enabled_changed = Signal(int, bool)
     mute_changed = Signal(int, bool)
     decoder_toggled = Signal(int, str, bool)
 
@@ -333,6 +359,7 @@ class VFOTabPanel(QWidget):
         tab.bandwidth_changed.connect(self.bandwidth_changed)
         tab.volume_changed.connect(self.volume_changed)
         tab.squelch_changed.connect(self.squelch_changed)
+        tab.squelch_enabled_changed.connect(self.squelch_enabled_changed)
         tab.mute_changed.connect(self.mute_changed)
         tab.decoder_toggled.connect(self.decoder_toggled)
 
@@ -380,6 +407,11 @@ class VFOTabPanel(QWidget):
         tab = self._tabs.get(vfo_id)
         if tab:
             tab.append_decoder_output(decoder_name, text)
+
+    def update_signal_strength(self, vfo_id: int, db: float, sq_open: bool):
+        tab = self._tabs.get(vfo_id)
+        if tab:
+            tab.update_signal_strength(db, sq_open)
 
     def set_vfo_color(self, vfo_id: int, color: str):
         """Set a small colored dot next to the VFO tab label."""
