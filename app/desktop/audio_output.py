@@ -121,7 +121,7 @@ class AudioMixer:
                 channels=1,
                 dtype='float32',
                 blocksize=CHUNK,
-                latency='low',
+                latency='high',   # large OS buffer absorbs GIL stalls from rendering
                 callback=self._callback,
             )
             self._stream.start()

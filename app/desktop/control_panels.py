@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
     QListWidget, QListWidgetItem, QTextEdit, QTabWidget, QSizePolicy,
     QCheckBox, QFileDialog, QInputDialog,
 )
+from PySide6.QtWidgets import QScrollArea
 from .widgets import AcceptCommaDoubleSpinBox
 QDoubleSpinBox = AcceptCommaDoubleSpinBox
 from PySide6.QtCore import Qt, Signal
@@ -808,19 +809,18 @@ class ControlPanel(QWidget):
         self._initUI()
 
     def _initUI(self):
-        layout = QVBoxLayout()
-        layout.setContentsMargins(4, 4, 4, 4)
-        layout.setSpacing(4)
+        # Make the control panel scrollable to give a less compact interface
+        outer_layout = QVBoxLayout()
+        outer_layout.setContentsMargins(4, 4, 4, 4)
+        outer_layout.setSpacing(4)
 
-        # VFO tabs occupy most of the space
-        self.vfo_tab = VFOTabPanel()
-        layout.addWidget(self.vfo_tab, stretch=3)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
 
-        # Bookmark panel — always visible between VFO tabs and device settings
-        self.bookmark_panel = BookmarkPanel(
-            get_vfo_snapshot=self.vfo_tab.get_active_vfo_snapshot
-        )
-        layout.addWidget(self.bookmark_panel)
+        content = QWidget()
+        content_layout = QVBoxLayout()
+        content_layout.setContentsMargins(6, 6, 6, 6)
+        content_layout.setSpacing(8)
 
         # Device group at the bottom
         device_group = QGroupBox("Device")
@@ -828,6 +828,21 @@ class ControlPanel(QWidget):
         self.device_panel = DevicePanel()
         device_layout.addWidget(self.device_panel)
         device_group.setLayout(device_layout)
-        layout.addWidget(device_group, stretch=1)
+        content_layout.addWidget(device_group, stretch=0)
 
-        self.setLayout(layout)
+        # VFO tabs occupy most of the space
+        self.vfo_tab = VFOTabPanel()
+        content_layout.addWidget(self.vfo_tab, stretch=0)
+
+        # Bookmark panel — always visible between VFO tabs and device settings
+        self.bookmark_panel = BookmarkPanel(
+            get_vfo_snapshot=self.vfo_tab.get_active_vfo_snapshot
+        )
+        content_layout.addWidget(self.bookmark_panel, stretch=0)
+
+        content_layout.addStretch()
+        content.setLayout(content_layout)
+
+        scroll.setWidget(content)
+        outer_layout.addWidget(scroll)
+        self.setLayout(outer_layout)

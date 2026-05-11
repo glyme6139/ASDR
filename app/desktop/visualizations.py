@@ -13,6 +13,11 @@ import numpy as np
 from PySide6.QtCore import QObject, QRectF, QTimer, Signal
 from PySide6.QtWidgets import QWidget, QVBoxLayout
 import pyqtgraph as pg
+
+# OpenGL rendering: GPU takes over the actual draw calls, releasing the Python GIL
+# during the heavy work. Must be set before any pg widget is instantiated.
+pg.setConfigOptions(useOpenGL=True, antialias=False)
+
 import logging
 import time
 
@@ -311,8 +316,10 @@ class WaterfallViewer:
         vb.setLimits(yMin=0, yMax=history_size, minYRange=history_size, maxYRange=history_size)
 
         # Ring buffer: (freq_bins, history_size) — written one column at a time.
-        # np.roll is avoided; np.concatenate reorders at render time (20 fps cap).
+        # _ordered is a pre-allocated reorder scratch buffer so render_pending
+        # never allocates — it just does two in-place slice copies.
         self._ring      = np.zeros((freq_bins, history_size), dtype=np.uint8)
+        self._ordered   = np.empty((freq_bins, history_size), dtype=np.uint8)
         self._write_idx = 0     # next column to overwrite
         self._dirty     = False # True when ring has unrendered data
         self.image_item = pg.ImageItem(self._ring)
@@ -418,14 +425,16 @@ class WaterfallViewer:
         self._dirty = True
 
     def render_pending(self):
-        """Reorder ring buffer and send to GPU. Called by VisualizationPanel timer."""
+        """Reorder ring buffer into pre-allocated scratch and send to GPU."""
         if not self._dirty:
             return
         self._dirty = False
-        idx = self._write_idx
-        # Oldest column is at write_idx; concatenate so it appears at bottom (Y=0)
-        ordered = np.concatenate([self._ring[:, idx:], self._ring[:, :idx]], axis=1)
-        self.image_item.setImage(ordered, autoLevels=False)
+        idx   = self._write_idx
+        first = self.history_size - idx
+        # In-place reorder: oldest column → left (Y=0), newest → right (Y=top)
+        self._ordered[:, :first] = self._ring[:, idx:]
+        self._ordered[:, first:] = self._ring[:, :idx]
+        self.image_item.setImage(self._ordered, autoLevels=False)
 
     # ------------------------------------------------------------------
     # Colormap (blue→cyan→green→yellow→red)
@@ -492,7 +501,7 @@ class VisualizationPanel(QWidget):
         self._display_buffers = display_buffers
 
         self._render_timer = QTimer(self)
-        self._render_timer.setInterval(50)   # 20 fps cap — rendering never blocks signal delivery
+        self._render_timer.setInterval(100)  # 10 fps cap — halves GIL hold frequency
         self._render_timer.timeout.connect(self._flush_pending)
         self._render_timer.start()
 
