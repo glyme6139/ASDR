@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtWidgets import QScrollArea
 from .widgets import AcceptCommaDoubleSpinBox
+from app.decoders.modulation import MODULATION_DECODER_NAMES
 QDoubleSpinBox = AcceptCommaDoubleSpinBox
 from PySide6.QtCore import Qt, Signal
 import logging
@@ -56,7 +57,7 @@ class AcceptCommaDoubleSpinBox(QDoubleSpinBox):
 # Use our subclass throughout this module wherever QDoubleSpinBox is used.
 QDoubleSpinBox = AcceptCommaDoubleSpinBox
 
-DECODER_NAMES = ['POCSAG', 'RDS', 'AIS', 'ADSB']
+DECODER_NAMES = ['POCSAG', 'RDS', 'AIS', 'ADSB'] + list(MODULATION_DECODER_NAMES)
 
 _BOOKMARK_FILE = 'bookmarks.json'
 

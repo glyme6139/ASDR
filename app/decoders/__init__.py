@@ -10,6 +10,11 @@ from .base import (
     DecoderResult,
     get_decoder_registry,
 )
+from .modulation import (
+    GenericModulationDecoder,
+    MODULATION_DECODER_NAMES,
+    create_modulation_decoder,
+)
 from .pocsag import POCSAGDecoder, POCSAGIQDecoder
 from .rds import RDSDecoder
 from .ais import AISDecoder
@@ -22,6 +27,9 @@ __all__ = [
     'DecoderRegistry',
     'DecoderResult',
     'get_decoder_registry',
+    'GenericModulationDecoder',
+    'MODULATION_DECODER_NAMES',
+    'create_modulation_decoder',
     'POCSAGDecoder',
     'POCSAGIQDecoder',
     'RDSDecoder',

@@ -296,6 +296,9 @@ class DSPWorker:
             elif name == 'ADSB':
                 from app.decoders.adsb import ADSBDecoder
                 return ADSBDecoder()
+            else:
+                from app.decoders.modulation import create_modulation_decoder
+                return create_modulation_decoder(name)
         except Exception as e:
             logger.error(f"Decoder instantiation failed ({name}): {e}")
         return None

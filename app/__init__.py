@@ -56,7 +56,14 @@ def create_app(config=None):
     
     # Register default decoders
     try:
-        from app.decoders import POCSAGDecoder, RDSDecoder, AISDecoder, ADSBDecoder
+        from app.decoders import (
+            POCSAGDecoder,
+            RDSDecoder,
+            AISDecoder,
+            ADSBDecoder,
+            MODULATION_DECODER_NAMES,
+            create_modulation_decoder,
+        )
         
         decoders = [
             POCSAGDecoder(),
@@ -64,6 +71,11 @@ def create_app(config=None):
             AISDecoder(),
             ADSBDecoder(),
         ]
+
+        for name in MODULATION_DECODER_NAMES:
+            decoder = create_modulation_decoder(name)
+            if decoder is not None:
+                decoders.append(decoder)
         
         for decoder in decoders:
             decoder_registry.register(decoder)
