@@ -585,6 +585,7 @@ class _POCSAGSingleBaudTS:
                     c = 0
                     cb = 0
         elif self.pageFunc != 0:
+            # nmap = '0123456789*-() '  # standard POCSAG numeric map (matches multimon-ng) KEPT FOR REFERENCE
             nmap = '0123456789 -.)(';  # POCSAG numeric map (matches BrowSDR/Mayhem reference)
             for i in range(0, len(self.pageBits), 4):
                 if i + 3 >= len(self.pageBits):

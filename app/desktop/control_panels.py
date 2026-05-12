@@ -203,8 +203,8 @@ class SingleVFOTab(QWidget):
         dec_group = QGroupBox("Decoders")
         dec_layout = QVBoxLayout()
         self.decoder_list = QListWidget()
-        self.decoder_list.setMaximumHeight(100)
-        self.decoder_list.setMinimumHeight(100)
+        # self.decoder_list.setMaximumHeight(100)
+        # self.decoder_list.setMinimumHeight(100)
         for name in DECODER_NAMES:
             item = QListWidgetItem(name)
             item.setFlags(item.flags() | Qt.ItemIsUserCheckable)

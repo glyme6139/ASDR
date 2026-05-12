@@ -323,6 +323,9 @@ class WaterfallViewer:
         self._write_idx = 0     # next column to overwrite
         self._dirty     = False # True when ring has unrendered data
         self.image_item = pg.ImageItem(self._ring)
+        # Let pyqtgraph smooth the waterfall against the screen resolution instead
+        # of rendering every FFT bin as a hard-edged pixel block.
+        self.image_item.setAutoDownsample(True)
         self.image_item.setLookupTable(self._build_lut())
         self.image_item.setLevels([0, 255])
         plot.addItem(self.image_item)
