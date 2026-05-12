@@ -323,7 +323,7 @@ class WaterfallViewer:
         self._write_idx = 0     # next column to overwrite
         self._dirty     = False # True when ring has unrendered data
         self.image_item = pg.ImageItem(self._ring)
-        self.image_item.setColorMap(self._create_colormap())
+        self.image_item.setLookupTable(self._build_lut())
         self.image_item.setLevels([0, 255])
         plot.addItem(self.image_item)
 
@@ -440,26 +440,40 @@ class WaterfallViewer:
     # Colormap (blue→cyan→green→yellow→red)
     # ------------------------------------------------------------------
 
-    def _create_colormap(self):
-        colors = []
-        for i in range(256):
-            h = (1 - i / 256) * 240
-            r, g, b = self._hsv_to_rgb(h / 360, 1.0, 1.0)
-            colors.append((r, g, b, 255))
-        return pg.ColorMap(pos=np.linspace(0, 1, len(colors)), color=colors)
-
     @staticmethod
-    def _hsv_to_rgb(h, s, v):
-        c = v * s
-        x = c * (1 - abs((h * 6) % 2 - 1))
-        m = v - c
-        if   h < 1/6: r, g, b = c, x, 0
-        elif h < 2/6: r, g, b = x, c, 0
-        elif h < 3/6: r, g, b = 0, c, x
-        elif h < 4/6: r, g, b = 0, x, c
-        elif h < 5/6: r, g, b = x, 0, c
-        else:         r, g, b = c, 0, x
-        return int((r + m) * 255), int((g + m) * 255), int((b + m) * 255)
+    def _build_lut() -> np.ndarray:
+        """Build a 256×3 uint8 LUT matching the BrowSDR color scheme:
+        dark-navy → dodger-blue → white → yellow → orange → red → dark-maroon.
+        Weak signals appear blue, noise-floor-plus signals appear bright white,
+        strong signals go warm orange→red.  Applied via setLookupTable — zero
+        render-time cost over a plain grayscale image.
+        """
+        stops = np.array([
+            [0x00, 0x00, 0x20],
+            [0x00, 0x00, 0x30],
+            [0x00, 0x00, 0x50],
+            [0x00, 0x00, 0x91],
+            [0x1E, 0x90, 0xFF],
+            [0xFF, 0xFF, 0xFF],
+            [0xFF, 0xFF, 0x00],
+            [0xFE, 0x6D, 0x16],
+            [0xFE, 0x6D, 0x16],
+            [0xFF, 0x00, 0x00],
+            [0xFF, 0x00, 0x00],
+            [0xC6, 0x00, 0x00],
+            [0x9F, 0x00, 0x00],
+            [0x75, 0x00, 0x00],
+            [0x4A, 0x00, 0x00],
+        ], dtype=np.float32)
+        n = len(stops)
+        lut = np.empty((256, 3), dtype=np.uint8)
+        for i in range(256):
+            p = i / 255.0 * n
+            lo = min(int(p), n - 1)
+            hi = min(lo + 1, n - 1)
+            t  = p - lo
+            lut[i] = np.clip(stops[lo] * (1 - t) + stops[hi] * t, 0, 255).astype(np.uint8)
+        return lut
 
 
 class VisualizationPanel(QWidget):
