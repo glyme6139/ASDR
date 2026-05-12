@@ -1,164 +1,149 @@
 """
-SDR signal processing worker thread.
+DSP worker — runs inside the DSP subprocess (no Qt).
 
-IQ pipeline (one FFT per block, shared between display and all VFOs):
+IQ pipeline (one FFT per audio block, separate larger FFT for display):
 
-  IQ block (FFT_SIZE samples)
+  IQ stream
       │
-      ├─ np.fft.fftshift(np.fft.fft(block))          ← single FFT
-      │       │
-      │       ├── display (spectrum + waterfall)       ← rate-limited
-      │       │
-      │       └── per VFO: extract [lo:hi] bins        ← O(n_bins)
-      │                 └── IFFT extracted slice        ← narrowband IQ at ~VFO bandwidth
-      │                           └── demodulate + resample → 48 kHz audio
+      ├─ rolling 32768-sample window  →  Hann-windowed FFT  →  spectrum / waterfall
+      │                                  (written to shared memory, 20 Hz)
+      │
+      └─ 4096-sample blocks  →  per-VFO bin extraction  →  IFFT  →  demod  →  48 kHz audio
 
-This eliminates the channel LPF (128-tap FIR × full sample rate) and integer
-pre-decimation that were the bottleneck at 20 MHz (35% audio production rate).
+Communicates with the UI process via:
+  - multiprocessing queues (cmd_q / result_q)
+  - shared memory numpy arrays (spectrum_buf, waterfall_buf, disp_gen counter)
 """
 
-import queue
+import queue as stdlib_queue
 import time
 import numpy as np
-from PySide6.QtCore import QThread, Signal
 import logging
-from .audio_output import CHUNK, AUDIO_RATE
 
 logger = logging.getLogger(__name__)
 
-FFT_SIZE         = 4096    # audio extraction block size (kept small for low latency)
-DISPLAY_FFT_SIZE = 32768   # display-only FFT: 610 Hz/bin at 20 MHz, 8× finer than audio FFT
-DISPLAY_HZ       = 20      # target spectrum/waterfall update rate
-MIN_BINS         = 4       # minimum frequency bins to extract per VFO
+FFT_SIZE         = 4096
+DISPLAY_FFT_SIZE = 32768
+DISPLAY_HZ       = 20
+MIN_BINS         = 4
+
+# Imported lazily inside DSPWorker to keep this module importable without audio deps
+_AUDIO_RATE = 48_000
+_CHUNK      = 2048
 
 
-class SDRWorkerThread(QThread):
-    """Background thread for SDR signal processing."""
-
-    spectrum_updated      = Signal(np.ndarray)
-    waterfall_updated     = Signal(np.ndarray)
-    device_status_changed = Signal(dict)
-    error_occurred        = Signal(str)
-    audio_ready           = Signal(int, object)       # vfo_id, np.ndarray
-    decoder_result        = Signal(int, str, str)     # vfo_id, name, text
+class DSPWorker:
+    """Pure-Python DSP engine. No Qt — runs in a subprocess."""
 
     DEMO_SAMPLE_RATE = 96_000
     DEMO_TICK        = 0.05
 
-    def __init__(self, vfo_manager=None, audio_mixer=None, display_buffers=None, parent=None):
-        super().__init__(parent)
-        self.vfo_manager = vfo_manager
-        self.audio_mixer = audio_mixer
-        # Optional dict of SharedLatest buffers: {'spectrum': SharedLatest, 'waterfall': SharedLatest}
-        self.display_buffers = display_buffers
-        self.receiver    = None
-        self.running     = False
+    def __init__(self, cmd_q, result_q, spec_arr: np.ndarray,
+                 wf_arr: np.ndarray, disp_gen):
+        self._cmd_q    = cmd_q
+        self._result_q = result_q
+        self._spec_arr = spec_arr   # shared memory float32 view
+        self._wf_arr   = wf_arr     # shared memory uint8 view
+        self._disp_gen = disp_gen   # mp.Value('L', 0)
 
-        self.fft_size   = FFT_SIZE
-        self._iq_buf    = np.zeros(FFT_SIZE, dtype=np.complex64)
-        self._buf_idx   = 0
+        from app.sdr.vfo import VFOManager
+        from app.desktop.audio_output import AudioMixer, AUDIO_RATE, CHUNK
+        global _AUDIO_RATE, _CHUNK
+        _AUDIO_RATE = AUDIO_RATE
+        _CHUNK      = CHUNK
 
-        # Set once sample rate is known (run() or _do_sample_rate)
+        self.vfo_manager = VFOManager(center_freq=100e6, sample_rate=20e6, max_vfos=10)
+        self.audio_mixer = AudioMixer()
+
+        self.receiver  = None
+        self.running   = False
+
+        self._iq_buf  = np.zeros(FFT_SIZE, dtype=np.complex64)
+        self._buf_idx = 0
+
         self._sample_rate  = 20e6
-        self._display_skip = 1    # FFT blocks between display updates
+        self._display_skip = 1
         self._display_tick = 0
 
-        self._cmd_queue: queue.Queue = queue.Queue()
-        # Per-VFO IQ accumulation — batch small IQ slices until enough for one CHUNK output.
-        # Maps vfo_id -> list[np.ndarray] of narrowband IQ fragments
-        self._vfo_iq_accum:  dict = {}
-        # Maps vfo_id -> nb_sr seen on last block (to detect bandwidth changes)
-        self._vfo_iq_nb_sr:  dict = {}
+        self._vfo_iq_accum: dict = {}
+        self._vfo_iq_nb_sr: dict = {}
 
-        # High-resolution display buffer: rolling circular window of DISPLAY_FFT_SIZE samples.
-        # Filled independently of the audio FFT so display resolution is decoupled from
-        # audio block size. Hann window pre-computed once to reduce spectral leakage.
         self._disp_buf    = np.zeros(DISPLAY_FFT_SIZE, dtype=np.complex64)
         self._disp_write  = 0
         self._disp_window = np.hanning(DISPLAY_FFT_SIZE).astype(np.float32)
+        self._wf_floor    = None
+
+        self._last_sig_t  = 0.0
 
     # ------------------------------------------------------------------
-    # Thread entry point
+    # Entry point
     # ------------------------------------------------------------------
 
     def run(self):
         try:
             use_hackrf = self._try_init_hackrf()
             self.running = True
+            self.audio_mixer.start()
 
             sr = self.receiver.config.sample_rate if use_hackrf else self.DEMO_SAMPLE_RATE
             self._update_rate_params(sr)
 
-            self.device_status_changed.emit({
-                'connected':   True,
-                'frequency':   100e6,
-                'sample_rate': sr,
-            })
+            self._emit({'type': 'device_status',
+                        'data': {'connected': True, 'frequency': 100e6, 'sample_rate': sr}})
 
             if use_hackrf:
                 self._real_hw_loop()
             else:
-                logger.info("Running in demo/simulation mode")
+                logger.info("DSPWorker: demo mode")
                 self._demo_loop()
 
         except Exception as e:
-            logger.error(f"SDR worker error: {e}", exc_info=True)
-            self.error_occurred.emit(str(e))
+            logger.error(f"DSPWorker error: {e}", exc_info=True)
+            self._emit({'type': 'error', 'message': str(e)})
         finally:
             self._cleanup()
 
+    def _emit(self, msg: dict):
+        try:
+            self._result_q.put_nowait(msg)
+        except Exception:
+            pass
+
     def _update_rate_params(self, sr: float):
-        """Recompute rate-dependent constants whenever sample rate changes."""
         self._sample_rate  = sr
-        blocks_per_sec     = sr / FFT_SIZE
-        self._display_skip = max(1, round(blocks_per_sec / DISPLAY_HZ))
-        logger.info(
-            f"SDRWorker rate params: SR={sr/1e6:.3f}MHz  "
-            f"bin={sr/FFT_SIZE:.0f}Hz  "
-            f"display_skip={self._display_skip}"
-        )
+        self._display_skip = max(1, round((sr / FFT_SIZE) / DISPLAY_HZ))
 
     def _try_init_hackrf(self) -> bool:
         try:
             from app.sdr.hackrf_receiver import HackRFReceiver
         except ImportError:
-            logger.warning("HackRF module not available, using demo mode")
             return False
-
         self.receiver = HackRFReceiver()
         self.receiver.on_iq_data = self._process_iq
-
         if not self.receiver.connect():
-            logger.warning("HackRF connect failed, using demo mode")
             self.receiver = None
             return False
-
         if self.receiver.device is None:
-            logger.info("No real HackRF hardware — using demo loop")
             self.receiver = None
             return False
-
         self.receiver.start_receiver()
         return True
 
     # ------------------------------------------------------------------
-    # Hardware / demo loops
+    # Main loops
     # ------------------------------------------------------------------
 
     def _real_hw_loop(self):
         while self.running:
             self._drain_commands()
-            self.msleep(20)
+            time.sleep(0.02)
 
     def _demo_loop(self):
         sr         = self.DEMO_SAMPLE_RATE
         dt         = self.DEMO_TICK
         chunk_size = int(sr * dt)
-
-        if self.vfo_manager:
-            self.vfo_manager.update_sample_rate(sr)
-
-        next_tick = time.monotonic()
+        self.vfo_manager.update_sample_rate(sr)
+        next_tick  = time.monotonic()
 
         while self.running:
             self._drain_commands()
@@ -175,340 +160,106 @@ class SDRWorkerThread(QThread):
                 noise = 0.05 * (np.random.randn(chunk_size) + 1j * np.random.randn(chunk_size))
                 self._process_iq((sig + noise).astype(np.complex64))
                 next_tick += dt
-
-            sleep_ms = max(1, int((next_tick - time.monotonic()) * 1000))
-            self.msleep(min(sleep_ms, 20))
+            time.sleep(max(0.001, min(next_tick - time.monotonic(), 0.02)))
 
     # ------------------------------------------------------------------
-    # Command queue
+    # Command dispatch
     # ------------------------------------------------------------------
-
-    def _post_command(self, fn):
-        self._cmd_queue.put_nowait(fn)
 
     def _drain_commands(self):
         while True:
             try:
-                fn = self._cmd_queue.get_nowait()
-                try:
-                    fn()
-                except Exception as e:
-                    logger.error(f"Command error: {e}", exc_info=True)
-            except queue.Empty:
+                self._dispatch(self._cmd_q.get_nowait())
+            except stdlib_queue.Empty:
                 break
+            except Exception as e:
+                logger.error(f"Command error: {e}", exc_info=True)
+
+    def _dispatch(self, msg: dict):
+        cmd = msg.get('cmd')
+        if   cmd == 'stop':
+            self.running = False
+        elif cmd == 'set_center_frequency':
+            self._do_center_freq(msg['freq_hz'])
+        elif cmd == 'set_sample_rate':
+            self._do_sample_rate(msg['rate'])
+        elif cmd == 'set_lna_gain':
+            self._do_lna_gain(msg['value'])
+        elif cmd == 'set_vga_gain':
+            self._do_vga_gain(msg['value'])
+        elif cmd == 'set_amp_enable':
+            self._do_amp_enable(msg['enabled'])
+        elif cmd == 'add_vfo':
+            vfo_id = msg.get('vfo_id')
+            freq   = msg.get('freq_hz', self.vfo_manager.center_freq)
+            self.vfo_manager.create_vfo(frequency=freq, vfo_id=vfo_id)
+            self.audio_mixer.add_vfo(vfo_id if vfo_id is not None else 0)
+        elif cmd == 'remove_vfo':
+            vid = msg['vfo_id']
+            self.vfo_manager.delete_vfo(vid)
+            self.audio_mixer.remove_vfo(vid)
+            self._vfo_iq_accum.pop(vid, None)
+            self._vfo_iq_nb_sr.pop(vid, None)
+        elif cmd == 'set_vfo_frequency':
+            vfo = self.vfo_manager.get_vfo(msg['vfo_id'])
+            if vfo: vfo.set_frequency(float(msg['freq_hz']))
+        elif cmd == 'set_vfo_demod':
+            vfo = self.vfo_manager.get_vfo(msg['vfo_id'])
+            if vfo: vfo.set_demod_mode(msg['mode'])
+        elif cmd == 'set_vfo_bandwidth':
+            vfo = self.vfo_manager.get_vfo(msg['vfo_id'])
+            if vfo: vfo.set_bandwidth(float(msg['bandwidth_hz']))
+        elif cmd == 'set_vfo_squelch':
+            vfo = self.vfo_manager.get_vfo(msg['vfo_id'])
+            if vfo: vfo.set_squelch(msg['level_db'], enabled=vfo.settings.squelch_enabled)
+        elif cmd == 'set_vfo_squelch_enabled':
+            vfo = self.vfo_manager.get_vfo(msg['vfo_id'])
+            if vfo: vfo.set_squelch_enabled(bool(msg['enabled']))
+        elif cmd == 'set_vfo_muted':
+            vfo = self.vfo_manager.get_vfo(msg['vfo_id'])
+            if vfo:
+                vfo.set_audio_enabled(not bool(msg['muted']))
+                self.audio_mixer.set_muted(msg['vfo_id'], bool(msg['muted']))
+        elif cmd == 'set_volume':
+            self.audio_mixer.set_volume(msg['vfo_id'], msg['volume'])
+        elif cmd == 'toggle_decoder':
+            self._do_toggle_decoder(msg['vfo_id'], msg['decoder_name'], msg['enabled'])
 
     # ------------------------------------------------------------------
-    # IQ ingestion — accumulate into FFT-sized blocks
+    # Hardware commands
     # ------------------------------------------------------------------
-
-    def _process_iq(self, iq_data: np.ndarray):
-        if not self.running:
-            return
-        try:
-            # --- Fill rolling display buffer (circular, independent of audio blocks) ---
-            n = len(iq_data)
-            w = self._disp_write
-            if n >= DISPLAY_FFT_SIZE:
-                # Incoming chunk larger than display window — just keep the tail
-                self._disp_buf[:] = iq_data[-DISPLAY_FFT_SIZE:]
-                self._disp_write  = 0
-            else:
-                end = w + n
-                if end <= DISPLAY_FFT_SIZE:
-                    self._disp_buf[w:end] = iq_data
-                else:
-                    first = DISPLAY_FFT_SIZE - w
-                    self._disp_buf[w:]     = iq_data[:first]
-                    self._disp_buf[:n - first] = iq_data[first:]
-                self._disp_write = end % DISPLAY_FFT_SIZE
-
-            # --- Audio FFT accumulation (unchanged) ---
-            pos = 0
-            while pos < len(iq_data):
-                space    = FFT_SIZE - self._buf_idx
-                to_copy  = min(len(iq_data) - pos, space)
-                self._iq_buf[self._buf_idx:self._buf_idx + to_copy] = iq_data[pos:pos + to_copy]
-                self._buf_idx += to_copy
-                pos           += to_copy
-
-                if self._buf_idx >= FFT_SIZE:
-                    self._process_block(self._iq_buf)
-                    self._buf_idx = 0
-        except Exception as e:
-            logger.error(f"IQ processing error: {e}")
-
-    # ------------------------------------------------------------------
-    # Core per-block processing — one FFT for everything
-    # ------------------------------------------------------------------
-
-    def _process_block(self, block: np.ndarray):
-        start_t = time.monotonic()
-        sr     = self._sample_rate
-        N      = FFT_SIZE
-        bin_hz = sr / N
-
-        # Audio FFT — small block, used only for VFO channelization
-        fft_out = np.fft.fftshift(np.fft.fft(block))
-
-        # ---- Display (rate-limited, high-resolution separate FFT) ----
-        self._display_tick += 1
-        if self._display_tick >= self._display_skip:
-            self._display_tick = 0
-
-            # Unroll circular display buffer: oldest → newest order
-            w = self._disp_write
-            if w == 0:
-                ordered = self._disp_buf.copy()
-            else:
-                ordered = np.empty(DISPLAY_FFT_SIZE, dtype=np.complex64)
-                ordered[:DISPLAY_FFT_SIZE - w] = self._disp_buf[w:]
-                ordered[DISPLAY_FFT_SIZE - w:] = self._disp_buf[:w]
-
-            # Hann window eliminates spectral leakage; result is 32768-bin spectrum
-            fft_disp = np.fft.fftshift(np.fft.fft(ordered * self._disp_window))
-            spectrum = (10.0 * np.log10(np.abs(fft_disp) ** 2 + 1e-10)).astype(np.float32)
-
-            # Prefer writing to shared buffers if provided to avoid filling the Qt event queue.
-            if self.display_buffers:
-                try:
-                    self.display_buffers.get('spectrum') and self.display_buffers['spectrum'].set(spectrum)
-                    self.display_buffers.get('waterfall') and self.display_buffers['waterfall'].set(
-                        self._make_waterfall_row(spectrum)
-                    )
-                except Exception:
-                    # Fall back to Qt signals on unexpected error
-                    self.spectrum_updated.emit(spectrum)
-                    self.waterfall_updated.emit(self._make_waterfall_row(spectrum))
-            else:
-                self.spectrum_updated.emit(spectrum)
-                self.waterfall_updated.emit(self._make_waterfall_row(spectrum))
-
-        # ---- Audio: per-VFO channelizer with IQ accumulation ----
-        if self.vfo_manager is None:
-            return
-
-        center_freq = self.vfo_manager.center_freq
-
-        for vfo in self.vfo_manager.get_all_vfos():
-            iq_nb, nb_sr = self._extract_vfo_iq(fft_out, vfo, sr, N, bin_hz, center_freq)
-            if iq_nb is None:
-                continue
-
-            vfo_id = vfo.id
-
-            # Flush accumulator if sample rate changed (bandwidth/SR change)
-            if vfo_id in self._vfo_iq_nb_sr and abs(self._vfo_iq_nb_sr[vfo_id] - nb_sr) > 1.0:
-                self._vfo_iq_accum[vfo_id] = []
-            self._vfo_iq_nb_sr[vfo_id] = nb_sr
-
-            if vfo_id not in self._vfo_iq_accum:
-                self._vfo_iq_accum[vfo_id] = []
-            self._vfo_iq_accum[vfo_id].append(iq_nb)
-
-            # IQ samples needed to produce exactly CHUNK audio samples at AUDIO_RATE
-            iq_needed = max(1, int(nb_sr * CHUNK / AUDIO_RATE))
-            total_iq  = sum(len(x) for x in self._vfo_iq_accum[vfo_id])
-            if total_iq < iq_needed:
-                continue
-
-            buf   = np.concatenate(self._vfo_iq_accum[vfo_id])
-            total = len(buf)
-            pos   = 0
-
-            while pos + iq_needed <= total:
-                audio, dec_results = vfo.process_narrowband_iq(
-                    buf[pos:pos + iq_needed], nb_sr, CHUNK
-                )
-                if audio is not None and len(audio) > 0:
-                    self._push_audio(vfo_id, audio)
-                for result in dec_results:
-                    formatted = str(result.data)
-                    for decoder in vfo.decoders:
-                        if decoder.name == result.decoder_name:
-                            try:
-                                formatted = decoder.format_result(result)
-                            except Exception:
-                                logger.exception("Decoder %s formatter failed", decoder.name)
-                                formatted = str(result.data)
-                            break
-                    self.decoder_result.emit(vfo_id, result.decoder_name, formatted)
-                pos += iq_needed
-
-            self._vfo_iq_accum[vfo_id] = [buf[pos:]] if pos < total else []
-
-        # Measure total time for this block (FFT + display prep + per-VFO work).
-        try:
-            elapsed = (time.monotonic() - start_t) * 1000.0
-            # if elapsed > 10.0:
-                # logger.warning(f"[SDRWorker] slow block processing: {elapsed:.1f} ms")
-        except Exception:
-            pass
-
-    def _extract_vfo_iq(self, fft_shifted, vfo, sr, N, bin_hz, center_freq):
-        """
-        Slice VFO bins from the fftshifted output and IFFT → narrowband IQ.
-
-        In the fftshifted array, index N//2 = DC (center_freq).
-        Positive offset → higher index; negative offset → lower index.
-        """
-        if not vfo.settings.enabled:
-            return None, None
-
-        offset_hz  = vfo.settings.frequency - center_freq
-        n_bins     = max(MIN_BINS, round(vfo.settings.bandwidth / bin_hz))
-        center_bin = N // 2 + round(offset_hz / bin_hz)
-        lo         = center_bin - n_bins // 2
-        hi         = lo + n_bins
-
-        if lo < 0 or hi > N:
-            return None, None
-
-        # Extract and IFFT — ifftshift moves the VFO center to DC in the output
-        extracted    = fft_shifted[lo:hi]
-        narrowband   = np.fft.ifft(np.fft.ifftshift(extracted))
-        # Amplitude correction: ifft divides by n_bins, compensate for bin count vs block size
-        narrowband   = (narrowband * (N / n_bins)).astype(np.complex64)
-
-        nb_sr = bin_hz * n_bins
-        logger.debug(
-            "[SDRWorker] VFO%s extract: offset_hz=%.2f n_bins=%d lo=%d hi=%d nb_sr=%.2f",
-            vfo.id, offset_hz, n_bins, lo, hi, nb_sr,
-        )
-        return narrowband, nb_sr
-
-    # ------------------------------------------------------------------
-    # Audio push
-    # ------------------------------------------------------------------
-
-    _diag_push_count   = 0
-    _diag_push_samples = 0
-    _diag_push_nans    = 0
-    _diag_last_t       = 0.0
-
-    def _push_audio(self, vfo_id: int, audio: np.ndarray):
-        self._diag_push_count   += 1
-        self._diag_push_samples += len(audio)
-        if not np.isfinite(audio).all():
-            self._diag_push_nans += 1
-
-        now = time.monotonic()
-        if self._diag_last_t == 0.0:
-            self._diag_last_t = now
-        elif now - self._diag_last_t >= 3.0:
-            dt   = now - self._diag_last_t
-            rate = self._diag_push_samples / dt
-            logger.warning(
-                f"[SDRWorker] push_audio: {self._diag_push_count} calls in {dt:.1f}s  "
-                f"rate={rate:.0f} smp/s ({rate/48000*100:.0f}% of 48kHz)  "
-                f"nan_chunks={self._diag_push_nans}"
-            )
-            self._diag_push_count = self._diag_push_samples = self._diag_push_nans = 0
-            self._diag_last_t = now
-
-        if self.audio_mixer is not None:
-            self.audio_mixer.push_audio(vfo_id, audio)
-        else:
-            self.audio_ready.emit(vfo_id, audio)
-
-    # ------------------------------------------------------------------
-    # Display helpers
-    # ------------------------------------------------------------------
-
-    def _make_waterfall_row(self, spectrum: np.ndarray) -> np.ndarray:
-        if len(spectrum) == 0:
-            return np.zeros(1, dtype=np.uint8)
-        # Adaptive noise floor: slow exponential average of the 15th percentile.
-        # Avoids per-frame min/max normalization which makes the noise floor jump
-        # every time a carrier appears or disappears (the "blocky" time-axis look).
-        floor = float(np.percentile(spectrum, 15))
-        if not hasattr(self, '_wf_floor'):
-            self._wf_floor = floor
-        else:
-            self._wf_floor += 0.05 * (floor - self._wf_floor)
-        normalized = np.clip((spectrum - self._wf_floor) / 70.0, 0.0, 1.0)
-        return (normalized * 255).astype(np.uint8)
-
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
-
-    def stop(self):
-        self.running = False
-        self.wait()
-
-    def _cleanup(self):
-        if self.receiver:
-            try:
-                self.receiver.stop_receiver()
-            except Exception:
-                pass
-        self.device_status_changed.emit({'connected': False})
-
-    # ------------------------------------------------------------------
-    # Public control methods (thread-safe via command queue)
-    # ------------------------------------------------------------------
-
-    def set_center_frequency(self, freq_hz: float):
-        if self.vfo_manager:
-            self.vfo_manager.update_center_freq(float(freq_hz))
-        self._post_command(lambda: self._do_center_freq(float(freq_hz)))
-        self.device_status_changed.emit({'frequency': freq_hz})
 
     def _do_center_freq(self, freq_hz: float):
+        self.vfo_manager.update_center_freq(freq_hz)
         if self.receiver:
             try:
                 self.receiver.set_center_frequency(freq_hz)
             except Exception as e:
-                logger.error(f"Center freq change failed: {e}")
-                self.error_occurred.emit(f"Center freq change failed: {e}")
+                logger.error(f"Center freq failed: {e}")
+        self._emit({'type': 'device_status', 'data': {'frequency': freq_hz}})
 
-    def set_frequency(self, freq_hz: float):
-        self.set_center_frequency(freq_hz)
-
-    def set_sample_rate(self, sample_rate: float):
-        if self.vfo_manager:
-            self.vfo_manager.sample_rate = float(sample_rate)
-        self._post_command(lambda: self._do_sample_rate(float(sample_rate)))
-        self.device_status_changed.emit({'sample_rate': sample_rate})
-
-    def _do_sample_rate(self, sample_rate: float):
+    def _do_sample_rate(self, sr: float):
         if self.receiver:
             try:
                 self.receiver.stop_receiver()
-                self.receiver.config.sample_rate = sample_rate
-                if self.vfo_manager:
-                    self.vfo_manager.update_sample_rate(sample_rate)
+                self.receiver.config.sample_rate = sr
+                self.vfo_manager.update_sample_rate(sr)
                 if self.receiver.connect():
                     self.receiver.start_receiver()
-                else:
-                    logger.error("Reconnect failed after sample rate change")
             except Exception as e:
                 logger.error(f"Sample rate change failed: {e}")
-                self.error_occurred.emit(f"Sample rate change failed: {e}")
-        self._update_rate_params(sample_rate)
-
-    def set_lna_gain(self, value: float):
-        self._post_command(lambda: self._do_lna_gain(float(value)))
+        self._update_rate_params(sr)
+        self._emit({'type': 'device_status', 'data': {'sample_rate': sr}})
 
     def _do_lna_gain(self, value: float):
         if self.receiver:
-            try:
-                self.receiver.set_lna_gain(value)
-            except Exception as e:
-                logger.error(f"LNA gain change failed: {e}")
-
-    def set_vga_gain(self, value: float):
-        self._post_command(lambda: self._do_vga_gain(float(value)))
+            try: self.receiver.set_lna_gain(value)
+            except Exception as e: logger.error(f"LNA gain: {e}")
 
     def _do_vga_gain(self, value: float):
         if self.receiver:
-            try:
-                self.receiver.set_vga_gain(value)
-            except Exception as e:
-                logger.error(f"VGA gain change failed: {e}")
-
-    def set_amp_enable(self, enabled: bool):
-        self._post_command(lambda: self._do_amp_enable(bool(enabled)))
+            try: self.receiver.set_vga_gain(value)
+            except Exception as e: logger.error(f"VGA gain: {e}")
 
     def _do_amp_enable(self, enabled: bool):
         if self.receiver:
@@ -517,49 +268,186 @@ class SDRWorkerThread(QThread):
                 self.receiver.config.amp_enabled = enabled
                 if self.receiver.connect():
                     self.receiver.start_receiver()
-                else:
-                    logger.error("Reconnect failed after amp enable change")
-                    self.error_occurred.emit("Reconnect failed after amp enable change")
             except Exception as e:
-                logger.error(f"Amp enable change failed: {e}")
-                self.error_occurred.emit(f"Amp enable change failed: {e}")
+                logger.error(f"Amp enable: {e}")
 
-    def set_vfo_frequency(self, vfo_id: int, freq_hz: float):
-        if self.vfo_manager:
-            vfo = self.vfo_manager.get_vfo(vfo_id)
-            if vfo:
-                vfo.set_frequency(float(freq_hz))
+    def _do_toggle_decoder(self, vfo_id: int, decoder_name: str, enabled: bool):
+        vfo = self.vfo_manager.get_vfo(vfo_id)
+        if vfo is None:
+            return
+        if enabled:
+            dec = self._make_decoder(decoder_name)
+            if dec:
+                vfo.add_decoder(dec)
+        else:
+            vfo.remove_decoder(decoder_name)
 
-    def set_vfo_demod(self, vfo_id: int, mode: str):
-        if self.vfo_manager:
-            vfo = self.vfo_manager.get_vfo(vfo_id)
-            if vfo:
-                vfo.set_demod_mode(mode)
+    def _make_decoder(self, name: str):
+        try:
+            if name == 'POCSAG':
+                from app.decoders.pocsag import POCSAGDecoder
+                return POCSAGDecoder()
+            elif name == 'RDS':
+                from app.decoders.rds import RDSDecoder
+                return RDSDecoder()
+            elif name == 'AIS':
+                from app.decoders.ais import AISDecoder
+                return AISDecoder()
+            elif name == 'ADSB':
+                from app.decoders.adsb import ADSBDecoder
+                return ADSBDecoder()
+        except Exception as e:
+            logger.error(f"Decoder instantiation failed ({name}): {e}")
+        return None
 
-    def set_vfo_muted(self, vfo_id: int, muted: bool):
-        """Toggle audio production for a specific VFO (mute/unmute).
+    # ------------------------------------------------------------------
+    # IQ processing
+    # ------------------------------------------------------------------
 
-        This stops the heavy demod/resample work when muted.
-        """
-        if self.vfo_manager:
-            vfo = self.vfo_manager.get_vfo(vfo_id)
-            if vfo:
-                vfo.set_audio_enabled(not bool(muted))
+    def _process_iq(self, iq_data: np.ndarray):
+        if not self.running:
+            return
+        try:
+            # Fill rolling display buffer (circular)
+            n = len(iq_data)
+            w = self._disp_write
+            if n >= DISPLAY_FFT_SIZE:
+                self._disp_buf[:] = iq_data[-DISPLAY_FFT_SIZE:]
+                self._disp_write  = 0
+            else:
+                end = w + n
+                if end <= DISPLAY_FFT_SIZE:
+                    self._disp_buf[w:end] = iq_data
+                else:
+                    first = DISPLAY_FFT_SIZE - w
+                    self._disp_buf[w:]          = iq_data[:first]
+                    self._disp_buf[:n - first]  = iq_data[first:]
+                self._disp_write = end % DISPLAY_FFT_SIZE
 
-    def set_vfo_bandwidth(self, vfo_id: int, bandwidth_hz: float):
-        if self.vfo_manager:
-            vfo = self.vfo_manager.get_vfo(vfo_id)
-            if vfo:
-                vfo.set_bandwidth(float(bandwidth_hz))
+            # Audio FFT accumulation
+            pos = 0
+            while pos < len(iq_data):
+                space   = FFT_SIZE - self._buf_idx
+                to_copy = min(len(iq_data) - pos, space)
+                self._iq_buf[self._buf_idx:self._buf_idx + to_copy] = iq_data[pos:pos + to_copy]
+                self._buf_idx += to_copy
+                pos           += to_copy
+                if self._buf_idx >= FFT_SIZE:
+                    self._process_block(self._iq_buf)
+                    self._buf_idx = 0
+        except Exception as e:
+            logger.error(f"IQ processing error: {e}")
 
-    def set_vfo_squelch(self, vfo_id: int, level_db: float):
-        if self.vfo_manager:
-            vfo = self.vfo_manager.get_vfo(vfo_id)
-            if vfo:
-                vfo.set_squelch(level_db, enabled=vfo.settings.squelch_enabled)
+    def _process_block(self, block: np.ndarray):
+        sr     = self._sample_rate
+        N      = FFT_SIZE
+        bin_hz = sr / N
 
-    def set_vfo_squelch_enabled(self, vfo_id: int, enabled: bool):
-        if self.vfo_manager:
-            vfo = self.vfo_manager.get_vfo(vfo_id)
-            if vfo:
-                vfo.set_squelch_enabled(bool(enabled))
+        fft_out = np.fft.fftshift(np.fft.fft(block))
+
+        # High-res display FFT (rate-limited)
+        self._display_tick += 1
+        if self._display_tick >= self._display_skip:
+            self._display_tick = 0
+            w = self._disp_write
+            if w == 0:
+                ordered = self._disp_buf.copy()
+            else:
+                ordered = np.empty(DISPLAY_FFT_SIZE, dtype=np.complex64)
+                ordered[:DISPLAY_FFT_SIZE - w] = self._disp_buf[w:]
+                ordered[DISPLAY_FFT_SIZE - w:] = self._disp_buf[:w]
+
+            fft_disp = np.fft.fftshift(np.fft.fft(ordered * self._disp_window))
+            spectrum = (10.0 * np.log10(np.abs(fft_disp) ** 2 + 1e-10)).astype(np.float32)
+
+            np.copyto(self._spec_arr, spectrum)
+            np.copyto(self._wf_arr,   self._make_waterfall_row(spectrum))
+            self._disp_gen.value += 1
+
+        # Per-VFO audio channelization
+        center_freq = self.vfo_manager.center_freq
+        for vfo in self.vfo_manager.get_all_vfos():
+            iq_nb, nb_sr = self._extract_vfo_iq(fft_out, vfo, sr, N, bin_hz, center_freq)
+            if iq_nb is None:
+                continue
+
+            vfo_id = vfo.id
+            if vfo_id in self._vfo_iq_nb_sr and abs(self._vfo_iq_nb_sr[vfo_id] - nb_sr) > 1.0:
+                self._vfo_iq_accum[vfo_id] = []
+            self._vfo_iq_nb_sr[vfo_id] = nb_sr
+
+            self._vfo_iq_accum.setdefault(vfo_id, []).append(iq_nb)
+
+            iq_needed = max(1, int(nb_sr * _CHUNK / _AUDIO_RATE))
+            total_iq  = sum(len(x) for x in self._vfo_iq_accum[vfo_id])
+            if total_iq < iq_needed:
+                continue
+
+            buf   = np.concatenate(self._vfo_iq_accum[vfo_id])
+            total = len(buf)
+            pos   = 0
+            while pos + iq_needed <= total:
+                audio, dec_results = vfo.process_narrowband_iq(
+                    buf[pos:pos + iq_needed], nb_sr, _CHUNK
+                )
+                if audio is not None and len(audio) > 0:
+                    self.audio_mixer.push_audio(vfo_id, audio)
+                for result in dec_results:
+                    formatted = str(result.data)
+                    for dec in vfo.decoders:
+                        if dec.name == result.decoder_name:
+                            try:
+                                formatted = dec.format_result(result)
+                            except Exception:
+                                pass
+                            break
+                    self._emit({'type': 'decoder_result', 'vfo_id': vfo_id,
+                                'name': result.decoder_name, 'text': formatted})
+                pos += iq_needed
+            self._vfo_iq_accum[vfo_id] = [buf[pos:]] if pos < total else []
+
+        # Signal strength (throttled to ~150 ms)
+        now = time.monotonic()
+        if now - self._last_sig_t >= 0.15:
+            self._last_sig_t = now
+            updates = {vfo.id: (vfo.signal_db, vfo.is_active)
+                       for vfo in self.vfo_manager.get_all_vfos()}
+            if updates:
+                self._emit({'type': 'signal_strength', 'updates': updates})
+
+    def _extract_vfo_iq(self, fft_shifted, vfo, sr, N, bin_hz, center_freq):
+        if not vfo.settings.enabled:
+            return None, None
+        offset_hz  = vfo.settings.frequency - center_freq
+        n_bins     = max(MIN_BINS, round(vfo.settings.bandwidth / bin_hz))
+        center_bin = N // 2 + round(offset_hz / bin_hz)
+        lo         = center_bin - n_bins // 2
+        hi         = lo + n_bins
+        if lo < 0 or hi > N:
+            return None, None
+        extracted  = fft_shifted[lo:hi]
+        narrowband = np.fft.ifft(np.fft.ifftshift(extracted))
+        narrowband = (narrowband * (N / n_bins)).astype(np.complex64)
+        return narrowband, bin_hz * n_bins
+
+    def _make_waterfall_row(self, spectrum: np.ndarray) -> np.ndarray:
+        if len(spectrum) == 0:
+            return np.zeros(DISPLAY_FFT_SIZE, dtype=np.uint8)
+        floor = float(np.percentile(spectrum, 15))
+        if self._wf_floor is None:
+            self._wf_floor = floor
+        else:
+            self._wf_floor += 0.05 * (floor - self._wf_floor)
+        return (np.clip((spectrum - self._wf_floor) / 70.0, 0.0, 1.0) * 255).astype(np.uint8)
+
+    # ------------------------------------------------------------------
+    # Cleanup
+    # ------------------------------------------------------------------
+
+    def _cleanup(self):
+        if self.receiver:
+            try: self.receiver.stop_receiver()
+            except Exception: pass
+        try: self.audio_mixer.stop()
+        except Exception: pass
+        self._emit({'type': 'device_status', 'data': {'connected': False}})

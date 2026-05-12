@@ -526,9 +526,32 @@ class VisualizationPanel(QWidget):
     def update_waterfall(self, data: np.ndarray):
         self._pending_waterfall = data
 
+    def set_process_display(self, spec_arr: np.ndarray, wf_arr: np.ndarray, disp_gen):
+        """Wire up shared-memory numpy arrays from the DSP subprocess.
+
+        Once called, _flush_pending reads directly from shared memory instead
+        of the _pending_* / SharedLatest paths.  disp_gen is a multiprocessing
+        Value('L') incremented by the DSP process on every new frame.
+        """
+        self._shm_spec     = spec_arr
+        self._shm_wf       = wf_arr
+        self._shm_gen      = disp_gen
+        self._shm_last_gen = -1
+
     def _flush_pending(self):
         t0 = time.monotonic()
 
+        # Fast path: shared memory from DSP subprocess
+        if hasattr(self, '_shm_spec'):
+            gen = self._shm_gen.value
+            if gen != self._shm_last_gen:
+                self._shm_last_gen = gen
+                self.spectrum.update_spectrum(self._shm_spec)
+                self.waterfall.update_waterfall(self._shm_wf)
+            self.waterfall.render_pending()
+            return
+
+        # Legacy path: SharedLatest buffers or direct push
         if self._display_buffers:
             try:
                 sb = self._display_buffers.get('spectrum')

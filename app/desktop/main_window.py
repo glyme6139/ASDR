@@ -14,17 +14,16 @@ from PySide6.QtWidgets import (
     QLabel,
     QTextBrowser,
 )
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt
 
 from .visualizations import VisualizationPanel, VFO_COLORS
 from .control_panels import ControlPanel
-from .sdr_worker import SDRWorkerThread
-from .audio_output import AudioMixer
-from app.sdr.vfo import VFOManager
-from .display_buffers import SharedLatest
+from .dsp_process import DSPProcess
+from .ipc_adapter import IPCAdapterThread
+
 logger = logging.getLogger(__name__)
 
-DEFAULT_CENTER_HZ = 100e6
+DEFAULT_CENTER_HZ   = 100e6
 DEFAULT_SAMPLE_RATE = 20e6
 
 
@@ -36,37 +35,33 @@ class ASURMainWindow(QMainWindow):
         self.setWindowTitle("Advanced SDR (ASDR)")
         self.setGeometry(100, 100, 1400, 900)
 
-        self.vfo_manager = VFOManager(
-            center_freq=DEFAULT_CENTER_HZ,
-            sample_rate=DEFAULT_SAMPLE_RATE,
-            max_vfos=10,
-        )
-        self.audio_mixer = AudioMixer()
+        # Shadow state: tracks per-VFO freq/bandwidth in the UI process
+        # so spectrum markers can be updated without round-tripping the DSP process.
+        self._vfo_state: dict = {}   # {vfo_id: {'freq_hz': float, 'bandwidth_hz': float}}
+        self._center_hz   = DEFAULT_CENTER_HZ
+        self._sample_rate = DEFAULT_SAMPLE_RATE
 
-        # Shared latest buffers for display data — SDR writes latest arrays,
-        # GUI polls them at its own pace to avoid Qt event-queue overload.
-        self._display_buffers = {
-            'spectrum': SharedLatest(),
-            'waterfall': SharedLatest(),
-        }
-
-        self.sdr_worker = SDRWorkerThread(
-            vfo_manager=self.vfo_manager,
-            audio_mixer=self.audio_mixer,
-            display_buffers=self._display_buffers,
-        )
+        self.dsp = DSPProcess()
+        self.ipc = IPCAdapterThread(self.dsp.result_queue)
 
         self._initUI()
         self._connect_signals()
         self._apply_stylesheet()
 
+        # Wire shared-memory display buffers into the visualization panel
+        self.vis_panel.set_process_display(
+            self.dsp.spectrum_buf,
+            self.dsp.waterfall_buf,
+            self.dsp.display_gen,
+        )
+
         # VFOTabPanel creates tab 0 during __init__ before vfo_added is connected,
-        # so the signal was missed. Bootstrap any pre-existing tabs now.
+        # so bootstrap any pre-existing tabs now.
         for vfo_id in sorted(self.ctrl_panel.vfo_tab._tabs.keys()):
             self._on_vfo_added(vfo_id)
 
-        self.audio_mixer.start()
-        self.sdr_worker.start()
+        self.dsp.start()
+        self.ipc.start()
 
     # ------------------------------------------------------------------
     # UI construction
@@ -76,13 +71,12 @@ class ASURMainWindow(QMainWindow):
         central = QWidget()
         self.setCentralWidget(central)
 
-        # Top area: visualization + controls
         top_widget = QWidget()
         top_layout = QHBoxLayout()
         top_layout.setContentsMargins(4, 4, 4, 4)
         top_layout.setSpacing(4)
 
-        self.vis_panel = VisualizationPanel(display_buffers=self._display_buffers)
+        self.vis_panel = VisualizationPanel()
         top_layout.addWidget(self.vis_panel, stretch=2)
 
         self.ctrl_panel = ControlPanel()
@@ -90,40 +84,32 @@ class ASURMainWindow(QMainWindow):
 
         top_widget.setLayout(top_layout)
 
-        # Bottom area: aggregated decoder output panel
         self.decoder_panel = self._create_decoder_panel()
-        # Main vertical layout: top area (≈70%) + bottom decoder panel (≈30%)
+
         vlayout = QVBoxLayout()
         vlayout.setContentsMargins(4, 4, 4, 4)
         vlayout.setSpacing(4)
         vlayout.addWidget(top_widget, stretch=7)
-
         vlayout.addWidget(self.decoder_panel, stretch=3)
-
         central.setLayout(vlayout)
 
-        self.status_bar = QStatusBar()
+        self.status_bar   = QStatusBar()
         self.setStatusBar(self.status_bar)
         self.status_label = QLabel("Initializing…")
         self.status_bar.addWidget(self.status_label)
 
-        # Set initial frequency range on both spectrum and waterfall
         self.vis_panel.set_freq_range(DEFAULT_CENTER_HZ, DEFAULT_SAMPLE_RATE)
 
     def _create_decoder_panel(self):
-        """Create the aggregated decoder output panel."""
-
         class DecoderAggregator(QWidget):
             def __init__(self, parent=None):
                 super().__init__(parent)
                 layout = QVBoxLayout(self)
                 layout.setContentsMargins(4, 4, 4, 4)
                 layout.setSpacing(4)
-
                 header = QLabel("Decoder Output (aggregated)")
                 header.setAlignment(Qt.AlignLeft)
                 layout.addWidget(header)
-
                 self.output = QTextBrowser()
                 self.output.setReadOnly(True)
                 self.output.document().setMaximumBlockCount(1000)
@@ -131,8 +117,7 @@ class ASURMainWindow(QMainWindow):
 
             def append(self, vfo_id: int, decoder_name: str, text: str, vfo_color: str):
                 import time
-
-                ts = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
+                ts        = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
                 vfo_label = escape(f"VFO{vfo_id}")
                 line = (
                     f'<span style="color:#9aa0a6">[{escape(ts)}]</span> '
@@ -145,22 +130,13 @@ class ASURMainWindow(QMainWindow):
         return DecoderAggregator()
 
     def _connect_signals(self):
-        # ---- SDR worker → UI ----
-        # Force queued connections so slots always execute on the main thread,
-        # regardless of whether the signal is emitted from the QThread worker,
-        # the HackRF callback thread, or any other background thread.
         Q = Qt.QueuedConnection
-        # Display updates are provided via shared buffers polled by the
-        # VisualizationPanel timer; avoid connecting high-frequency arrays
-        # through Qt signals which can overwhelm the event queue.
-        self.sdr_worker.device_status_changed.connect(self._on_device_status, Q)
-        self.sdr_worker.error_occurred.connect(self._on_error, Q)
 
-        # audio_ready signal not connected: the worker pushes directly to
-        # audio_mixer.push_audio() to avoid Qt event-queue latency.
-
-        # ---- SDR worker → decoder output ----
-        self.sdr_worker.decoder_result.connect(self._on_decoder_result, Q)
+        # ---- IPC adapter → UI ----
+        self.ipc.device_status_changed.connect(self._on_device_status, Q)
+        self.ipc.error_occurred.connect(self._on_error, Q)
+        self.ipc.decoder_result.connect(self._on_decoder_result, Q)
+        self.ipc.signal_strength.connect(self._on_signal_strength, Q)
 
         # ---- VFO tab lifecycle ----
         self.ctrl_panel.vfo_tab.vfo_added.connect(self._on_vfo_added)
@@ -169,21 +145,20 @@ class ASURMainWindow(QMainWindow):
             self.vis_panel.set_active_vfo_marker
         )
 
-        # ---- VFO settings → backend ----
+        # ---- VFO settings → DSP ----
         self.ctrl_panel.vfo_tab.frequency_changed.connect(self._on_vfo_frequency_changed)
-        self.ctrl_panel.vfo_tab.demod_changed.connect(self.sdr_worker.set_vfo_demod)
+        self.ctrl_panel.vfo_tab.demod_changed.connect(self.dsp.set_vfo_demod)
         self.ctrl_panel.vfo_tab.bandwidth_changed.connect(self._on_vfo_bandwidth_changed)
-        self.ctrl_panel.vfo_tab.squelch_changed.connect(self.sdr_worker.set_vfo_squelch)
+        self.ctrl_panel.vfo_tab.squelch_changed.connect(self.dsp.set_vfo_squelch)
+        self.ctrl_panel.vfo_tab.squelch_enabled_changed.connect(self.dsp.set_vfo_squelch_enabled)
 
-        # ---- VFO audio controls → mixer ----
+        # ---- VFO audio controls → DSP ----
         self.ctrl_panel.vfo_tab.volume_changed.connect(
-            lambda vid, v: self.audio_mixer.set_volume(vid, v)
+            lambda vid, v: self.dsp.set_volume(vid, v)
         )
         self.ctrl_panel.vfo_tab.mute_changed.connect(
-            lambda vid, m: self.audio_mixer.set_muted(vid, m)
+            lambda vid, m: self.dsp.set_vfo_muted(vid, m)
         )
-        # Also inform the SDR worker to stop producing audio when muted
-        self.ctrl_panel.vfo_tab.mute_changed.connect(self.sdr_worker.set_vfo_muted)
 
         # ---- Decoder toggles ----
         self.ctrl_panel.vfo_tab.decoder_toggled.connect(self._on_decoder_toggled)
@@ -196,20 +171,13 @@ class ASURMainWindow(QMainWindow):
         # ---- Device panel ----
         self.ctrl_panel.device_panel.center_freq_changed.connect(self._on_center_freq_changed)
         self.ctrl_panel.device_panel.sample_rate_changed.connect(self._on_sample_rate_changed)
-        self.ctrl_panel.device_panel.lna_gain_changed.connect(self._on_lna_gain_changed)
-        self.ctrl_panel.device_panel.vga_gain_changed.connect(self._on_vga_gain_changed)
-        self.ctrl_panel.device_panel.amp_enabled_changed.connect(self._on_amp_enabled_changed)
-
-        # ---- Squelch enable toggle ----
-        self.ctrl_panel.vfo_tab.squelch_enabled_changed.connect(
-            self.sdr_worker.set_vfo_squelch_enabled
+        self.ctrl_panel.device_panel.lna_gain_changed.connect(
+            lambda v: self.dsp.set_lna_gain(float(v))
         )
-
-        # ---- Signal strength polling timer (150 ms) ----
-        self._sq_poll_timer = QTimer(self)
-        self._sq_poll_timer.setInterval(150)
-        self._sq_poll_timer.timeout.connect(self._poll_signal_strength)
-        self._sq_poll_timer.start()
+        self.ctrl_panel.device_panel.vga_gain_changed.connect(
+            lambda v: self.dsp.set_vga_gain(float(v))
+        )
+        self.ctrl_panel.device_panel.amp_enabled_changed.connect(self.dsp.set_amp_enable)
 
         # ---- Spectrum click → tune active VFO ----
         self.vis_panel.spectrum.frequency_clicked.connect(self._on_spectrum_clicked)
@@ -219,76 +187,72 @@ class ASURMainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _on_vfo_added(self, vfo_id: int):
-        vfo = self.vfo_manager.create_vfo(frequency=self.vfo_manager.center_freq)
-        if vfo is None:
-            logger.warning("Could not create VFO (limit reached)")
-            return
-
+        freq  = self._center_hz
+        bw    = 12_500.0
         color = VFO_COLORS[vfo_id % len(VFO_COLORS)]
+
+        self._vfo_state[vfo_id] = {'freq_hz': freq, 'bandwidth_hz': bw}
         self.vis_panel.add_vfo_marker(
-            vfo_id,
-            freq_hz=vfo.settings.frequency,
-            bandwidth_hz=vfo.settings.bandwidth,
-            color=color,
-            label=f"VFO {vfo_id + 1}",
+            vfo_id, freq_hz=freq, bandwidth_hz=bw, color=color, label=f"VFO {vfo_id + 1}"
         )
         self.ctrl_panel.vfo_tab.set_vfo_color(vfo_id, color)
-        self.audio_mixer.add_vfo(vfo_id)
+        self.dsp.add_vfo(vfo_id, freq)
         self._check_vfo_ranges()
 
     def _on_vfo_removed(self, vfo_id: int):
-        self.vfo_manager.delete_vfo(vfo_id)
+        self._vfo_state.pop(vfo_id, None)
         self.vis_panel.remove_vfo_marker(vfo_id)
-        self.audio_mixer.remove_vfo(vfo_id)
+        self.dsp.remove_vfo(vfo_id)
 
     # ------------------------------------------------------------------
     # VFO control handlers
     # ------------------------------------------------------------------
 
     def _on_vfo_frequency_changed(self, vfo_id: int, freq_hz: float):
-        self.sdr_worker.set_vfo_frequency(vfo_id, freq_hz)
-        vfo = self.vfo_manager.get_vfo(vfo_id)
-        bw = vfo.settings.bandwidth if vfo else None
+        self.dsp.set_vfo_frequency(vfo_id, freq_hz)
+        if vfo_id in self._vfo_state:
+            self._vfo_state[vfo_id]['freq_hz'] = freq_hz
+        bw = self._vfo_state.get(vfo_id, {}).get('bandwidth_hz', 12_500)
         self.vis_panel.update_vfo_marker(vfo_id, freq_hz, bw)
         self._check_vfo_ranges()
 
-    def _poll_signal_strength(self):
-        """Update signal strength displays in all VFO tabs from the VFO backend."""
-        for vfo in self.vfo_manager.get_all_vfos():
-            self.ctrl_panel.vfo_tab.update_signal_strength(
-                vfo.id, vfo.signal_db, vfo.is_active
-            )
-
     def _on_vfo_bandwidth_changed(self, vfo_id: int, bandwidth_hz: float):
-        self.sdr_worker.set_vfo_bandwidth(vfo_id, bandwidth_hz)
-        vfo = self.vfo_manager.get_vfo(vfo_id)
-        if vfo:
-            self.vis_panel.update_vfo_marker(vfo_id, vfo.settings.frequency, bandwidth_hz)
+        self.dsp.set_vfo_bandwidth(vfo_id, bandwidth_hz)
+        if vfo_id in self._vfo_state:
+            self._vfo_state[vfo_id]['bandwidth_hz'] = bandwidth_hz
+            freq_hz = self._vfo_state[vfo_id]['freq_hz']
+            self.vis_panel.update_vfo_marker(vfo_id, freq_hz, bandwidth_hz)
 
     def _on_spectrum_clicked(self, freq_hz: float):
-        """Tune the active VFO to the clicked spectrum frequency."""
         active_id = self.ctrl_panel.vfo_tab.active_vfo_id()
         if active_id is None:
             return
         self.ctrl_panel.vfo_tab.set_frequency(active_id, freq_hz)
-        self.sdr_worker.set_vfo_frequency(active_id, freq_hz)
-        vfo = self.vfo_manager.get_vfo(active_id)
-        bw = vfo.settings.bandwidth if vfo else 12_500
+        self.dsp.set_vfo_frequency(active_id, freq_hz)
+        if active_id in self._vfo_state:
+            self._vfo_state[active_id]['freq_hz'] = freq_hz
+        bw = self._vfo_state.get(active_id, {}).get('bandwidth_hz', 12_500)
         self.vis_panel.update_vfo_marker(active_id, freq_hz, bw)
         self._check_vfo_ranges()
+
+    def _on_signal_strength(self, updates: dict):
+        for vfo_id, (db, is_active) in updates.items():
+            self.ctrl_panel.vfo_tab.update_signal_strength(vfo_id, db, is_active)
 
     # ------------------------------------------------------------------
     # Device control handlers
     # ------------------------------------------------------------------
 
     def _on_center_freq_changed(self, freq_hz: float):
-        self.sdr_worker.set_center_frequency(freq_hz)
-        self.vis_panel.set_freq_range(freq_hz, self.vfo_manager.sample_rate)
+        self._center_hz = freq_hz
+        self.dsp.set_center_frequency(freq_hz)
+        self.vis_panel.set_freq_range(freq_hz, self._sample_rate)
         self._check_vfo_ranges()
 
     def _on_sample_rate_changed(self, sample_rate: float):
-        self.sdr_worker.set_sample_rate(sample_rate)
-        self.vis_panel.set_freq_range(self.vfo_manager.center_freq, sample_rate)
+        self._sample_rate = sample_rate
+        self.dsp.set_sample_rate(sample_rate)
+        self.vis_panel.set_freq_range(self._center_hz, sample_rate)
         self._check_vfo_ranges()
 
     # ------------------------------------------------------------------
@@ -296,20 +260,16 @@ class ASURMainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _check_vfo_ranges(self):
-        """Disable VFOs whose frequency falls outside center ± sample_rate/2."""
-        center = self.vfo_manager.center_freq
-        half_bw = self.vfo_manager.sample_rate / 2
-        for vfo in self.vfo_manager.get_all_vfos():
-            out_of_range = abs(vfo.settings.frequency - center) > half_bw
-            vfo.settings.enabled = not out_of_range
-            self.ctrl_panel.vfo_tab.set_vfo_out_of_range(vfo.id, out_of_range)
+        half_bw = self._sample_rate / 2
+        for vfo_id, state in self._vfo_state.items():
+            out_of_range = abs(state['freq_hz'] - self._center_hz) > half_bw
+            self.ctrl_panel.vfo_tab.set_vfo_out_of_range(vfo_id, out_of_range)
 
     # ------------------------------------------------------------------
     # Bookmark handlers
     # ------------------------------------------------------------------
 
     def _on_bookmark_add_requested(self, settings: dict):
-        """Create a new VFO tab pre-configured with bookmark settings."""
         vfo_id = self.ctrl_panel.vfo_tab.add_vfo()
         self.ctrl_panel.vfo_tab.apply_settings_to_vfo(vfo_id, settings)
 
@@ -318,38 +278,10 @@ class ASURMainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _on_decoder_toggled(self, vfo_id: int, decoder_name: str, enabled: bool):
-        vfo = self.vfo_manager.get_vfo(vfo_id)
-        if vfo is None:
-            return
-        if enabled:
-            decoder = self._make_decoder(decoder_name)
-            if decoder:
-                vfo.add_decoder(decoder)
-        else:
-            vfo.remove_decoder(decoder_name)
-
-    def _make_decoder(self, name: str):
-        try:
-            if name == 'POCSAG':
-                from app.decoders.pocsag import POCSAGDecoder
-                return POCSAGDecoder()
-            elif name == 'RDS':
-                from app.decoders.rds import RDSDecoder
-                return RDSDecoder()
-            elif name == 'AIS':
-                from app.decoders.ais import AISDecoder
-                return AISDecoder()
-            elif name == 'ADSB':
-                from app.decoders.adsb import ADSBDecoder
-                return ADSBDecoder()
-        except Exception as e:
-            logger.error(f"Could not instantiate decoder {name}: {e}")
-        return None
+        self.dsp.toggle_decoder(vfo_id, decoder_name, enabled)
 
     def _on_decoder_result(self, vfo_id: int, decoder_name: str, text: str):
-        # Add to per-VFO panel
         self.ctrl_panel.vfo_tab.add_decoder_output(vfo_id, decoder_name, text)
-        # Add to aggregated global decoder panel
         try:
             if self.decoder_panel is not None:
                 vfo_color = VFO_COLORS[vfo_id % len(VFO_COLORS)]
@@ -357,30 +289,22 @@ class ASURMainWindow(QMainWindow):
         except Exception:
             logger.exception("Failed to append to global decoder panel")
 
-
-    # ------------------------------------------------------------------
-    # Spectrum / waterfall
-    # ------------------------------------------------------------------
-
-    def _on_spectrum_update(self, spectrum):
-        self.vis_panel.update_spectrum(spectrum)
-
-    def _on_waterfall_update(self, row):
-        self.vis_panel.update_waterfall(row)
-
     # ------------------------------------------------------------------
     # Device status
     # ------------------------------------------------------------------
 
     def _on_device_status(self, status: dict):
-        # Only update connection indicator when the key is explicitly present;
-        # partial status dicts (e.g. just {'sample_rate': ...}) must not reset it.
         if 'connected' in status:
             self.ctrl_panel.device_panel.set_connected(status['connected'])
 
-        connected = status.get('connected', True)  # assume connected for partial updates
-        center = status.get('frequency', self.vfo_manager.center_freq)
-        sr = status.get('sample_rate', self.vfo_manager.sample_rate)
+        connected = status.get('connected', True)
+        center    = status.get('frequency', self._center_hz)
+        sr        = status.get('sample_rate', self._sample_rate)
+
+        if 'frequency' in status:
+            self._center_hz = center
+        if 'sample_rate' in status:
+            self._sample_rate = sr
 
         if connected:
             self.status_label.setText(
@@ -389,23 +313,13 @@ class ASURMainWindow(QMainWindow):
         else:
             self.status_label.setText("Disconnected")
 
-        # Keep visualization in sync whenever freq or sample_rate is reported
         if 'frequency' in status or 'sample_rate' in status:
             self.vis_panel.set_freq_range(center, sr)
             self._check_vfo_ranges()
 
     def _on_error(self, error_msg: str):
-        logger.error(f"SDR Error: {error_msg}")
+        logger.error(f"DSP Error: {error_msg}")
         self.status_label.setText(f"Error: {error_msg}")
-
-    def _on_lna_gain_changed(self, value: int):
-        self.sdr_worker.set_lna_gain(float(value))
-
-    def _on_vga_gain_changed(self, value: int):
-        self.sdr_worker.set_vga_gain(float(value))
-
-    def _on_amp_enabled_changed(self, enabled: bool):
-        self.sdr_worker.set_amp_enable(enabled)
 
     # ------------------------------------------------------------------
     # Shutdown
@@ -413,8 +327,8 @@ class ASURMainWindow(QMainWindow):
 
     def closeEvent(self, event):
         logger.info("Closing ASDR…")
-        self.sdr_worker.stop()
-        self.audio_mixer.stop()
+        self.ipc.stop()
+        self.dsp.stop()
         event.accept()
 
     # ------------------------------------------------------------------

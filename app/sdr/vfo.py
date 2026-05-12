@@ -487,12 +487,13 @@ class VFOManager:
         self._lock   = threading.RLock()
         self._next_id = 0
 
-    def create_vfo(self, frequency: float) -> Optional[VFO]:
+    def create_vfo(self, frequency: float, vfo_id: int = None) -> Optional[VFO]:
         with self._lock:
             if len(self.vfos) >= self.max_vfos:
                 return None
-            vfo_id         = self._next_id
-            self._next_id += 1
+            if vfo_id is None:
+                vfo_id = self._next_id
+            self._next_id  = max(self._next_id, vfo_id + 1)
             vfo            = VFO(vfo_id, self.center_freq, self.sample_rate)
             vfo.set_frequency(frequency)
             self.vfos[vfo_id] = vfo
