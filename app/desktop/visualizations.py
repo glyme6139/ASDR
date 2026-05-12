@@ -408,16 +408,13 @@ class WaterfallViewer:
         if col_data is None or len(col_data) == 0:
             return
 
-        col = np.asarray(col_data, dtype=np.float32)
+        col = np.asarray(col_data, dtype=np.uint8) if col_data.dtype == np.uint8 \
+              else np.clip(col_data, 0, 255).astype(np.uint8)
 
         if len(col) != self.freq_bins:
-            idx = np.linspace(0, len(col) - 1, self.freq_bins).astype(int)
-            col = col[idx]
-
-        col_max = col.max()
-        if col_max > 255:
-            col = col / (col_max + 1e-10) * 255
-        col = np.clip(col, 0, 255).astype(np.uint8)
+            # linear interpolation preserves frequency resolution better than integer indexing
+            src_x = np.linspace(0, len(col) - 1, self.freq_bins)
+            col = np.interp(src_x, np.arange(len(col)), col.astype(np.float32)).astype(np.uint8)
 
         # In-place ring write — no allocation
         self._ring[:, self._write_idx] = col
@@ -507,7 +504,7 @@ class VisualizationPanel(QWidget):
         wf_plot.setXLink(spec_plot)
 
         self.spectrum  = SpectrumViewer(spec_plot)
-        self.waterfall = WaterfallViewer(wf_plot)
+        self.waterfall = WaterfallViewer(wf_plot, freq_bins=4096)
 
         self._pending_spectrum:  Optional[np.ndarray] = None
         self._pending_waterfall: Optional[np.ndarray] = None
