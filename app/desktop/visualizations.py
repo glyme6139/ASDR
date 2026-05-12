@@ -504,7 +504,7 @@ class VisualizationPanel(QWidget):
         wf_plot.setXLink(spec_plot)
 
         self.spectrum  = SpectrumViewer(spec_plot)
-        self.waterfall = WaterfallViewer(wf_plot, freq_bins=4096)
+        self.waterfall = WaterfallViewer(wf_plot, freq_bins=32768)
 
         self._pending_spectrum:  Optional[np.ndarray] = None
         self._pending_waterfall: Optional[np.ndarray] = None

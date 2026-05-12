@@ -26,9 +26,10 @@ from .audio_output import CHUNK, AUDIO_RATE
 
 logger = logging.getLogger(__name__)
 
-FFT_SIZE    = 4096   # shared block size for display and audio extraction
-DISPLAY_HZ  = 20     # target spectrum/waterfall update rate
-MIN_BINS    = 4      # minimum frequency bins to extract per VFO
+FFT_SIZE         = 4096    # audio extraction block size (kept small for low latency)
+DISPLAY_FFT_SIZE = 32768   # display-only FFT: 610 Hz/bin at 20 MHz, 8× finer than audio FFT
+DISPLAY_HZ       = 20      # target spectrum/waterfall update rate
+MIN_BINS         = 4       # minimum frequency bins to extract per VFO
 
 
 class SDRWorkerThread(QThread):
@@ -68,6 +69,13 @@ class SDRWorkerThread(QThread):
         self._vfo_iq_accum:  dict = {}
         # Maps vfo_id -> nb_sr seen on last block (to detect bandwidth changes)
         self._vfo_iq_nb_sr:  dict = {}
+
+        # High-resolution display buffer: rolling circular window of DISPLAY_FFT_SIZE samples.
+        # Filled independently of the audio FFT so display resolution is decoupled from
+        # audio block size. Hann window pre-computed once to reduce spectral leakage.
+        self._disp_buf    = np.zeros(DISPLAY_FFT_SIZE, dtype=np.complex64)
+        self._disp_write  = 0
+        self._disp_window = np.hanning(DISPLAY_FFT_SIZE).astype(np.float32)
 
     # ------------------------------------------------------------------
     # Thread entry point
@@ -197,6 +205,24 @@ class SDRWorkerThread(QThread):
         if not self.running:
             return
         try:
+            # --- Fill rolling display buffer (circular, independent of audio blocks) ---
+            n = len(iq_data)
+            w = self._disp_write
+            if n >= DISPLAY_FFT_SIZE:
+                # Incoming chunk larger than display window — just keep the tail
+                self._disp_buf[:] = iq_data[-DISPLAY_FFT_SIZE:]
+                self._disp_write  = 0
+            else:
+                end = w + n
+                if end <= DISPLAY_FFT_SIZE:
+                    self._disp_buf[w:end] = iq_data
+                else:
+                    first = DISPLAY_FFT_SIZE - w
+                    self._disp_buf[w:]     = iq_data[:first]
+                    self._disp_buf[:n - first] = iq_data[first:]
+                self._disp_write = end % DISPLAY_FFT_SIZE
+
+            # --- Audio FFT accumulation (unchanged) ---
             pos = 0
             while pos < len(iq_data):
                 space    = FFT_SIZE - self._buf_idx
@@ -221,14 +247,27 @@ class SDRWorkerThread(QThread):
         N      = FFT_SIZE
         bin_hz = sr / N
 
-        # Single FFT — shared between display and VFO audio extraction
+        # Audio FFT — small block, used only for VFO channelization
         fft_out = np.fft.fftshift(np.fft.fft(block))
 
-        # ---- Display (rate-limited) ----
+        # ---- Display (rate-limited, high-resolution separate FFT) ----
         self._display_tick += 1
         if self._display_tick >= self._display_skip:
             self._display_tick = 0
-            spectrum = (10.0 * np.log10(np.abs(fft_out) ** 2 + 1e-10)).astype(np.float32)
+
+            # Unroll circular display buffer: oldest → newest order
+            w = self._disp_write
+            if w == 0:
+                ordered = self._disp_buf.copy()
+            else:
+                ordered = np.empty(DISPLAY_FFT_SIZE, dtype=np.complex64)
+                ordered[:DISPLAY_FFT_SIZE - w] = self._disp_buf[w:]
+                ordered[DISPLAY_FFT_SIZE - w:] = self._disp_buf[:w]
+
+            # Hann window eliminates spectral leakage; result is 32768-bin spectrum
+            fft_disp = np.fft.fftshift(np.fft.fft(ordered * self._disp_window))
+            spectrum = (10.0 * np.log10(np.abs(fft_disp) ** 2 + 1e-10)).astype(np.float32)
+
             # Prefer writing to shared buffers if provided to avoid filling the Qt event queue.
             if self.display_buffers:
                 try:
@@ -378,20 +417,16 @@ class SDRWorkerThread(QThread):
     def _make_waterfall_row(self, spectrum: np.ndarray) -> np.ndarray:
         if len(spectrum) == 0:
             return np.zeros(1, dtype=np.uint8)
-        s_min, s_max = spectrum.min(), spectrum.max()
-        if s_max > s_min:
-            normalized = (spectrum - s_min) / (s_max - s_min)
+        # Adaptive noise floor: slow exponential average of the 15th percentile.
+        # Avoids per-frame min/max normalization which makes the noise floor jump
+        # every time a carrier appears or disappears (the "blocky" time-axis look).
+        floor = float(np.percentile(spectrum, 15))
+        if not hasattr(self, '_wf_floor'):
+            self._wf_floor = floor
         else:
-            normalized = np.zeros_like(spectrum)
-        # Lightweight horizontal smoothing to reduce blocky appearance along x-axis.
-        # Use a small triangular kernel (cheap convolution) that preserves edges.
-        try:
-            kernel = np.array([0.25, 0.5, 0.25], dtype=np.float32)
-            smoothed = np.convolve(normalized, kernel, mode='same')
-            smoothed = np.clip(smoothed, 0.0, 1.0)
-        except Exception:
-            smoothed = normalized
-        return (smoothed * 255).astype(np.uint8)
+            self._wf_floor += 0.05 * (floor - self._wf_floor)
+        normalized = np.clip((spectrum - self._wf_floor) / 70.0, 0.0, 1.0)
+        return (normalized * 255).astype(np.uint8)
 
     # ------------------------------------------------------------------
     # Lifecycle
