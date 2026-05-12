@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
     QStatusBar,
     QLabel,
     QTextBrowser,
+    QFileDialog,
 )
 from PySide6.QtCore import Qt
 
@@ -46,6 +47,11 @@ class ASURMainWindow(QMainWindow):
 
         self._initUI()
         self._connect_signals()
+        # connect session save/load handlers for manual save and autosave toggles
+        try:
+            self.ctrl_panel.device_panel.connect_session_signals(self._on_manual_save)
+        except Exception:
+            pass
         self._apply_stylesheet()
 
         # Wire shared-memory display buffers into the visualization panel
@@ -62,6 +68,64 @@ class ASURMainWindow(QMainWindow):
 
         self.dsp.start()
         self.ipc.start()
+
+        # Load session if available and apply settings
+        try:
+            from app import session
+            sess = session.load_session()
+            # Apply device settings
+            dev = sess.get('device', {})
+            if dev:
+                self.ctrl_panel.device_panel.apply_settings(dev)
+
+            # Apply VFOs
+            vfos = sess.get('vfos', [])
+            if vfos and isinstance(vfos, list):
+                # Apply first VFO to existing first tab, create others
+                first = True
+                for v in vfos:
+                    if first:
+                        # apply to the initial tab (tab 0)
+                        vid = self.ctrl_panel.vfo_tab.active_vfo_id()
+                        if vid is None:
+                            vid = 0
+                        self.ctrl_panel.vfo_tab.apply_settings_to_vfo(vid, v)
+                        # apply decoder settings
+                        try:
+                            tab = self.ctrl_panel.vfo_tab._tabs.get(vid)
+                            if tab:
+                                for i in range(tab.decoder_list.count()):
+                                    item = tab.decoder_list.item(i)
+                                    checked = item.text() in v.get('decoders', [])
+                                    item.setCheckState(Qt.Checked if checked else Qt.Unchecked)
+                                    # if checked:
+                                    #     try:
+                                    #         self.dsp.toggle_decoder(vid, item.text(), True)
+                                    #     except Exception:
+                                    #         pass
+                        except Exception:
+                            pass
+                        first = False
+                        continue
+
+                    new_id = self.ctrl_panel.vfo_tab.add_vfo()
+                    self.ctrl_panel.vfo_tab.apply_settings_to_vfo(new_id, v)
+                    try:
+                        tab = self.ctrl_panel.vfo_tab._tabs.get(new_id)
+                        if tab:
+                            for i in range(tab.decoder_list.count()):
+                                item = tab.decoder_list.item(i)
+                                checked = item.text() in v.get('decoders', [])
+                                item.setCheckState(Qt.Checked if checked else Qt.Unchecked)
+                                # if checked:
+                                #     try:
+                                #         self.dsp.toggle_decoder(new_id, item.text(), True)
+                                #     except Exception:
+                                #         pass
+                    except Exception:
+                        pass
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # UI construction
@@ -327,9 +391,39 @@ class ASURMainWindow(QMainWindow):
 
     def closeEvent(self, event):
         logger.info("Closing ASDR…")
+        # Save session
+        try:
+            # only autosave if enabled
+            if self.ctrl_panel.device_panel.get_autosave_enabled():
+                from app import session
+                sess = {
+                    'device': self.ctrl_panel.device_panel.get_settings(),
+                    'vfos': list(self.ctrl_panel.vfo_tab.get_all_vfo_settings().values()),
+                }
+                session.save_session(sess)
+        except Exception:
+            pass
+
         self.ipc.stop()
         self.dsp.stop()
         event.accept()
+
+    # ------------------------------------------------------------------
+    # Manual save handler
+    # ------------------------------------------------------------------
+    def _on_manual_save(self):
+        try:
+            fname, _ = QFileDialog.getSaveFileName(self, "Save session as...", str(), "JSON Files (*.json);;All Files (*)")
+            if not fname:
+                return
+            from app import session
+            sess = {
+                'device': self.ctrl_panel.device_panel.get_settings(),
+                'vfos': list(self.ctrl_panel.vfo_tab.get_all_vfo_settings().values()),
+            }
+            session.save_session(sess, fname)
+        except Exception:
+            logger.exception("Manual save session failed")
 
     # ------------------------------------------------------------------
     # Stylesheet

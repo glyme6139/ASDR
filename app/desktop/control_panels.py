@@ -4,7 +4,7 @@ Control panels for VFO tabs, decoders, and device settings.
 
 import json
 import os
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from typing import Callable, Dict, Optional
 
 from PySide6.QtGui import QColor, QIcon, QPixmap, QPainter
@@ -70,10 +70,16 @@ class VFOBookmark:
     bandwidth: float = 12_500.0  # Hz
     squelch_level: float = -100.0
     volume: float    = 0.8
+    decoders: list = field(default_factory=list)
 
     def display_label(self) -> str:
         mhz = self.frequency / 1e6
         bw  = self.bandwidth / 1e3
+        if self.decoders:
+            dec_text = ', '.join(self.decoders[:4])
+            if len(self.decoders) > 4:
+                dec_text += ', ...'
+            return f"{self.name}  —  {mhz:.4f} MHz  [{self.demod_mode}, {bw:.1f} kHz, {dec_text}]"
         return f"{self.name}  —  {mhz:.4f} MHz  [{self.demod_mode}, {bw:.1f} kHz]"
 
 
@@ -204,8 +210,8 @@ class SingleVFOTab(QWidget):
         dec_group = QGroupBox("Decoders")
         dec_layout = QVBoxLayout()
         self.decoder_list = QListWidget()
-        # self.decoder_list.setMaximumHeight(100)
-        # self.decoder_list.setMinimumHeight(100)
+        self.decoder_list.setMaximumHeight(150)
+        self.decoder_list.setMinimumHeight(100)
         for name in DECODER_NAMES:
             item = QListWidgetItem(name)
             item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
@@ -448,13 +454,46 @@ class VFOTabPanel(QWidget):
         tab    = self._tabs.get(vfo_id)
         if tab is None:
             return None
+        decoders = []
+        for i in range(tab.decoder_list.count()):
+            item = tab.decoder_list.item(i)
+            if item.checkState() == Qt.CheckState.Checked:
+                decoders.append(item.text())
         return {
             'frequency':     tab.freq_spin.value() * 1e6,
             'demod_mode':    tab.demod_combo.currentText(),
             'bandwidth':     tab.bw_spin.value() * 1e3,
             'squelch_level': float(tab.squelch_slider.value()),
             'volume':        tab.vol_slider.value() / 100.0,
+            'decoders':      decoders,
         }
+
+    def get_all_vfo_settings(self) -> dict:
+        """Return a dict of all VFO settings and per-vfo enabled decoders."""
+        out = {}
+        for vfo_id, tab in self._tabs.items():
+            # tab fields
+            decoders = []
+            for i in range(tab.decoder_list.count()):
+                item = tab.decoder_list.item(i)
+                if item.checkState() == Qt.CheckState.Checked:
+                    decoders.append(item.text())
+
+            name_idx = self._vfo_id_to_tab_index(vfo_id)
+            name = self._tab_widget.tabText(name_idx) if name_idx >= 0 else f"VFO {vfo_id + 1}"
+
+            out[str(vfo_id)] = {
+                'name': name,
+                'frequency': tab.freq_spin.value() * 1e6,
+                'demod_mode': tab.demod_combo.currentText(),
+                'bandwidth': tab.bw_spin.value() * 1e3,
+                'volume': tab.vol_slider.value() / 100.0,
+                'squelch_level': float(tab.squelch_slider.value()),
+                'squelch_enabled': tab.squelch_check.isChecked(),
+                'enabled': True,
+                'decoders': decoders,
+            }
+        return out
 
     def apply_settings_to_vfo(self, vfo_id: int, settings: dict):
         """Apply a settings dict to a VFO tab, propagating all signals to the backend."""
@@ -472,6 +511,11 @@ class VFOTabPanel(QWidget):
             idx = self._vfo_id_to_tab_index(vfo_id)
             if idx >= 0:
                 self._tab_widget.setTabText(idx, name[:12])
+
+        decoder_names = set(settings.get('decoders', []) or [])
+        for i in range(tab.decoder_list.count()):
+            item = tab.decoder_list.item(i)
+            item.setCheckState(Qt.CheckState.Checked if item.text() in decoder_names else Qt.CheckState.Unchecked)
 
     def set_vfo_out_of_range(self, vfo_id: int, out_of_range: bool):
         """Gray the tab label and disable only decoding when the VFO is outside the SDR bandwidth."""
@@ -653,6 +697,7 @@ class BookmarkPanel(QWidget):
             bandwidth=snapshot.get('bandwidth', 12_500.0),
             squelch_level=snapshot.get('squelch_level', -100.0),
             volume=snapshot.get('volume', 0.8),
+            decoders=list(snapshot.get('decoders', []) or []),
         )
         self._bookmarks.append(bm)
         self._refresh_list()
@@ -703,6 +748,7 @@ class BookmarkPanel(QWidget):
                     bandwidth=float(item.get('bandwidth', 12_500.0)),
                     squelch_level=float(item.get('squelch_level', -100.0)),
                     volume=float(item.get('volume', 0.8)),
+                    decoders=list(item.get('decoders', []) or []),
                 ))
             # Merge: skip entries already present (same name + frequency)
             existing_keys = {(b.name, b.frequency) for b in self._bookmarks}
@@ -821,6 +867,19 @@ class DevicePanel(QWidget):
         amp_row.addStretch()
         layout.addLayout(amp_row)
 
+        # Session controls: Save and Autosave
+        sess_row = QHBoxLayout()
+        self.save_btn = QPushButton("Save Session...")
+        self.save_btn.setToolTip("Save current session to a file")
+        sess_row.addWidget(self.save_btn)
+
+        self.autosave_check = QCheckBox("Autosave on exit")
+        self.autosave_check.setChecked(True)
+        sess_row.addWidget(self.autosave_check)
+
+        sess_row.addStretch()
+        layout.addLayout(sess_row)
+
         self.setLayout(layout)
 
     def set_connected(self, connected: bool):
@@ -830,6 +889,50 @@ class DevicePanel(QWidget):
         else:
             self.status_label.setText("Disconnected")
             self.status_label.setStyleSheet("color: red;")
+
+    def get_settings(self) -> dict:
+        return {
+            'center_freq': float(self.cf_spin.value()) * 1e6,
+            'sample_rate': int(float(self.sr_combo.currentText()) * 1e6),
+            'lna': int(self.lna_slider.value()),
+            'vga': int(self.vga_slider.value()),
+            'amp_enabled': bool(self.amp_check.isChecked()),
+            'autosave': bool(self.autosave_check.isChecked()),
+        }
+
+    def apply_settings(self, settings: dict) -> None:
+        try:
+            if 'center_freq' in settings:
+                self.cf_spin.setValue(settings.get('center_freq', 100e6) / 1e6)
+            if 'sample_rate' in settings:
+                sr_mhz = int(settings.get('sample_rate', 20_000_000) / 1e6)
+                self.sr_combo.setCurrentText(str(sr_mhz))
+            if 'lna' in settings:
+                self.lna_slider.setValue(int(settings.get('lna', 24)))
+            if 'vga' in settings:
+                self.vga_slider.setValue(int(settings.get('vga', 20)))
+            if 'amp_enabled' in settings:
+                self.amp_check.setChecked(bool(settings.get('amp_enabled', False)))
+            if 'autosave' in settings:
+                try:
+                    self.autosave_check.setChecked(bool(settings.get('autosave', True)))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def get_autosave_enabled(self) -> bool:
+        return bool(self.autosave_check.isChecked())
+
+    def connect_session_signals(self, save_callback, autosave_callback=None):
+        """Connect callbacks for Save button and autosave toggles.
+
+        - save_callback: callable invoked when Save button clicked
+        - autosave_callback: optional callable(bool) called when autosave toggled
+        """
+        self.save_btn.clicked.connect(lambda: save_callback())
+        if autosave_callback is not None:
+            self.autosave_check.toggled.connect(lambda v: autosave_callback(bool(v)))
 
 
 # ---------------------------------------------------------------------------

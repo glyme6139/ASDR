@@ -1,0 +1,22 @@
+{
+  "device": {
+    "center_freq": 100000000.0,
+    "sample_rate": 20000000,
+    "lna": 24,
+    "vga": 20,
+    "amp_enabled": false
+  },
+  "vfos": [
+    {
+      "name": "VFO 1",
+      "frequency": 100000000.0,
+      "demod_mode": "NFM",
+      "bandwidth": 12500.0,
+      "volume": 0.8,
+      "squelch_level": -100.0,
+      "squelch_enabled": true,
+      "enabled": true,
+      "decoders": []
+    }
+  ]
+}

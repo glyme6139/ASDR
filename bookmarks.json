@@ -5,9 +5,12 @@
       "name": "POCSAG 1",
       "frequency": 466050000.0,
       "demod_mode": "NFM",
-      "bandwidth": 13000.0,
+      "bandwidth": 14000.0,
       "squelch_level": 70.0,
-      "volume": 0.05
+      "volume": 0.05,
+      "decoders": [
+        "POCSAG"
+      ]
     },
     {
       "name": "POCSAG 2",
@@ -15,15 +18,21 @@
       "demod_mode": "NFM",
       "bandwidth": 13000.0,
       "squelch_level": 70.0,
-      "volume": 0.06
+      "volume": 0.06,
+      "decoders": [
+        "POCSAG"
+      ]
     },
     {
       "name": "POCSAG 3",
-      "frequency": 466206000.0,
+      "frequency": 466204000.0,
       "demod_mode": "NFM",
       "bandwidth": 13000.0,
       "squelch_level": 70.0,
-      "volume": 0.04
+      "volume": 0.1,
+      "decoders": [
+        "POCSAG"
+      ]
     }
   ]
 }
