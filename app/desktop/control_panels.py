@@ -204,6 +204,7 @@ class SingleVFOTab(QWidget):
         dec_layout = QVBoxLayout()
         self.decoder_list = QListWidget()
         self.decoder_list.setMaximumHeight(100)
+        self.decoder_list.setMinimumHeight(100)
         for name in DECODER_NAMES:
             item = QListWidgetItem(name)
             item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
@@ -564,6 +565,7 @@ class BookmarkPanel(QWidget):
         # ── bookmark list ──
         self.list_widget = QListWidget()
         self.list_widget.setMaximumHeight(140)
+        self.list_widget.setMinimumHeight(140)
         self.list_widget.setAlternatingRowColors(True)
         self.list_widget.setToolTip("Double-click a bookmark to add it as a new VFO")
         self.list_widget.itemSelectionChanged.connect(self._on_selection_changed)

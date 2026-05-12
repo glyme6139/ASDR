@@ -439,6 +439,15 @@ class _POCSAGSingleBaudTS:
         pass2 = self._ecc_correct(pass1['cw'])
 
         if pass2['errors'] >= 3:
+            # Uncorrectable codeword.  For alpha messages, silently dropping
+            # the 20 data bits shifts the 7-bit character accumulator by
+            # (20 mod 7) = 6 positions, making every subsequent character
+            # wrong.  Insert the raw bits instead so alignment is preserved;
+            # at worst we get a few garbage characters for this codeword.
+            if self.pageActive and ((cw >> 31) & 1) == 1:
+                data = (cw >> 11) & 0xFFFFF
+                for b in range(19, -1, -1):
+                    self.pageBits.append((data >> b) & 1)
             self.batchCwIdx += 1
             if self.batchCwIdx >= 16:
                 self.state = 'hunt'
@@ -457,6 +466,10 @@ class _POCSAGSingleBaudTS:
         if self.batchCwIdx >= 16:
             self.state = 'hunt'
 
+    # Maximum page bits before force-emitting (~80 alpha chars = 560 bits).
+    # Prevents a missed IDLE codeword from merging unrelated messages.
+    _MAX_PAGE_BITS = 560
+
     def _process_cw(self, cw: int, cw_idx: int) -> None:
         if ((cw >> 31) & 1) == 0:
             if self.pageActive and self.pageBits:
@@ -474,6 +487,9 @@ class _POCSAGSingleBaudTS:
                 data = (cw >> 11) & 0xFFFFF
                 for b in range(19, -1, -1):
                     self.pageBits.append((data >> b) & 1)
+                # Safety valve: force-emit if page grows unreasonably large
+                if len(self.pageBits) >= self._MAX_PAGE_BITS:
+                    self._emit_page()
 
     @classmethod
     def _build_ecc(cls):
@@ -569,7 +585,8 @@ class _POCSAGSingleBaudTS:
                     c = 0
                     cb = 0
         elif self.pageFunc != 0:
-            nmap = '0123456789 -.)('
+            nmap = '0123456789*-() '  # standard POCSAG numeric map (matches multimon-ng)
+            # nmap = '0123456789 -.)(';  # POCSAG numeric map (matches reference BrowSDR/Mayhem)
             for i in range(0, len(self.pageBits), 4):
                 if i + 3 >= len(self.pageBits):
                     break
@@ -632,6 +649,16 @@ class POCSAGDecoder(BaseAudioDecoder):
         self._d1200.reset()
         self._d512.reset()
         self._results = []
+
+    def format_result(self, result: DecoderResult) -> str:
+        data = result.data if isinstance(result.data, dict) else {}
+        capcode  = data.get('capcode', '?')
+        func     = data.get('func', '?')
+        msg_type = data.get('type', 'alpha')
+        text     = str(data.get('text', '')).strip()
+        baud     = data.get('baud', '?')
+        header   = f"[{capcode}/{func} {msg_type}@{baud}]"
+        return f"{header} {text}" if text else header
 
 
 class POCSAGIQDecoder(BaseAudioDecoder):
