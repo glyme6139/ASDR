@@ -1,0 +1,20 @@
+--- c-code/sub_sc_d.c	2011-05-29 11:46:28.000000000 +0200
++++ c-code/sub_sc_d.c	2011-05-29 11:47:36.000000000 +0200
+@@ -1829,7 +1829,7 @@
+     s = L_mac0(s, x[i-15], coef[i]);
+ 
+   s = L_add(s, s);
+-  i = round(s);
++  i = etsi_round(s);
+   return(i);
+ }
+ 
+@@ -1877,7 +1877,7 @@
+     s = L_mac0(s, x[i-16], coef[i]);
+ 
+   s = L_add(s, s);
+-  i = round(s);
++  i = etsi_round(s);
+   return(i);
+ }
+ 

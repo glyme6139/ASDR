@@ -1,0 +1,37 @@
+--- amr-code/tetra_op.c	2011-05-29 11:41:07.000000000 +0200
++++ amr-code/tetra_op.c	2011-05-29 11:41:54.000000000 +0200
+@@ -31,7 +31,7 @@
+ *					- negate()
+ *					- norm_l()
+ *					- norm_s()
+-*					- round()
++*					- etsi_round()
+ *					- sature()
+ *					- shl()
+ *					- shr()
+@@ -1336,14 +1336,14 @@
+ 
+ /************************************************************************
+ *
+-*	Function Name : round
++*	Function Name : etsi_round
+ *
+ *	Purpose :
+ *
+ *		Round the lower 16 bits of the 32 bit input number into its MS 16 bits
+ *		with saturation. Shift the resulting bits right by 16 and return the 16
+ *		bit number:
+-*			round(L_var1) = extract_h(L_add(L_var1,32768))
++*			etsi_round(L_var1) = extract_h(L_add(L_var1,32768))
+ *
+ *	Complexity Weight : 1
+ *
+@@ -1365,7 +1365,7 @@
+ *
+ ************************************************************************/
+ 
+-Word16 round(Word32 L_var1)
++Word16 etsi_round(Word32 L_var1)
+   {
+    Word16 var_out;
+    Word32 L_arrondi;

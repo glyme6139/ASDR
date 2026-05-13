@@ -1,0 +1,52 @@
+--- c-code/sdecoder.c	1995-06-06 10:55:28.000000000 +0200
++++ c-code/sdecoder.c	2014-11-18 22:53:06.000000000 +0100
+@@ -58,15 +58,15 @@
+ 
+   if ( argc != 3 )
+   {
+-     printf("Usage : sdecoder  serial_file  synth_file\n");
+-     printf("\n");
+-     printf("Format for serial_file:\n");
+-     printf("  Serial stream input is read from a binary file\n");
+-     printf("  where each 16-bit word represents 1 encoded bit.\n");
+-     printf("  BFI + 137 bits by frame\n");
+-     printf("\n");
+-     printf("Format for synth_file:\n");
+-     printf("  Synthesis is written to a binary file of 16 bits data.\n");
++     fprintf(stderr,"Usage : sdecoder  serial_file  synth_file\n");
++     fprintf(stderr,"\n");
++     fprintf(stderr,"Format for serial_file:\n");
++     fprintf(stderr,"  Serial stream input is read from a binary file\n");
++     fprintf(stderr,"  where each 16-bit word represents 1 encoded bit.\n");
++     fprintf(stderr,"  BFI + 137 bits by frame\n");
++     fprintf(stderr,"\n");
++     fprintf(stderr,"Format for synth_file:\n");
++     fprintf(stderr,"  Synthesis is written to a binary file of 16 bits data.\n");
+      exit( 1 );
+   }
+ 
+@@ -74,13 +74,13 @@
+ 
+   if( (f_serial = fopen(argv[1],"rb") ) == NULL )
+   {
+-    printf("Input file '%s' does not exist !!\n",argv[1]);
++    fprintf(stderr,"Input file '%s' does not exist !!\n",argv[1]);
+     exit(0);
+   }
+ 
+   if( (f_syn = fopen(argv[2], "wb") ) == NULL )
+   {
+-    printf("Cannot open file '%s' !!\n", argv[2]);
++    fprintf(stderr,"Cannot open file '%s' !!\n", argv[2]);
+     exit(0);
+   }
+ 
+@@ -95,7 +95,7 @@
+ 
+   while( fread(serial, sizeof(Word16), serial_size, f_serial) == serial_size)
+   {
+-    printf("frame=%d\n", ++frame);
++    fprintf(stderr,"frame=%d\n", ++frame);
+ 
+     Bits2prm_Tetra(serial, parm);	/* serial to parameters */
+ 

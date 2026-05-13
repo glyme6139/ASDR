@@ -32,6 +32,20 @@ _AUDIO_RATE = 48_000
 _CHUNK      = 2048
 
 
+def _resample_8k_to_48k(pcm_8k: np.ndarray) -> np.ndarray:
+    """
+    Upsample 8 kHz int16 PCM (TETRA ACELP output) to 48 kHz float32.
+
+    Each TCH/S burst produces 2 × 240 = 480 samples @ 8 kHz → 2 880 @ 48 kHz.
+    Linear interpolation keeps the DSP worker free of scipy dependency here.
+    """
+    pcm_f = pcm_8k.astype(np.float32) * (1.0 / 32768.0)
+    n_in  = len(pcm_f)
+    n_out = n_in * 6   # 8 000 Hz × 6 = 48 000 Hz
+    x_out = np.linspace(0.0, n_in - 1.0, n_out, endpoint=False)
+    return np.interp(x_out, np.arange(n_in), pcm_f).astype(np.float32)
+
+
 class DSPWorker:
     """Pure-Python DSP engine. No Qt — runs in a subprocess."""
 
@@ -396,8 +410,21 @@ class DSPWorker:
                 audio, dec_results = vfo.process_narrowband_iq(
                     buf[pos:pos + iq_needed], nb_sr, _CHUNK
                 )
-                if audio is not None and len(audio) > 0:
+
+                # Check whether any decoder produced PCM audio (e.g. TETRA voice).
+                # If so, use it instead of the VFO's FM-demodulated audio.
+                tetra_pcm = None
+                for result in dec_results:
+                    if result.decoder_name == 'TETRA' and isinstance(result.data, dict):
+                        pcm = result.data.pop('pcm', None)   # remove before IPC
+                        if pcm is not None and len(pcm) > 0:
+                            tetra_pcm = pcm
+
+                if tetra_pcm is not None:
+                    self.audio_mixer.push_audio(vfo_id, _resample_8k_to_48k(tetra_pcm))
+                elif audio is not None and len(audio) > 0:
                     self.audio_mixer.push_audio(vfo_id, audio)
+
                 for result in dec_results:
                     formatted = str(result.data)
                     for dec in vfo.decoders:

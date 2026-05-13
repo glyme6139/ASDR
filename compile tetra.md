@@ -1,0 +1,1 @@
+gcc -shared -O2 -o tetra_codec.dll tetra_codec_wrap.c codec/c-code/sub_sc_d.c codec/c-code/sub_dsp.c  codec/c-code/fbas_tet.c codec/c-code/fexp_tet.c codec/c-code/sdecoder.c codec/c-code/sdec_tet.c codec/c-code/fmat_tet.c codec/c-code/tetra_op.c -I codec/c-code -lm 

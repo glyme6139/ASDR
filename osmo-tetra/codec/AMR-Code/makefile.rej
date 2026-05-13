@@ -1,0 +1,24 @@
+--- amr-code/makefile	2011-05-29 11:38:48.000000000 +0200
++++ amr-code/makefile	2011-05-29 11:38:50.000000000 +0200
+@@ -21,7 +21,7 @@
+ 
+ CC=gcc
+ 
+-CFLAGS	=	-g -I.
++CFLAGS	=	-g -I. -Wall -O3
+ 
+ SRCS1		=	ccoder.c	ccod_tet.c	init_params.c	sub_cc.c \
+ 			tetra_op.c
+@@ -33,10 +33,10 @@
+ 
+ all:		ccoder	cdecoder
+ 
+-ccoder:
++ccoder: $(SRCS1)
+ 	$(CC) $(SRCS1) $(CFLAGS) -o ccoder
+ 
+-cdecoder:
++cdecoder: $(SRCS2)
+ 	$(CC) $(SRCS2) $(CFLAGS) -o cdecoder
+ 
+ clean:
