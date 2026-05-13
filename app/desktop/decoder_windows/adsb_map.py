@@ -13,7 +13,8 @@ import json
 import time
 
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton
-from PySide6.QtCore import QTimer
+from PySide6.QtWidgets import QListWidget, QListWidgetItem, QGroupBox, QSplitter
+from PySide6.QtCore import QTimer, Qt
 from PySide6.QtWebEngineWidgets import QWebEngineView
 
 from .base import BaseDecoderWindow
@@ -65,9 +66,14 @@ function planeIcon(color, track) {
   });
 }
 
-function updateAircraft(icao, lat, lon, color, callsign, alt, speed, track) {
+function updateAircraft(icao, lat, lon, color, callsign, airline, country, originAirport, destination, destinationCountry, alt, speed, track) {
   var label = (callsign && callsign !== icao) ? callsign + ' (' + icao + ')' : icao;
   var popup = '<b>' + label + '</b>';
+  if (airline) popup += '<br>Airline: ' + airline;
+  if (country) popup += '<br>Country: ' + country;
+  if (originAirport) popup += '<br>Origin: ' + originAirport;
+  if (destination) popup += '<br>Destination: ' + destination;
+  if (destinationCountry) popup += '<br>Destination country: ' + destinationCountry;
   if (alt   != null) popup += '<br>' + alt.toLocaleString() + ' ft';
   if (speed != null) popup += '<br>' + speed + ' kt';
   if (track != null) popup += '<br>&#8599; ' + Math.round(track) + '&deg;';
@@ -111,6 +117,7 @@ class ADSBMapWindow(BaseDecoderWindow):
         self._aircraft:    dict = {}
         self._auto_ranged: bool = False
         self._page_ready:  bool = False
+        self._list_widget: QListWidget = None
 
         self._build_ui()
 
@@ -147,12 +154,33 @@ class ADSBMapWindow(BaseDecoderWindow):
         bar.addWidget(legend_lbl)
         bar.addWidget(fit_btn)
 
+        # Aircraft list panel (collapsible)
+        self._list_widget = QListWidget()
+        self._list_widget.setMaximumHeight(200)
+        self._list_widget.itemClicked.connect(self._on_aircraft_selected)
+        self._list_widget.setStyleSheet(
+            "QListWidget { background:#1a1a1a; color:#e0e0e0; border:1px solid #444; }"
+            "QListWidget::item { padding:2px; }"
+            "QListWidget::item:selected { background:#404080; }"
+        )
+
+        list_group = QGroupBox("Tracked Aircraft")
+        list_group.setStyleSheet("QGroupBox { color:#e0e0e0; border:1px solid #555; padding-top:8px; margin-top:0; }")
+        list_layout = QVBoxLayout(list_group)
+        list_layout.setContentsMargins(4, 8, 4, 4)
+        list_layout.addWidget(self._list_widget)
+
         central = QWidget()
         layout  = QVBoxLayout(central)
         layout.setContentsMargins(4, 4, 4, 4)
         layout.setSpacing(4)
         layout.addLayout(bar)
-        layout.addWidget(self._web, stretch=1)
+        splitter = QSplitter(Qt.Vertical)
+        splitter.addWidget(self._web)
+        splitter.addWidget(list_group)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 1)
+        layout.addWidget(splitter, stretch=1)
         self.setCentralWidget(central)
         self.resize(960, 680)
 
@@ -191,19 +219,28 @@ class ADSBMapWindow(BaseDecoderWindow):
         for icao, d in positioned:
             color = _alt_color(d.get("alt_ft") or 0)
             cs    = json.dumps((d.get("callsign") or "").strip() or None)
+            airline = json.dumps((d.get("airline") or d.get("airline_code") or "").strip() or None)
+            country = json.dumps((d.get("country") or d.get("origin_country") or "").strip() or None)
+            origin_airport = json.dumps((d.get("origin_airport") or "").strip() or None)
+            destination = json.dumps((d.get("destination") or d.get("destination_airport") or "").strip() or None)
+            destination_country = json.dumps((d.get("destination_country") or "").strip() or None)
             alt   = json.dumps(d.get("alt_ft"))
             speed = json.dumps(d.get("speed_kt"))
             track = json.dumps(d.get("track_deg"))
             self._js(
                 f"updateAircraft("
                 f"{json.dumps(icao)},{d['lat']},{d['lon']},"
-                f"{json.dumps(color)},{cs},{alt},{speed},{track})"
+                f"{json.dumps(color)},{cs},{airline},{country},{origin_airport},{destination},{destination_country},"
+                f"{alt},{speed},{track})"
             )
 
         # Auto-fit on first data
         if positioned and not self._auto_ranged:
             self._auto_ranged = True
             self._fit_view()
+
+        # Update aircraft list widget
+        self._update_aircraft_list()
 
         n_total = len(self._aircraft)
         n_pos   = len(positioned)
@@ -228,6 +265,53 @@ class ADSBMapWindow(BaseDecoderWindow):
 
     def _js(self, script: str):
         self._web.page().runJavaScript(script)
+
+    def _update_aircraft_list(self):
+        """Update the aircraft list widget with current tracked aircraft."""
+        self._list_widget.blockSignals(True)
+        self._list_widget.clear()
+
+        # Sort by callsign or ICAO
+        items = sorted(self._aircraft.items(),
+                      key=lambda x: (x[1].get('callsign') or x[0]).upper())
+
+        for icao, data in items:
+            cs = data.get('callsign', '').strip() or icao
+            alt = data.get('alt_ft')
+            speed = data.get('speed_kt')
+            airline = data.get('airline') or data.get('airline_code') or ''
+            dest = data.get('destination') or data.get('destination_airport') or ''
+            has_position = data.get('lat') is not None and data.get('lon') is not None
+            last_seen = int(max(0, time.time() - data.get('_ts', time.time())))
+
+            # Build display text
+            parts = ['¤' if has_position else '-', cs]
+            if airline:
+                parts.append(f"[{airline}]")
+            if alt is not None:
+                parts.append(f"{int(alt)}ft")
+            if speed is not None:
+                parts.append(f"{int(speed)}kt")
+            if dest:
+                parts.append(f"→ {dest}")
+
+            parts.append(f'(last seen: {last_seen}s)')
+            label = " | ".join(parts)
+            item = QListWidgetItem(label)
+            item.setData(Qt.UserRole, icao)  # Store ICAO as data
+            self._list_widget.addItem(item)
+            self._list_widget.item(self._list_widget.count() - 1).setForeground(Qt.gray if not has_position else Qt.white)
+            self._list_widget.item(self._list_widget.count() - 1).setToolTip(f"ICAO: {icao}\nAirline: {airline}\nAltitude: {alt} ft\nSpeed: {speed} kt\nDestination: {dest}\nLast seen: {last_seen} seconds ago")
+        self._list_widget.blockSignals(False)
+
+    def _on_aircraft_selected(self, item: QListWidgetItem):
+        """Handle aircraft selection from the list."""
+        icao = item.data(Qt.UserRole)
+        if icao and icao in self._aircraft:
+            data = self._aircraft[icao]
+            if data.get('lat') is not None and data.get('lon') is not None:
+                # Center map on selected aircraft
+                self._js(f"map.setView([{data['lat']}, {data['lon']}], 12);")
 
     # ── Cleanup ──────────────────────────────────────────────────────────
 

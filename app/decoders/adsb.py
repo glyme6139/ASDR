@@ -8,7 +8,11 @@ For best results: center frequency = 1090 MHz, VFO bandwidth = 8-20 MHz.
 """
 import time
 import logging
+import re
 import numpy as np
+import requests
+import airportsdata
+import pycountry
 from typing import Optional, Tuple
 from collections import deque
 
@@ -20,9 +24,15 @@ _AUDIO_RATE   = 48_000
 _CHUNK        = 2048
 _MIN_NB_SR    = 4_000_000   # minimum sample rate for reliable decoding
 _CRC_GEN      = 0xFFF409    # Mode-S CRC-24 generator polynomial
+_OPEN_SKY_BASE = 'https://opensky-network.org/api'
+_LOOKUP_TTL    = 600
+_HTTP_TIMEOUT  = 4
+
+_AIRPORTS = airportsdata.load('ICAO')
 
 # 6-bit character map for callsign decoding (index 0-63)
 _CS_MAP = '#ABCDEFGHIJKLMNOPQRSTUVWXYZ##### ###############0123456789######'
+_CALLSIGN_RE = re.compile(r'^([A-Z0-9]{3})([A-Z0-9]{1,5})?$')
 
 
 class ADSBDecoder(BaseDecoder):
@@ -32,6 +42,7 @@ class ADSBDecoder(BaseDecoder):
         super().__init__('ADSB', sample_rate=int(_MIN_NB_SR))
         self._aircraft: dict = {}   # ICAO → accumulated state
         self._pending: deque = deque()
+        self._lookup_cache: dict = {}
 
     # ------------------------------------------------------------------
     # BaseDecoder interface
@@ -60,6 +71,16 @@ class ADSBDecoder(BaseDecoder):
         cs = d.get('callsign', '').strip()
         if cs:
             parts.append(cs)
+        if d.get('airline'):
+            parts.append(f"AIRLINE:{d['airline']}")
+        if d.get('country'):
+            parts.append(f"COUNTRY:{d['country']}")
+        if d.get('origin_airport'):
+            parts.append(f"ORIGIN:{d['origin_airport']}")
+        if d.get('destination'):
+            parts.append(f"DEST:{d['destination']}")
+        if d.get('destination_country'):
+            parts.append(f"DEST_COUNTRY:{d['destination_country']}")
         if d.get('alt_ft') is not None:
             parts.append(f"ALTITUDE:{d['alt_ft']}ft ")
         if d.get('speed_kt') is not None:
@@ -233,12 +254,127 @@ class ADSBDecoder(BaseDecoder):
             if track is not None: state['track_deg'] = track
             if vs    is not None: state['vs_fpm']    = vs
 
+        state.update(self._lookup_metadata(icao, state.get('callsign')))
+
         result_data: dict = {'icao': icao}
-        for k in ('callsign', 'alt_ft', 'speed_kt', 'track_deg', 'vs_fpm', 'lat', 'lon'):
+        for k in (
+            'callsign', 'airline', 'airline_code', 'flight_number', 'country',
+            'origin_airport', 'origin_country', 'destination', 'destination_airport',
+            'destination_country', 'alt_ft', 'speed_kt', 'track_deg', 'vs_fpm',
+            'lat', 'lon',
+        ):
             if k in state:
                 result_data[k] = state[k]
 
         return DecoderResult(decoder_name='ADSB', timestamp=now, data=result_data)
+
+    def _lookup_metadata(self, icao: str, callsign: Optional[str] = None) -> dict:
+        now = time.time()
+        cached = self._lookup_cache.get(icao)
+        if cached and now - cached.get('_ts', 0.0) < _LOOKUP_TTL:
+            return {k: v for k, v in cached.items() if k != '_ts'}
+
+        meta: dict = {}
+        callsign_clean = self._clean_callsign(callsign or '')
+        if callsign_clean:
+            airline_code, flight_number = self._split_callsign(callsign_clean)
+            if airline_code:
+                meta['airline_code'] = airline_code
+                meta['airline'] = airline_code
+            if flight_number:
+                meta['flight_number'] = flight_number
+            meta['callsign'] = callsign_clean
+
+        try:
+            response = requests.get(
+                f'{_OPEN_SKY_BASE}/states/all?icao24={icao.lower()}',
+                timeout=_HTTP_TIMEOUT,
+            )
+            if response.ok:
+                payload = response.json()
+                states = payload.get('states') or []
+                if states:
+                    origin_country = states[0][2]
+                    if origin_country:
+                        meta['country'] = origin_country
+                    live_callsign = self._clean_callsign(states[0][1] or '')
+                    if live_callsign and not meta.get('callsign'):
+                        meta['callsign'] = live_callsign
+        except Exception:
+            pass
+
+        try:
+            end = int(now)
+            begin = end - 6 * 3600
+            response = requests.get(
+                f'{_OPEN_SKY_BASE}/flights/aircraft?icao24={icao.lower()}&begin={begin}&end={end}',
+                timeout=_HTTP_TIMEOUT,
+            )
+            if response.ok:
+                flights = response.json() or []
+                flight = None
+                for item in reversed(flights):
+                    if item.get('estArrivalAirport') or item.get('estDepartureAirport'):
+                        flight = item
+                        break
+                if flight:
+                    dep_code = flight.get('estDepartureAirport')
+                    arr_code = flight.get('estArrivalAirport')
+                    if dep_code:
+                        dep = self._format_airport(dep_code)
+                        if dep:
+                            meta['origin_airport'] = dep
+                            airport_info = _AIRPORTS.get(dep_code.upper())
+                            if airport_info:
+                                meta['origin_country'] = self._country_name(airport_info.get('country'))
+                    if arr_code:
+                        arr = self._format_airport(arr_code)
+                        if arr:
+                            meta['destination_airport'] = arr
+                            meta['destination'] = arr
+                            airport_info = _AIRPORTS.get(arr_code.upper())
+                            if airport_info:
+                                meta['destination_country'] = self._country_name(airport_info.get('country'))
+        except Exception:
+            pass
+
+        self._lookup_cache[icao] = {'_ts': now, **meta}
+        return meta
+
+    @staticmethod
+    def _clean_callsign(callsign: str) -> str:
+        return callsign.strip().upper()
+
+    @staticmethod
+    def _split_callsign(callsign: str) -> Tuple[Optional[str], Optional[str]]:
+        match = _CALLSIGN_RE.match(callsign.strip().upper())
+        if not match:
+            return None, None
+        airline_code, flight_number = match.groups()
+        return airline_code, flight_number
+
+    @staticmethod
+    def _country_name(code: Optional[str]) -> Optional[str]:
+        if not code:
+            return None
+        country = pycountry.countries.get(alpha_2=code.upper())
+        return country.name if country else code.upper()
+
+    def _format_airport(self, icao_code: Optional[str]) -> Optional[str]:
+        if not icao_code:
+            return None
+        info = _AIRPORTS.get(icao_code.upper())
+        if not info:
+            return icao_code.upper()
+        label = info.get('iata') or info.get('icao') or icao_code.upper()
+        name = info.get('name')
+        country = self._country_name(info.get('country'))
+        parts = [label]
+        if name:
+            parts.append(name)
+        if country:
+            parts.append(country)
+        return ' - '.join(parts)
 
     # ------------------------------------------------------------------
     # TC-specific decoders

@@ -33,6 +33,17 @@
       "decoders": [
         "POCSAG"
       ]
+    },
+    {
+      "name": "ADS-B",
+      "frequency": 1090000000.0,
+      "demod_mode": "IQ",
+      "bandwidth": 8000000.0,
+      "squelch_level": -120.0,
+      "volume": 0.0,
+      "decoders": [
+        "ADSB"
+      ]
     }
   ]
 }
