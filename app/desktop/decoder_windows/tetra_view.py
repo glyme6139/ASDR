@@ -1,9 +1,12 @@
 """
-TETRA decoder visualization window.
+TETRA channel visualization window — full protocol stack view.
 
-Shows the live burst stream with the most useful channel metadata that can be
-extracted from the decoder: BCCH vs TCH/S classification, broadcast-block
-fields, sync error count, inversion, codec availability, and PCM frame counts.
+Tabs:
+  Cell Info     — MCC, MNC, CC, LA, network time, frequencies
+  Active Calls  — per-slot call state with SSI, encryption, priority
+  Neighbours    — up to 32 neighbouring cells from MLE broadcast
+  SDS           — short data service messages
+  Events        — scrolling burst / control event log
 """
 
 from __future__ import annotations
@@ -12,7 +15,7 @@ import json
 import time
 from collections import deque
 from html import escape
-from typing import Deque, Dict, Optional
+from typing import Deque, Dict, List, Optional
 
 from PySide6.QtCore import QTimer, Qt
 from PySide6.QtGui import QColor, QBrush, QFont
@@ -26,6 +29,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QPushButton,
     QSplitter,
+    QTabWidget,
     QTableWidget,
     QTableWidgetItem,
     QTextBrowser,
@@ -36,553 +40,619 @@ from PySide6.QtWidgets import (
 
 from .base import BaseDecoderWindow
 
-_REFRESH_MS = 250
-_MAX_EVENTS = 250
-_MAX_DISPLAY_ROWS = 50
+# ── Tuning ────────────────────────────────────────────────────────────────────
+_FAST_MS      = 500    # status bar + cell info cards
+_SLOW_TICKS   = 4      # heavy tables refresh every _SLOW_TICKS fast ticks (2 s)
+_MAX_EVENTS   = 200    # rolling event buffer
+_LOG_ROWS     = 60     # rows shown in event log table
+_CALLS_ROWS   = 8      # max active-call rows (1 per timeslot, 4 slots)
+_SDS_ROWS     = 50
+
+_STYLE_DARK  = "background:#0f1012;"
+_STYLE_GROUP = (
+    "QGroupBox { color:#e0e0e0; border:1px solid #444; border-radius:6px; margin-top:8px; }"
+    "QGroupBox::title { subcontrol-origin:margin; left:8px; padding:0 4px; }"
+)
+_STYLE_TABLE = (
+    "QTableWidget { background:#131416; color:#e0e0e0; border:1px solid #444; }"
+    "QHeaderView::section { background:#202124; color:#f0f0f0; padding:4px; border:1px solid #444; }"
+    "QTableWidget::item:selected { background:#34507a; }"
+    "QTableWidget::item:alternate { background:#161820; }"
+)
+_STYLE_BROWSER = "QTextBrowser { background:#111214; color:#e0e0e0; border:1px solid #444; }"
+_MONO = QFont("Consolas", 10)
+
+# Colours
+_C_DEFAULT  = "#e0e0e0"
+_C_SYNC     = "#4a9eff"
+_C_BCCH     = "#8ab4f8"
+_C_TCH      = "#c5e1a5"
+_C_CONNECT  = "#7ee787"
+_C_RELEASE  = "#f28b82"
+_C_SDS      = "#fdd663"
+_BG_SYNC    = "#142235"
+_BG_BCCH    = "#142235"
+_BG_TCH     = "#122017"
+_BG_ALT     = ""
+
+
+def _make_table(headers: list[str]) -> QTableWidget:
+    t = QTableWidget(0, len(headers))
+    t.setHorizontalHeaderLabels(headers)
+    t.setAlternatingRowColors(True)
+    t.setSelectionBehavior(QAbstractItemView.SelectRows)
+    t.setSelectionMode(QAbstractItemView.SingleSelection)
+    t.setEditTriggers(QAbstractItemView.NoEditTriggers)
+    t.verticalHeader().setVisible(False)
+    t.horizontalHeader().setStretchLastSection(True)
+    for i in range(len(headers) - 1):
+        t.horizontalHeader().setSectionResizeMode(i, QHeaderView.ResizeToContents)
+    t.setStyleSheet(_STYLE_TABLE)
+    return t
+
+
+def _preallocate(table: QTableWidget, n_rows: int, n_cols: int):
+    """Fill table with blank items so we can setText() instead of setItem() later."""
+    table.setRowCount(n_rows)
+    flags = Qt.ItemIsSelectable | Qt.ItemIsEnabled
+    for r in range(n_rows):
+        for c in range(n_cols):
+            it = QTableWidgetItem("")
+            it.setFlags(flags)
+            table.setItem(r, c, it)
+
+
+def _set_row(table: QTableWidget, row: int, texts: list[str],
+             fg: str = _C_DEFAULT, bg: str = ""):
+    """Update an existing pre-allocated row in-place (no allocation)."""
+    fg_brush = QBrush(QColor(fg))
+    bg_brush = QBrush(QColor(bg)) if bg else None
+    for c, txt in enumerate(texts):
+        it = table.item(row, c)
+        if it is None:
+            it = QTableWidgetItem(str(txt))
+            it.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
+            table.setItem(row, c, it)
+        else:
+            it.setText(str(txt))
+        it.setForeground(fg_brush)
+        if bg_brush is not None:
+            it.setBackground(bg_brush)
 
 
 class TETRAWindow(BaseDecoderWindow):
-    """Live TETRA burst/channel inspector."""
+    """Full-stack TETRA channel inspector."""
 
     def __init__(self, vfo_id: int):
-        super().__init__(f"TETRA Channel - VFO {vfo_id + 1}", vfo_id, "TETRA")
-        self._events: Deque[dict] = deque(maxlen=_MAX_EVENTS)
-        self._latest: Dict = {}
-        self._selected_burst: Optional[int] = None
-        self._freeze = False
-        self._show_bcch = True
-        self._show_traffic = True
-        self._auto_follow = True
+        super().__init__(f"TETRA — VFO {vfo_id + 1}", vfo_id, "TETRA")
+        self._events: Deque[dict]    = deque(maxlen=_MAX_EVENTS)
+        self._latest: dict           = {}
+        self._calls:  Dict[str,dict] = {}
+        self._sds:    List[dict]     = []
+        self._neighbours: List[dict] = []
+        self._net:    dict           = {}
+        self._freeze: bool           = False
+        self._tick:   int            = 0
 
-        self._metric_labels: Dict[str, QLabel] = {}
-        self._table: QTableWidget | None = None
-        self._details: QTextBrowser | None = None
-        self._status_label: QLabel | None = None
-        self._freeze_btn: QPushButton | None = None
-        self._clear_btn: QPushButton | None = None
-        self._show_bcch_cb: QCheckBox | None = None
-        self._show_traffic_cb: QCheckBox | None = None
-        self._auto_follow_cb: QCheckBox | None = None
+        # dirty flags — set by push_result(), cleared after render
+        self._dirty_events:     bool = False
+        self._dirty_calls:      bool = False
+        self._dirty_neighbours: bool = False
+        self._dirty_sds:        bool = False
+        self._dirty_status:     bool = False
+
+        # last rendered row count per table (skip redraw if unchanged)
+        self._ev_rendered:  int = -1
+        self._nb_rendered:  int = -1
+        self._sds_rendered: int = -1
 
         self._build_ui()
-
         self._timer = QTimer(self)
-        self._timer.timeout.connect(self._refresh)
-        self._timer.start(_REFRESH_MS)
+        self._timer.timeout.connect(self._on_tick)
+        self._timer.start(_FAST_MS)
 
-    # ------------------------------------------------------------------
-    # UI construction
-    # ------------------------------------------------------------------
+    # ── UI construction ───────────────────────────────────────────────────────
 
     def _build_ui(self):
         central = QWidget(self)
         root = QVBoxLayout(central)
         root.setContentsMargins(8, 8, 8, 8)
-        root.setSpacing(8)
+        root.setSpacing(6)
 
-        header = QHBoxLayout()
+        # Header
+        hdr = QHBoxLayout()
         title = QLabel("TETRA Channel Inspector")
-        title.setObjectName("decoderTitle")
-        title.setStyleSheet("font-size:18px; font-weight:700; color:#f5f7fa;")
-        self._status_label = QLabel("Waiting for TETRA bursts...")
-        self._status_label.setStyleSheet("color:#9aa0a6; font-weight:600;")
-        header.addWidget(title)
-        header.addStretch()
-        header.addWidget(self._status_label)
-        root.addLayout(header)
+        title.setStyleSheet("font-size:17px; font-weight:700; color:#f5f7fa;")
+        self._status_lbl = QLabel("Waiting…")
+        self._status_lbl.setStyleSheet("color:#9aa0a6; font-weight:600;")
+        hdr.addWidget(title)
+        hdr.addStretch()
+        hdr.addWidget(self._status_lbl)
+        root.addLayout(hdr)
 
-        metrics = self._build_metrics()
-        root.addWidget(metrics)
-
-        controls = QGroupBox("View Options")
-        controls.setStyleSheet(
-            "QGroupBox { color:#e0e0e0; border:1px solid #444; border-radius:6px; margin-top:8px; }"
-            "QGroupBox::title { subcontrol-origin: margin; left:8px; padding:0 4px; }"
-        )
-        controls_layout = QHBoxLayout(controls)
-        controls_layout.setContentsMargins(8, 16, 8, 8)
-        controls_layout.setSpacing(10)
-
+        # Toolbar
+        tb = QHBoxLayout()
         self._freeze_btn = QPushButton("Freeze")
         self._freeze_btn.setCheckable(True)
-        self._freeze_btn.toggled.connect(self._on_freeze_toggled)
-        controls_layout.addWidget(self._freeze_btn)
-
+        self._freeze_btn.toggled.connect(self._on_freeze)
         self._clear_btn = QPushButton("Clear")
-        self._clear_btn.clicked.connect(self._clear_events)
-        controls_layout.addWidget(self._clear_btn)
+        self._clear_btn.clicked.connect(self._clear)
+        self._bcch_cb = QCheckBox("BCCH")
+        self._bcch_cb.setChecked(True)
+        self._bcch_cb.stateChanged.connect(self._invalidate_events)
+        self._tch_cb = QCheckBox("TCH/S")
+        self._tch_cb.setChecked(True)
+        self._tch_cb.stateChanged.connect(self._invalidate_events)
+        for w in (self._freeze_btn, self._clear_btn, self._bcch_cb, self._tch_cb):
+            tb.addWidget(w)
+        tb.addStretch()
+        root.addLayout(tb)
 
-        self._auto_follow_cb = QCheckBox("Auto follow latest")
-        self._auto_follow_cb.setChecked(True)
-        self._auto_follow_cb.toggled.connect(self._on_auto_follow_toggled)
-        controls_layout.addWidget(self._auto_follow_cb)
+        # Tabs
+        self._tabs = QTabWidget()
+        self._tabs.setStyleSheet(
+            "QTabBar::tab { background:#1a1b1e; color:#9aa0a6; padding:6px 14px; }"
+            "QTabBar::tab:selected { background:#202124; color:#f1f3f4;"
+            " border-bottom:2px solid #4a9eff; }"
+        )
+        self._tabs.addTab(self._build_cell_tab(),       "Cell Info")
+        self._tabs.addTab(self._build_calls_tab(),      "Active Calls")
+        self._tabs.addTab(self._build_neighbours_tab(), "Neighbours")
+        self._tabs.addTab(self._build_sds_tab(),        "SDS Messages")
+        self._tabs.addTab(self._build_events_tab(),     "Event Log")
+        root.addWidget(self._tabs, stretch=1)
 
-        self._show_bcch_cb = QCheckBox("Show BCCH")
-        self._show_bcch_cb.setChecked(True)
-        self._show_bcch_cb.toggled.connect(self._on_filter_changed)
-        controls_layout.addWidget(self._show_bcch_cb)
+        self.setCentralWidget(central)
+        self.resize(1200, 820)
+        self.setStyleSheet(_STYLE_DARK)
 
-        self._show_traffic_cb = QCheckBox("Show TCH/S")
-        self._show_traffic_cb.setChecked(True)
-        self._show_traffic_cb.toggled.connect(self._on_filter_changed)
-        controls_layout.addWidget(self._show_traffic_cb)
+    # ── Cell Info tab ─────────────────────────────────────────────────────────
 
-        controls_layout.addStretch()
-        root.addWidget(controls)
+    def _build_cell_tab(self) -> QWidget:
+        w = QWidget()
+        root = QVBoxLayout(w)
+        root.setContentsMargins(8, 8, 8, 8)
+
+        grid = QGroupBox("Current Cell")
+        grid.setStyleSheet(_STYLE_GROUP)
+        gl = QGridLayout(grid)
+        gl.setContentsMargins(10, 16, 10, 10)
+        gl.setSpacing(10)
+
+        self._cell_cards: Dict[str, QLabel] = {}
+        fields = [
+            ("MCC",           "net_mcc"),
+            ("MNC",           "net_mnc"),
+            ("Colour Code",   "net_cc"),
+            ("Location Area", "net_la"),
+            ("Cell ID",       "sysinfo_cell_id"),
+            ("Freq Band",     "sysinfo_freq_band"),
+            ("Power Class",   "sysinfo_power_class"),
+            ("TN",            "net_tn"),
+            ("FN",            "net_fn"),
+            ("MN",            "net_mn"),
+            ("Superframe",    "net_sn"),
+            ("Synced",        "net_synced"),
+            ("Mode",          "mode"),
+            ("Burst #",       "burst"),
+            ("SW errors",     "sw_errors"),
+            ("CRC",           "crc_ok"),
+        ]
+        for idx, (label, key) in enumerate(fields):
+            card = self._make_card(label, key, self._cell_cards)
+            gl.addWidget(card, idx // 4, idx % 4)
+
+        root.addWidget(grid)
+
+        nt_grp = QGroupBox("Network Time")
+        nt_grp.setStyleSheet(_STYLE_GROUP)
+        nt_lay = QHBoxLayout(nt_grp)
+        nt_lay.setContentsMargins(10, 16, 10, 10)
+        self._nt_lbl = QLabel("—")
+        self._nt_lbl.setFont(_MONO)
+        self._nt_lbl.setStyleSheet("color:#7ee787; font-size:13px;")
+        nt_lay.addWidget(self._nt_lbl)
+        root.addWidget(nt_grp)
+        root.addStretch()
+        return w
+
+    # ── Active Calls tab ──────────────────────────────────────────────────────
+
+    def _build_calls_tab(self) -> QWidget:
+        w = QWidget()
+        v = QVBoxLayout(w)
+        v.setContentsMargins(8, 8, 8, 8)
+        self._calls_tbl = _make_table(
+            ["Slot", "Event", "SSI", "GSSI", "Enc.", "Priority", "Type"])
+        _preallocate(self._calls_tbl, _CALLS_ROWS, 7)
+        v.addWidget(self._calls_tbl)
+        return w
+
+    # ── Neighbours tab ────────────────────────────────────────────────────────
+
+    def _build_neighbours_tab(self) -> QWidget:
+        w = QWidget()
+        v = QVBoxLayout(w)
+        v.setContentsMargins(8, 8, 8, 8)
+        self._nb_tbl = _make_table(["Cell ID", "MCC", "MNC", "LA", "ARFCN"])
+        _preallocate(self._nb_tbl, 32, 5)
+        v.addWidget(self._nb_tbl)
+        return w
+
+    # ── SDS tab ───────────────────────────────────────────────────────────────
+
+    def _build_sds_tab(self) -> QWidget:
+        w = QWidget()
+        v = QVBoxLayout(w)
+        v.setContentsMargins(8, 8, 8, 8)
+        self._sds_tbl = _make_table(
+            ["Time", "Src SSI", "Dst SSI", "Protocol", "Text / Hex"])
+        _preallocate(self._sds_tbl, _SDS_ROWS, 5)
+        v.addWidget(self._sds_tbl)
+        return w
+
+    # ── Event log tab ─────────────────────────────────────────────────────────
+
+    def _build_events_tab(self) -> QWidget:
+        w = QWidget()
+        v = QVBoxLayout(w)
+        v.setContentsMargins(8, 8, 8, 8)
 
         splitter = QSplitter(Qt.Horizontal)
         splitter.setChildrenCollapsible(False)
 
-        left = QWidget()
-        left_layout = QVBoxLayout(left)
-        left_layout.setContentsMargins(0, 0, 0, 0)
-        left_layout.setSpacing(6)
+        self._ev_tbl = _make_table(
+            ["Time", "#", "Type", "CC", "TS", "Err", "CRC", "Voice", "Ev."])
+        _preallocate(self._ev_tbl, _LOG_ROWS, 9)
+        self._ev_tbl.itemSelectionChanged.connect(self._on_ev_selected)
+        splitter.addWidget(self._ev_tbl)
 
-        table_group = QGroupBox("Recent Bursts")
-        table_group.setStyleSheet(
-            "QGroupBox { color:#e0e0e0; border:1px solid #444; border-radius:6px; margin-top:8px; }"
-            "QGroupBox::title { subcontrol-origin: margin; left:8px; padding:0 4px; }"
-        )
-        table_layout = QVBoxLayout(table_group)
-        table_layout.setContentsMargins(8, 16, 8, 8)
-        self._table = QTableWidget(0, 9)
-        self._table.setHorizontalHeaderLabels(
-            ["Time", "Burst", "Type", "CC", "TS", "SW err", "Inv", "Voice", "PCM"]
-        )
-        self._table.setAlternatingRowColors(True)
-        self._table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self._table.setSelectionMode(QAbstractItemView.SingleSelection)
-        self._table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self._table.verticalHeader().setVisible(False)
-        self._table.horizontalHeader().setStretchLastSection(True)
-        self._table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        self._table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        self._table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        self._table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        self._table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
-        self._table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeToContents)
-        self._table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeToContents)
-        self._table.horizontalHeader().setSectionResizeMode(7, QHeaderView.ResizeToContents)
-        self._table.setStyleSheet(
-            "QTableWidget { background:#131416; color:#e0e0e0; border:1px solid #444; }"
-            "QHeaderView::section { background:#202124; color:#f0f0f0; padding:4px; border:1px solid #444; }"
-            "QTableWidget::item:selected { background:#34507a; }"
-        )
-        self._table.itemSelectionChanged.connect(self._on_selection_changed)
-        table_layout.addWidget(self._table)
-        left_layout.addWidget(table_group, stretch=3)
+        self._ev_detail = QTextBrowser()
+        self._ev_detail.setStyleSheet(_STYLE_BROWSER)
+        self._ev_detail.setFont(_MONO)
+        splitter.addWidget(self._ev_detail)
+        splitter.setStretchFactor(0, 2)
+        splitter.setStretchFactor(1, 1)
 
-        details_group = QGroupBox("Selected Burst Details")
-        details_group.setStyleSheet(
-            "QGroupBox { color:#e0e0e0; border:1px solid #444; border-radius:6px; margin-top:8px; }"
-            "QGroupBox::title { subcontrol-origin: margin; left:8px; padding:0 4px; }"
-        )
-        details_layout = QVBoxLayout(details_group)
-        details_layout.setContentsMargins(8, 16, 8, 8)
-        self._details = QTextBrowser()
-        self._details.setStyleSheet(
-            "QTextBrowser { background:#111214; color:#e0e0e0; border:1px solid #444; }"
-        )
-        self._details.setFont(QFont("Consolas", 10))
-        self._details.setOpenExternalLinks(False)
-        details_layout.addWidget(self._details)
-        left_layout.addWidget(details_group, stretch=2)
+        v.addWidget(splitter)
+        return w
 
-        splitter.addWidget(left)
-        splitter.addWidget(self._build_channel_notes())
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 2)
-        root.addWidget(splitter, stretch=1)
+    # ── Card helper ───────────────────────────────────────────────────────────
 
-        self.setCentralWidget(central)
-        self.resize(1180, 820)
-        self.setStyleSheet("background:#0f1012;")
+    def _make_card(self, title: str, key: str, store: dict) -> QFrame:
+        f = QFrame()
+        f.setFrameShape(QFrame.StyledPanel)
+        f.setStyleSheet(
+            "QFrame { background:#17181b; border:1px solid #32353b; border-radius:6px; }")
+        lay = QVBoxLayout(f)
+        lay.setContentsMargins(10, 8, 10, 8)
+        lay.setSpacing(2)
+        tl = QLabel(title)
+        tl.setStyleSheet("color:#8a9099; font-size:10px;")
+        vl = QLabel("—")
+        vl.setStyleSheet("color:#f1f3f4; font-size:14px; font-weight:700;")
+        vl.setWordWrap(True)
+        lay.addWidget(tl)
+        lay.addWidget(vl)
+        store[key] = vl
+        return f
 
-    def _build_metrics(self) -> QGroupBox:
-        group = QGroupBox("Channel Summary")
-        group.setStyleSheet(
-            "QGroupBox { color:#e0e0e0; border:1px solid #444; border-radius:6px; margin-top:8px; }"
-            "QGroupBox::title { subcontrol-origin: margin; left:8px; padding:0 4px; }"
-        )
-        layout = QGridLayout(group)
-        layout.setContentsMargins(8, 16, 8, 8)
-        layout.setHorizontalSpacing(12)
-        layout.setVerticalSpacing(8)
-
-        cards = [
-            ("Latest burst", "burst"),
-            ("Channel type", "burst_type"),
-            ("Burst kind", "burst_kind"),
-            ("Train seq", "train_seq"),
-            ("Mode", "mode"),
-            ("Errors", "have_errors"),
-            ("Layout", "burst_layout"),
-            ("System code", "system_code"),
-            ("Colour code", "colour_code"),
-            ("Timeslot", "timeslot"),
-            ("Sync errors", "sw_errors"),
-            ("Training errors", "training_errors"),
-            ("Sync quality", "sync_quality"),
-            ("Inverted", "inverted"),
-            ("Voice burst", "voice_burst"),
-            ("PCM samples", "pcm_samples"),
-            ("Codec", "codec_available"),
-            ("Broadcast block", "bb_hex"),
-            ("Confidence", "confidence"),
-        ]
-
-        for idx, (label_text, key) in enumerate(cards):
-            card = self._make_metric_card(label_text, key)
-            layout.addWidget(card, idx // 4, idx % 4)
-
-        return group
-
-    def _make_metric_card(self, title: str, key: str) -> QFrame:
-        frame = QFrame()
-        frame.setFrameShape(QFrame.StyledPanel)
-        frame.setStyleSheet(
-            "QFrame { background:#17181b; border:1px solid #32353b; border-radius:6px; }"
-        )
-        layout = QVBoxLayout(frame)
-        layout.setContentsMargins(10, 8, 10, 8)
-        layout.setSpacing(2)
-
-        title_lbl = QLabel(title)
-        title_lbl.setStyleSheet("color:#8a9099; font-size:11px; text-transform:uppercase;")
-        value_lbl = QLabel("-")
-        value_lbl.setStyleSheet("color:#f1f3f4; font-size:15px; font-weight:700;")
-        value_lbl.setWordWrap(True)
-        layout.addWidget(title_lbl)
-        layout.addWidget(value_lbl)
-
-        self._metric_labels[key] = value_lbl
-        return frame
-
-    def _build_channel_notes(self) -> QGroupBox:
-        group = QGroupBox("Channel Notes")
-        group.setStyleSheet(
-            "QGroupBox { color:#e0e0e0; border:1px solid #444; border-radius:6px; margin-top:8px; }"
-            "QGroupBox::title { subcontrol-origin: margin; left:8px; padding:0 4px; }"
-        )
-        layout = QVBoxLayout(group)
-        layout.setContentsMargins(8, 16, 8, 8)
-
-        notes = QTextBrowser()
-        notes.setStyleSheet(
-            "QTextBrowser { background:#111214; color:#d7dae0; border:1px solid #444; }"
-        )
-        notes.setFont(QFont("Consolas", 10))
-        notes.setHtml(
-            "<h3 style='margin-top:0;color:#f1f3f4;'>TETRA burst inspector</h3>"
-            "<p>Use this window to watch the Broadcast Block metadata and the traffic-channel"
-            " speech path separately.</p>"
-            "<ul>"
-            "<li><b>BCCH</b>: system code 1, with colour code and timeslot extracted from the BB field.</li>"
-            "<li><b>TCH/S</b>: traffic bursts with optional ACELP decode output.</li>"
-            "<li><b>Codec</b>: indicates whether the TETRA speech codec wrapper is loaded.</li>"
-            "</ul>"
-            "<p>Filter buttons above can hide BCCH or traffic bursts if you only want one side of the channel.</p>"
-        )
-        layout.addWidget(notes)
-        return group
-
-    # ------------------------------------------------------------------
-    # Data ingress
-    # ------------------------------------------------------------------
+    # ── Data ingress ──────────────────────────────────────────────────────────
 
     def push_result(self, data: dict) -> None:
         if not isinstance(data, dict):
             return
-        event = dict(data)
-        event["_ts"] = time.time()
-        self._events.append(event)
-        self._latest = event
-        if self._auto_follow and not self._freeze:
-            self._selected_burst = int(event.get("burst", 0)) if event.get("burst") is not None else None
+        ev = dict(data)
+        ev["_ts"] = time.time()
+        self._events.append(ev)
+        self._latest = ev
+        self._dirty_events  = True
+        self._dirty_status  = True
 
-    # ------------------------------------------------------------------
-    # Refresh/render
-    # ------------------------------------------------------------------
+        calls = ev.get("active_calls")
+        if isinstance(calls, dict) and calls:
+            self._calls.update(calls)
+            self._dirty_calls = True
 
-    def _refresh(self):
+        nb = ev.get("neighbours")
+        if isinstance(nb, list) and nb:
+            self._neighbours = nb
+            self._dirty_neighbours = True
+
+        sds_text = ev.get("sds_text")
+        if sds_text:
+            self._sds.append({
+                "_ts": ev["_ts"],
+                "src_ssi": ev.get("ssi", 0),
+                "dst_ssi": 0,
+                "protocol": 0,
+                "text": sds_text,
+            })
+            if len(self._sds) > _SDS_ROWS:
+                self._sds.pop(0)
+            self._dirty_sds = True
+
+        net = {k[4:]: v for k, v in ev.items() if k.startswith("net_")}
+        if net:
+            self._net = net
+
+    # ── Timer ─────────────────────────────────────────────────────────────────
+
+    def _on_tick(self):
         if self._freeze:
             return
-        self._render_metrics()
-        self._render_table()
-        self._render_details()
-        self._render_status()
+        self._tick += 1
 
-    def _render_metrics(self):
-        latest = self._latest or {}
-        for key, value in self._metric_labels.items():
-            value.setText(self._format_metric(key, latest.get(key)))
+        # Fast path: status bar + cell info cards (every tick)
+        if self._dirty_status:
+            self._refresh_status()
+            self._dirty_status = False
+        self._refresh_cell_fast()
 
-    def _render_status(self):
-        if self._status_label is None:
-            return
-        total = len(self._events)
-        voice = sum(1 for e in self._events if e.get("voice_burst"))
-        bcch = sum(1 for e in self._events if e.get("burst_type") == "BCCH")
-        pcm = sum(1 for e in self._events if e.get("pcm_samples", 0))
-        if total == 0:
-            self._status_label.setText("Waiting for TETRA bursts...")
-        else:
-            self._status_label.setText(
-                f"{total} bursts | BCCH {bcch} | TCH/S {voice} | PCM {pcm}"
-            )
+        # Slow path: heavy tables (every _SLOW_TICKS ticks)
+        if self._tick % _SLOW_TICKS == 0:
+            tab_idx = self._tabs.currentIndex()
+            if tab_idx == 1 and self._dirty_calls:
+                self._refresh_calls()
+                self._dirty_calls = False
+            if tab_idx == 2 and self._dirty_neighbours:
+                self._refresh_neighbours()
+                self._dirty_neighbours = False
+            if tab_idx == 3 and self._dirty_sds:
+                self._refresh_sds()
+                self._dirty_sds = False
+            if tab_idx == 4 and self._dirty_events:
+                self._refresh_events()
+                self._dirty_events = False
 
-    def _render_table(self):
-        if self._table is None:
-            return
-        rows = list(self._filtered_events())[:_MAX_DISPLAY_ROWS]
-        # Batch updates and reuse QTableWidgetItem objects to avoid churn.
-        self._table.blockSignals(True)
-        self._table.setUpdatesEnabled(False)
+    # ── Renders ───────────────────────────────────────────────────────────────
+
+    def _refresh_cell_fast(self):
+        """Update cell-info cards with latest data (cheap label setText calls)."""
+        d = self._latest
+        sysinfo = d.get("sysinfo") or {}
+
+        for key, lbl in self._cell_cards.items():
+            if key.startswith("sysinfo_"):
+                raw = sysinfo.get(key[8:])
+            else:
+                raw = d.get(key)
+            if raw is None:
+                txt = "—"
+            elif key == "net_synced":
+                txt = "YES" if raw else "no"
+            elif key == "crc_ok":
+                txt = "OK" if raw else ("FAIL" if raw is False else "—")
+            else:
+                txt = str(raw)
+            if lbl.text() != txt:
+                lbl.setText(txt)
+
+        net = self._net
+        if net:
+            nt = (f"TN={net.get('tn','?')}  FN={net.get('fn','?')}"
+                  f"  MN={net.get('mn','?')}  SN={net.get('sn','?')}"
+                  f"   MCC={net.get('mcc','?')}  MNC={net.get('mnc','?')}"
+                  f"  CC={net.get('cc','?')}")
+            if self._nt_lbl.text() != nt:
+                self._nt_lbl.setText(nt)
+
+    def _refresh_calls(self):
+        t = self._calls_tbl
+        rows = list(self._calls.items())
+        n = min(len(rows), _CALLS_ROWS)
+        t.blockSignals(True)
+        t.setUpdatesEnabled(False)
         try:
-            current_rows = self._table.rowCount()
-            if current_rows != len(rows):
-                self._table.setRowCount(len(rows))
-
-            selected_burst = self._selected_burst
-            selected_row = -1
-            for row_idx, event in enumerate(rows):
-                burst = event.get("burst")
-                texts = [
-                    time.strftime("%H:%M:%S", time.localtime(event.get("_ts", time.time()))),
-                    str(burst) if burst is not None else "-",
-                    str(event.get("burst_type", "-")),
-                    self._format_metric("colour_code", event.get("colour_code")),
-                    self._format_metric("timeslot", event.get("timeslot")),
-                    str(event.get("sw_errors", "-")),
-                    "yes" if event.get("inverted") else "no",
-                    "yes" if event.get("voice_burst") else "no",
-                    self._format_metric("pcm_samples", event.get("pcm_samples")),
-                ]
-
-                # Reuse or create items, set text only
-                for col, text in enumerate(texts):
-                    item = self._table.item(row_idx, col)
-                    if item is None:
-                        item = QTableWidgetItem(text)
-                        item.setFlags(item.flags() & ~Qt.ItemIsEditable)
-                        self._table.setItem(row_idx, col, item)
-                    else:
-                        item.setText(text)
-
-                # Style the row once (apply to all columns)
-                fg = None
-                bg = None
-                burst_type = event.get("burst_type")
-                if burst_type == "BCCH":
-                    fg = QBrush(QColor("#8ab4f8"))
-                elif event.get("voice_burst"):
-                    fg = QBrush(QColor("#7ee787"))
-                if event.get("inverted"):
-                    bg = QBrush(QColor("#2b2315"))
-                elif burst_type == "BCCH":
-                    bg = QBrush(QColor("#142235"))
-                else:
-                    bg = QBrush(QColor("#122017"))
-
-                for col in range(self._table.columnCount()):
-                    it = self._table.item(row_idx, col)
-                    if it is not None:
-                        if fg is not None:
-                            it.setForeground(fg)
-                        else:
-                            it.setForeground(QBrush(QColor("#e0e0e0")))
-                        if bg is not None:
-                            it.setBackground(bg)
-
-                if burst is not None and selected_burst is not None and burst == selected_burst:
-                    selected_row = row_idx
-
-            if selected_row >= 0:
-                self._table.selectRow(selected_row)
-            elif rows and self._auto_follow:
-                self._table.selectRow(0)
-                top = rows[0].get("burst")
-                self._selected_burst = int(top) if top is not None else None
+            for r in range(n):
+                slot, ev = rows[r]
+                enc   = "YES" if ev.get("encryption") else "no"
+                ctype = ("Circuit" if ev.get("circuit_mode") else "Packet")
+                ctype += " Simplex" if ev.get("simplex") else " Duplex"
+                fg = (_C_CONNECT if ev.get("event") == "connect" else
+                      _C_RELEASE if ev.get("event") == "release" else _C_DEFAULT)
+                _set_row(t, r, [str(slot), ev.get("event","?"),
+                                str(ev.get("ssi",0)), str(ev.get("gssi",0)),
+                                enc, str(ev.get("priority",0)), ctype], fg)
+            # Blank unused rows
+            for r in range(n, _CALLS_ROWS):
+                _set_row(t, r, [""] * 7)
         finally:
-            self._table.setUpdatesEnabled(True)
-            self._table.blockSignals(False)
+            t.setUpdatesEnabled(True)
+            t.blockSignals(False)
 
-    def _render_details(self):
-        if self._details is None:
+    def _refresh_neighbours(self):
+        if len(self._neighbours) == self._nb_rendered:
             return
-        event = self._selected_event()
-        if not event:
-            self._details.setHtml(
-                "<div style='color:#9aa0a6; font-family:Consolas;'>No burst selected.</div>"
-            )
+        t = self._nb_tbl
+        rows = self._neighbours
+        n = min(len(rows), 32)
+        t.blockSignals(True)
+        t.setUpdatesEnabled(False)
+        try:
+            for r in range(n):
+                nb = rows[r]
+                _set_row(t, r, [str(nb.get(k,"?"))
+                                for k in ("cell_id","mcc","mnc","la","arfcn")])
+            for r in range(n, 32):
+                _set_row(t, r, [""] * 5)
+        finally:
+            t.setUpdatesEnabled(True)
+            t.blockSignals(False)
+        self._nb_rendered = len(rows)
+
+    def _refresh_sds(self):
+        if len(self._sds) == self._sds_rendered:
+            return
+        t = self._sds_tbl
+        rows = list(reversed(self._sds[-_SDS_ROWS:]))
+        n = min(len(rows), _SDS_ROWS)
+        t.blockSignals(True)
+        t.setUpdatesEnabled(False)
+        try:
+            for r in range(n):
+                msg = rows[r]
+                ts  = time.strftime("%H:%M:%S", time.localtime(msg.get("_ts", 0)))
+                fg  = _C_SDS if r == 0 else _C_DEFAULT
+                _set_row(t, r, [ts, str(msg.get("src_ssi",0)),
+                                str(msg.get("dst_ssi",0)),
+                                str(msg.get("protocol",0)),
+                                msg.get("text") or msg.get("data_hex","")], fg)
+            for r in range(n, _SDS_ROWS):
+                _set_row(t, r, [""] * 5)
+        finally:
+            t.setUpdatesEnabled(True)
+            t.blockSignals(False)
+        self._sds_rendered = len(self._sds)
+
+    def _refresh_events(self):
+        show_bcch = self._bcch_cb.isChecked()
+        show_tch  = self._tch_cb.isChecked()
+        visible: list[dict] = []
+        for ev in reversed(self._events):
+            bt = ev.get("burst_type", "")
+            if bt == "BCCH" and not show_bcch:
+                continue
+            if bt == "TCH/S" and not show_tch:
+                continue
+            visible.append(ev)
+            if len(visible) >= _LOG_ROWS:
+                break
+
+        n = len(visible)
+        if n == self._ev_rendered and not self._dirty_events:
             return
 
-        summary_rows = []
-        for key in [
-            "burst", "burst_type", "burst_kind", "train_seq", "mode",
-            "burst_received", "have_errors", "burst_layout", "system_code", "bb_hex",
-            "colour_code", "timeslot", "sw_errors", "training_errors",
-            "sync_error_ratio", "sync_quality", "inverted", "voice_burst",
-            "codec_available", "pcm_samples", "confidence"
-        ]:
-            summary_rows.append(
-                f"<tr><td style='padding:2px 10px 2px 0;color:#8a9099'>{escape(str(key))}</td>"
-                f"<td style='padding:2px 0;color:#f1f3f4'>{escape(self._format_metric(key, event.get(key)))}</td></tr>"
-            )
+        t = self._ev_tbl
+        t.blockSignals(True)
+        t.setUpdatesEnabled(False)
+        try:
+            for r in range(n):
+                ev  = visible[r]
+                bt  = ev.get("burst_type", "?")
+                ts  = time.strftime("%H:%M:%S", time.localtime(ev.get("_ts", 0)))
+                cc  = str(ev.get("colour_code", "—"))
+                tss = f"TS{ev.get('timeslot','?')}"
+                err = str(ev.get("sw_errors", "?"))
+                crc = ("OK" if ev.get("crc_ok") else
+                       "—" if ev.get("crc_ok") is None else "FAIL")
+                voice = "Y" if ev.get("voice_burst") else ""
+                ceve  = ev.get("call_event") or ""
 
-        raw_json = escape(json.dumps(self._serializable_event(event), indent=2, sort_keys=True))
+                if bt == "SYNC":
+                    fg, bg = _C_SYNC, _BG_SYNC
+                elif bt == "BCCH":
+                    fg, bg = _C_BCCH, _BG_BCCH
+                elif ceve == "connect":
+                    fg, bg = _C_CONNECT, _BG_TCH
+                elif ceve == "release":
+                    fg, bg = _C_RELEASE, _BG_TCH
+                elif bt == "TCH/S":
+                    fg, bg = _C_TCH, _BG_TCH
+                else:
+                    fg, bg = _C_DEFAULT, ""
+
+                _set_row(t, r,
+                         [ts, str(ev.get("burst","?")), bt, cc, tss,
+                          err, crc, voice, ceve], fg, bg)
+
+            # Blank unused rows
+            for r in range(n, _LOG_ROWS):
+                _set_row(t, r, [""] * 9)
+        finally:
+            t.setUpdatesEnabled(True)
+            t.blockSignals(False)
+
+        self._ev_rendered = n
+
+    def _refresh_status(self):
+        total = len(self._events)
+        if total == 0:
+            self._status_lbl.setText("Waiting for TETRA bursts…")
+            return
+        bcch  = sum(1 for e in self._events if e.get("burst_type") == "BCCH")
+        tch   = sum(1 for e in self._events if e.get("burst_type") == "TCH/S")
+        sync  = sum(1 for e in self._events if e.get("burst_type") == "SYNC")
+        voice = sum(1 for e in self._events if e.get("pcm_samples", 0) > 0)
+        mcc    = self._net.get("mcc", "?")
+        mnc    = self._net.get("mnc", "?")
+        synced = "✓" if self._net.get("synced") else "×"
+        self._status_lbl.setText(
+            f"[{synced}] MCC={mcc} MNC={mnc}  |  "
+            f"SYNC={sync}  BCCH={bcch}  TCH/S={tch}  Voice={voice}  "
+            f"Total={total}/{_MAX_EVENTS}"
+        )
+
+    # ── Event detail panel ────────────────────────────────────────────────────
+
+    def _on_ev_selected(self):
+        row = self._ev_tbl.currentRow()
+        if row < 0:
+            return
+        show_bcch = self._bcch_cb.isChecked()
+        show_tch  = self._tch_cb.isChecked()
+        visible: list[dict] = []
+        for ev in reversed(self._events):
+            bt = ev.get("burst_type", "")
+            if bt == "BCCH" and not show_bcch:
+                continue
+            if bt == "TCH/S" and not show_tch:
+                continue
+            visible.append(ev)
+            if len(visible) >= _LOG_ROWS:
+                break
+        if row < len(visible):
+            self._show_ev_detail(visible[row])
+
+    def _show_ev_detail(self, ev: dict):
+        safe = {}
+        for k, v in ev.items():
+            if k.startswith("_"):
+                continue
+            if k == "pcm" and v is not None:
+                safe[k] = f"<{len(v)} samples>"
+            elif hasattr(v, "tolist"):
+                safe[k] = v.tolist()
+            else:
+                safe[k] = v
         html = (
-            "<div style='font-family:Consolas,monospace;color:#e0e0e0;'>"
-            f"<h3 style='margin-top:0;color:#f1f3f4;'>Burst #{escape(self._format_metric('burst', event.get('burst')))}</h3>"
-            "<table style='border-collapse:collapse;margin-bottom:10px;'>"
-            + ''.join(summary_rows)
-            + "</table>"
-            "<div style='margin-top:10px;color:#8a9099;'>Raw event</div>"
-            f"<pre style='white-space:pre-wrap;background:#111214;border:1px solid #333;padding:10px;border-radius:4px;'>{raw_json}</pre>"
+            "<div style='font-family:Consolas,monospace;color:#e0e0e0;font-size:11px;'>"
+            f"<h3 style='color:#4a9eff;margin-top:0'>"
+            f"Burst #{escape(str(ev.get('burst','?')))} — "
+            f"{escape(str(ev.get('burst_type','?')))}</h3>"
+            f"<pre style='white-space:pre-wrap;'>"
+            f"{escape(json.dumps(safe, indent=2, default=str))}</pre>"
             "</div>"
         )
-        self._details.setHtml(html)
+        self._ev_detail.setHtml(html)
 
-    # ------------------------------------------------------------------
-    # Interaction
-    # ------------------------------------------------------------------
+    # ── Controls ──────────────────────────────────────────────────────────────
 
-    def _on_freeze_toggled(self, checked: bool):
+    def _invalidate_events(self):
+        self._ev_rendered = -1
+        self._dirty_events = True
+
+    def _on_freeze(self, checked: bool):
         self._freeze = checked
-        if self._freeze_btn is not None:
-            self._freeze_btn.setText("Unfreeze" if checked else "Freeze")
-        if not checked:
-            self._refresh()
+        self._freeze_btn.setText("Unfreeze" if checked else "Freeze")
 
-    def _on_auto_follow_toggled(self, checked: bool):
-        self._auto_follow = checked
-        if checked:
-            self._selected_burst = self._latest.get("burst") if self._latest else None
-            self._refresh()
-
-    def _on_filter_changed(self, _checked: bool):
-        if self._show_bcch_cb is not None:
-            self._show_bcch = self._show_bcch_cb.isChecked()
-        if self._show_traffic_cb is not None:
-            self._show_traffic = self._show_traffic_cb.isChecked()
-        self._refresh()
-
-    def _clear_events(self):
+    def _clear(self):
         self._events.clear()
-        self._latest = {}
-        self._selected_burst = None
-        if self._table is not None:
-            self._table.clearContents()
-            self._table.setRowCount(0)
-        if self._details is not None:
-            self._details.setHtml("<div style='color:#9aa0a6; font-family:Consolas;'>Cleared.</div>")
-        self._render_status()
-        self._render_metrics()
-
-    def _on_selection_changed(self):
-        event = self._selected_event()
-        if event is not None:
-            burst = event.get("burst")
-            self._selected_burst = int(burst) if burst is not None else None
-            self._render_details()
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-
-    def _filtered_events(self):
-        for event in reversed(self._events):
-            burst_type = event.get("burst_type")
-            if burst_type == "BCCH" and not self._show_bcch:
-                continue
-            if burst_type != "BCCH" and not self._show_traffic:
-                continue
-            yield event
-
-    def _selected_event(self) -> Optional[dict]:
-        if self._selected_burst is None:
-            if self._events:
-                return self._events[-1]
-            return None
-        for event in reversed(self._events):
-            if event.get("burst") == self._selected_burst:
-                return event
-        return self._events[-1] if self._events else None
-
-    @staticmethod
-    def _serializable_event(event: dict) -> dict:
-        data = {}
-        for key, value in event.items():
-            if key.startswith("_"):
-                continue
-            if key == "pcm" and value is not None:
-                data[key] = f"<{len(value)} samples>"
-            elif hasattr(value, "tolist"):
-                data[key] = value.tolist()
-            else:
-                data[key] = value
-        return data
-
-    @staticmethod
-    def _item(text: str) -> QTableWidgetItem:
-        item = QTableWidgetItem(text)
-        item.setFlags(item.flags() & ~Qt.ItemIsEditable)
-        return item
-
-    @staticmethod
-    def _format_metric(key: str, value) -> str:
-        if value is None:
-            return "-"
-        if key in ("inverted", "voice_burst", "codec_available", "have_errors", "burst_received"):
-            return "yes" if bool(value) else "no"
-        if key == "confidence":
-            try:
-                return f"{float(value):.2f}"
-            except Exception:
-                return str(value)
-        if key == "sync_error_ratio":
-            try:
-                return f"{float(value):.3f}"
-            except Exception:
-                return str(value)
-        if key == "sync_quality":
-            try:
-                return f"{float(value) * 100.0:.1f}%"
-            except Exception:
-                return str(value)
-        if key == "timeslot" and value is not None:
-            return f"TS{int(value)}"
-        if key == "burst_type" and value:
-            return str(value)
-        if key == "burst_kind" and value:
-            return str(value)
-        if key == "train_seq" and value:
-            return str(value)
-        if key == "mode" and value:
-            return str(value)
-        if key == "burst_layout" and isinstance(value, dict):
-            kind = value.get("kind", "-")
-            segs = value.get("segments", [])
-            seg_names = ",".join(str(seg.get("name", "?")) for seg in segs) if isinstance(segs, list) else "-"
-            return f"{kind}: {seg_names}"
-        if key == "colour_code" and value is not None:
-            return f"CC{int(value)}"
-        if key == "pcm_samples" and value is not None:
-            return f"{int(value)} samples"
-        return str(value)
-
-    def _style_row_item(self, item: QTableWidgetItem, event: dict):
-        burst_type = event.get("burst_type")
-        if burst_type == "BCCH":
-            item.setForeground(QBrush(QColor("#8ab4f8")))
-        elif event.get("voice_burst"):
-            item.setForeground(QBrush(QColor("#7ee787")))
-        if event.get("inverted"):
-            item.setBackground(QBrush(QColor("#2b2315")))
-        elif burst_type == "BCCH":
-            item.setBackground(QBrush(QColor("#142235")))
-        else:
-            item.setBackground(QBrush(QColor("#122017")))
+        self._latest     = {}
+        self._calls.clear()
+        self._sds.clear()
+        self._neighbours = []
+        self._net        = {}
+        self._ev_rendered  = -1
+        self._nb_rendered  = -1
+        self._sds_rendered = -1
+        self._dirty_events = self._dirty_calls = True
+        self._dirty_neighbours = self._dirty_sds = True
+        self._refresh_events()
+        self._refresh_calls()
+        self._refresh_neighbours()
+        self._refresh_sds()
+        self._status_lbl.setText("Cleared.")
 
     def closeEvent(self, event):
         event.ignore()

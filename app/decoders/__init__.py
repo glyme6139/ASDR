@@ -19,7 +19,7 @@ from .pocsag import POCSAGDecoder, POCSAGIQDecoder
 from .rds import RDSDecoder
 from .ais import AISDecoder
 from .adsb import ADSBDecoder
-from .tetra import TETRADecoder
+from .tetra import TETRADecoder  # now a package: app/decoders/tetra/
 
 __all__ = [
     'BaseDecoder',

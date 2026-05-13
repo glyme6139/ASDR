@@ -1,24 +1,21 @@
 """
-TETRA ACELP 4.8 kbps codec wrapper.
+TETRA ACELP 4.8 kbps speech codec wrapper.
 
-The TETRA speech codec is the ETSI EN 300 395-2 reference implementation.
-osmo-tetra provides patches for it in etsi_codec-patches/ but the source
-must be downloaded from ETSI separately (proprietary reference code):
+Supports two backend DLLs:
+  1. tetraVoiceDec  — from SDRSharp TETRA plugin (tetraVoiceDec.dll)
+       API: tetra_decode_init() → void*
+            tetra_cdec(int fp, uint8* inp, int16* outp, int hs) → void
+            tetra_sdec(int16* inp, int16* outp, void* chStruct) → void
+  2. ETSI reference  — from osmo-tetra + ETSI EN 300 395-2 source patches
+       API: speech_decode_frame(uint8* bits, int16* pcm) → int
 
-    cd etsi_codec-patches
-    ./download_and_patch.sh          # downloads + patches → ../codec/
-    cd ../codec && make              # builds the patched ETSI sources
+Build tetraVoiceDec.dll:
+  See SDRSharp TETRA plugin repo (it ships a pre-built DLL).
+  Place tetraVoiceDec.dll next to the executable or on PATH.
 
-The resulting object files must be linked into a shared library alongside
-the osmo-tetra lower_mac code (viterbi_tch.c, tch_reordering.c, etc.).
-No pre-built DLL/SO is distributed — you must build it yourself.
-
-Input per frame  : 137 bits (uint8, values 0/1) — post-reordering
-Output per frame : 240 int16 samples at 8 000 Hz (30 ms)
-
-One NDB burst (B1 + B2 = 432 raw bits) yields 2 ACELP frames (274 bits
-after Viterbi decoding → reordering → 2 × 137 bits), so one burst call
-produces 2 × 240 = 480 PCM samples.
+Input per frame  : 137 bits (uint8 values 0/1) — post-reordering
+Output per frame : 240 int16 samples @ 8 000 Hz (30 ms)
+One NDB burst    : 2 ACELP frames → 480 PCM samples
 """
 
 import sys
@@ -28,67 +25,67 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-FRAME_BITS   = 137    # ETSI ACELP input length per 30 ms frame
-PCM_SAMPLES  = 240    # 30 ms @ 8 000 Hz
-SAMPLE_RATE  = 8_000
+FRAME_BITS  = 137
+PCM_SAMPLES = 240
+SAMPLE_RATE = 8_000
 
 _SILENCE = np.zeros(PCM_SAMPLES, dtype=np.int16)
 
-# Library search names without extension (added per platform below).
-# Build your own shared library from osmo-tetra + patched ETSI codec and
-# place it here or on the system library search path.
+# Library search order (without extension)
 _LIB_CANDIDATES = [
+    'tetraVoiceDec',
+    'libtetraVoiceDec',
+    './tetraVoiceDec',
     'tetra_codec',
     'libtetra_codec',
     './tetra_codec',
     './libtetra_codec',
 ]
 
-# Candidate function names from the ETSI reference decoder.
-# The patched ETSI source exposes a decode entry point; the exact symbol
-# name depends on how it was compiled.  Add your symbol here if it differs.
-_FN_CANDIDATES = [
-    'tetra_speech_decode',   # osmo-tetra wrapper name (if added)
-    'speech_decode_frame',   # common ETSI reference name
-    'sp_dec',                # alternative ETSI name
-    'decode',                # generic name
-]
-
 
 class TetraCodec:
     """
-    Lazy-loading ctypes wrapper for the TETRA ACELP 4.8 kbps decoder.
-
-    Tries every combination of library candidate × function candidate at
-    load time; the first working pair is kept.  Returns silence on every
-    decode() call when the library is unavailable.
+    Lazy-loading ctypes wrapper.  Tries tetraVoiceDec API first (SDRSharp
+    variant), then falls back to ETSI reference symbol names.
+    Returns silence on every decode() call when no library is found.
     """
 
     def __init__(self):
-        self._fn  = None
-        self._buf = (ctypes.c_int16 * PCM_SAMPLES)()
+        self._ctx      = None          # void* from tetra_decode_init
+        self._cdec_fn  = None          # tetra_cdec (SDRSharp API)
+        self._sdec_fn  = None          # tetra_sdec (SDRSharp API)
+        self._etsi_fn  = None          # speech_decode_frame (ETSI API)
+        self._buf      = (ctypes.c_int16 * PCM_SAMPLES)()
         self._try_load()
 
     @property
     def available(self) -> bool:
-        return self._fn is not None
+        return (self._cdec_fn is not None) or (self._etsi_fn is not None)
 
     def decode(self, bits: np.ndarray) -> np.ndarray:
-        """
-        Decode one 137-bit TETRA ACELP frame → 240 int16 PCM @ 8 000 Hz.
-        Returns a silent frame when the codec library is not loaded.
-        """
-        if self._fn is None or len(bits) < FRAME_BITS:
+        """Decode one 137-bit ACELP frame → 240 int16 PCM @ 8 000 Hz."""
+        if not self.available or len(bits) < FRAME_BITS:
             return _SILENCE.copy()
         try:
-            packed = bits[:FRAME_BITS].astype(np.uint8)
-            self._fn(packed.ctypes.data_as(ctypes.c_char_p), self._buf)
-            return np.frombuffer(self._buf, dtype=np.int16).copy()
+            if self._cdec_fn is not None:
+                return self._decode_sdrsharp(bits)
+            return self._decode_etsi(bits)
         except Exception as exc:
             logger.debug("tetra_codec decode error: %s", exc)
             return _SILENCE.copy()
 
-    # ── private ──────────────────────────────────────────────────────────
+    # ── private ──────────────────────────────────────────────────────────────
+
+    def _decode_sdrsharp(self, bits: np.ndarray) -> np.ndarray:
+        packed = (ctypes.c_uint8 * FRAME_BITS)(*bits[:FRAME_BITS].astype(np.uint8))
+        # tetra_cdec(fp=0, inp, outp, hs=0)
+        self._cdec_fn(ctypes.c_int(0), packed, self._buf, ctypes.c_int(0))
+        return np.frombuffer(self._buf, dtype=np.int16).copy()
+
+    def _decode_etsi(self, bits: np.ndarray) -> np.ndarray:
+        packed = bits[:FRAME_BITS].astype(np.uint8)
+        self._etsi_fn(packed.ctypes.data_as(ctypes.c_char_p), self._buf)
+        return np.frombuffer(self._buf, dtype=np.int16).copy()
 
     def _try_load(self):
         suffix = '.dll' if sys.platform == 'win32' else '.so'
@@ -98,24 +95,60 @@ class TetraCodec:
                 lib = ctypes.CDLL(path)
             except OSError:
                 continue
-            for fn_name in _FN_CANDIDATES:
+
+            # Try tetraVoiceDec API (SDRSharp)
+            if self._try_sdrsharp_api(lib, path):
+                return
+
+            # Try ETSI reference API
+            for fn_name in ('speech_decode_frame', 'tetra_speech_decode', 'sp_dec', 'decode'):
                 try:
                     fn = getattr(lib, fn_name)
                     fn.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_int16)]
                     fn.restype  = ctypes.c_int
-                    self._fn = fn
-                    logger.info("TETRA codec: loaded '%s' → '%s'", path, fn_name)
+                    self._etsi_fn = fn
+                    logger.info("TETRA codec: ETSI API '%s' → '%s'", path, fn_name)
                     return
                 except AttributeError:
                     continue
 
         logger.info(
-            "TETRA ACELP codec library not found — voice output will be silent.\n"
-            "  1. cd etsi_codec-patches && ./download_and_patch.sh\n"
-            "  2. Build a shared library from codec/ + src/lower_mac/ sources\n"
-            "  3. Place tetra_codec%s in the working directory.",
-            suffix,
+            "TETRA ACELP codec not found — voice output will be silent.\n"
+            "  Place tetraVoiceDec%s (SDRSharp plugin) in the working directory.", suffix
         )
+
+    def _try_sdrsharp_api(self, lib, path: str) -> bool:
+        """Try to bind the SDRSharp tetraVoiceDec API."""
+        try:
+            init_fn = lib.tetra_decode_init
+            init_fn.argtypes = []
+            init_fn.restype  = ctypes.c_void_p
+            ctx = init_fn()
+
+            cdec = lib.tetra_cdec
+            cdec.argtypes = [
+                ctypes.c_int,
+                ctypes.POINTER(ctypes.c_uint8),
+                ctypes.POINTER(ctypes.c_int16),
+                ctypes.c_int,
+            ]
+            cdec.restype = None
+
+            sdec = lib.tetra_sdec
+            sdec.argtypes = [
+                ctypes.POINTER(ctypes.c_int16),
+                ctypes.POINTER(ctypes.c_int16),
+                ctypes.c_void_p,
+            ]
+            sdec.restype = None
+
+            self._ctx     = ctx
+            self._cdec_fn = cdec
+            self._sdec_fn = sdec
+            logger.info("TETRA codec: SDRSharp API loaded from '%s'", path)
+            return True
+        except AttributeError:
+            return False
 
 
 _instance: TetraCodec | None = None
