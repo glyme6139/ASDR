@@ -296,6 +296,9 @@ class DSPWorker:
             elif name == 'ADSB':
                 from app.decoders.adsb import ADSBDecoder
                 return ADSBDecoder()
+            elif name == 'TETRA':
+                from app.decoders.tetra import TETRADecoder
+                return TETRADecoder()
             else:
                 from app.decoders.modulation import create_modulation_decoder
                 return create_modulation_decoder(name)
@@ -404,8 +407,10 @@ class DSPWorker:
                             except Exception:
                                 pass
                             break
+                    raw_data = result.data if isinstance(result.data, dict) else {}
                     self._emit({'type': 'decoder_result', 'vfo_id': vfo_id,
-                                'name': result.decoder_name, 'text': formatted})
+                                'name': result.decoder_name, 'text': formatted,
+                                'data': raw_data})
                 pos += iq_needed
             self._vfo_iq_accum[vfo_id] = [buf[pos:]] if pos < total else []
 

@@ -19,6 +19,7 @@ from .pocsag import POCSAGDecoder, POCSAGIQDecoder
 from .rds import RDSDecoder
 from .ais import AISDecoder
 from .adsb import ADSBDecoder
+from .tetra import TETRADecoder
 
 __all__ = [
     'BaseDecoder',
@@ -35,4 +36,5 @@ __all__ = [
     'RDSDecoder',
     'AISDecoder',
     'ADSBDecoder',
+    'TETRADecoder',
 ]

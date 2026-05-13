@@ -57,7 +57,7 @@ class AcceptCommaDoubleSpinBox(QDoubleSpinBox):
 # Use our subclass throughout this module wherever QDoubleSpinBox is used.
 QDoubleSpinBox = AcceptCommaDoubleSpinBox
 
-DECODER_NAMES = ['POCSAG', 'RDS', 'AIS', 'ADSB'] + list(MODULATION_DECODER_NAMES)
+DECODER_NAMES = ['POCSAG', 'RDS', 'AIS', 'ADSB', 'TETRA'] + list(MODULATION_DECODER_NAMES)
 
 _BOOKMARK_FILE = 'bookmarks.json'
 
@@ -98,6 +98,7 @@ class SingleVFOTab(QWidget):
     squelch_enabled_changed = Signal(int, bool) # vfo_id, enabled
     mute_changed = Signal(int, bool)          # vfo_id, muted
     decoder_toggled = Signal(int, str, bool)  # vfo_id, decoder_name, enabled
+    open_window_requested = Signal(int, str)  # vfo_id, decoder_name
 
     def __init__(self, vfo_id: int, parent=None):
         super().__init__(parent)
@@ -218,7 +219,18 @@ class SingleVFOTab(QWidget):
             item.setCheckState(Qt.CheckState.Unchecked)
             self.decoder_list.addItem(item)
         self.decoder_list.itemChanged.connect(self._on_decoder_toggled)
+        self.decoder_list.itemSelectionChanged.connect(self._update_view_btn)
+        self.decoder_list.itemChanged.connect(self._update_view_btn)
         dec_layout.addWidget(self.decoder_list)
+
+        view_row = QHBoxLayout()
+        self.view_btn = QPushButton("Open View…")
+        self.view_btn.setEnabled(False)
+        self.view_btn.setToolTip("Open a visualization window for the selected decoder")
+        self.view_btn.clicked.connect(self._on_view_clicked)
+        view_row.addWidget(self.view_btn)
+        view_row.addStretch()
+        dec_layout.addLayout(view_row)
 
         dec_layout.addWidget(QLabel("Output:"))
         self.decoder_output = QTextEdit()
@@ -297,6 +309,20 @@ class SingleVFOTab(QWidget):
         enabled = item.checkState() == Qt.CheckState.Checked
         self.decoder_toggled.emit(self.vfo_id, name, enabled)
 
+    def _update_view_btn(self):
+        from app.desktop.decoder_windows import has_window
+        item = self.decoder_list.currentItem()
+        if item is None:
+            self.view_btn.setEnabled(False)
+            return
+        checked = item.checkState() == Qt.CheckState.Checked
+        self.view_btn.setEnabled(checked and has_window(item.text()))
+
+    def _on_view_clicked(self):
+        item = self.decoder_list.currentItem()
+        if item is not None:
+            self.open_window_requested.emit(self.vfo_id, item.text())
+
 
 # ---------------------------------------------------------------------------
 # VFO tab panel
@@ -322,6 +348,7 @@ class VFOTabPanel(QWidget):
     squelch_enabled_changed = Signal(int, bool)
     mute_changed = Signal(int, bool)
     decoder_toggled = Signal(int, str, bool)
+    open_window_requested = Signal(int, str)  # vfo_id, decoder_name
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -370,6 +397,7 @@ class VFOTabPanel(QWidget):
         tab.squelch_enabled_changed.connect(self.squelch_enabled_changed)
         tab.mute_changed.connect(self.mute_changed)
         tab.decoder_toggled.connect(self.decoder_toggled)
+        tab.open_window_requested.connect(self.open_window_requested)
 
         label = f"VFO {vfo_id + 1}"
         self._tab_widget.addTab(tab, label)

@@ -18,6 +18,7 @@ class IPCAdapterThread(QThread):
 
     device_status_changed = Signal(object)          # dict — object avoids Shiboken copy-convert warning
     decoder_result        = Signal(int, str, str)   # vfo_id, decoder_name, text
+    decoder_data          = Signal(int, str, object) # vfo_id, decoder_name, data-dict
     error_occurred        = Signal(str)
     signal_strength       = Signal(object)          # dict — same reason
 
@@ -36,6 +37,8 @@ class IPCAdapterThread(QThread):
                     self.device_status_changed.emit(msg['data'])
                 elif t == 'decoder_result':
                     self.decoder_result.emit(msg['vfo_id'], msg['name'], msg['text'])
+                    if msg.get('data'):
+                        self.decoder_data.emit(msg['vfo_id'], msg['name'], msg['data'])
                 elif t == 'error':
                     self.error_occurred.emit(msg['message'])
                 elif t == 'signal_strength':

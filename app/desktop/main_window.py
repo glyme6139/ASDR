@@ -39,6 +39,8 @@ class ASURMainWindow(QMainWindow):
         # Shadow state: tracks per-VFO freq/bandwidth in the UI process
         # so spectrum markers can be updated without round-tripping the DSP process.
         self._vfo_state: dict = {}   # {vfo_id: {'freq_hz': float, 'bandwidth_hz': float}}
+        # Optional decoder visualization windows: (vfo_id, decoder_name) → window
+        self._decoder_windows: dict = {}
         self._center_hz   = DEFAULT_CENTER_HZ
         self._sample_rate = DEFAULT_SAMPLE_RATE
 
@@ -200,6 +202,7 @@ class ASURMainWindow(QMainWindow):
         self.ipc.device_status_changed.connect(self._on_device_status, Q)
         self.ipc.error_occurred.connect(self._on_error, Q)
         self.ipc.decoder_result.connect(self._on_decoder_result, Q)
+        self.ipc.decoder_data.connect(self._on_decoder_data, Q)
         self.ipc.signal_strength.connect(self._on_signal_strength, Q)
 
         # ---- VFO tab lifecycle ----
@@ -226,6 +229,9 @@ class ASURMainWindow(QMainWindow):
 
         # ---- Decoder toggles ----
         self.ctrl_panel.vfo_tab.decoder_toggled.connect(self._on_decoder_toggled)
+
+        # ---- Decoder visualization windows ----
+        self.ctrl_panel.vfo_tab.open_window_requested.connect(self._on_open_decoder_window)
 
         # ---- Bookmarks ----
         self.ctrl_panel.bookmark_panel.bookmark_add_requested.connect(
@@ -267,6 +273,10 @@ class ASURMainWindow(QMainWindow):
         self._vfo_state.pop(vfo_id, None)
         self.vis_panel.remove_vfo_marker(vfo_id)
         self.dsp.remove_vfo(vfo_id)
+        for key in list(self._decoder_windows.keys()):
+            if key[0] == vfo_id:
+                win = self._decoder_windows.pop(key)
+                win.close()
 
     # ------------------------------------------------------------------
     # VFO control handlers
@@ -344,6 +354,27 @@ class ASURMainWindow(QMainWindow):
     def _on_decoder_toggled(self, vfo_id: int, decoder_name: str, enabled: bool):
         self.dsp.toggle_decoder(vfo_id, decoder_name, enabled)
 
+    def _on_decoder_data(self, vfo_id: int, decoder_name: str, data: dict):
+        key = (vfo_id, decoder_name)
+        win = self._decoder_windows.get(key)
+        if win is not None and win.isVisible():
+            win.push_result(data)
+
+    def _on_open_decoder_window(self, vfo_id: int, decoder_name: str):
+        from app.desktop.decoder_windows import create_window, has_window
+        if not has_window(decoder_name):
+            return
+        key = (vfo_id, decoder_name)
+        win = self._decoder_windows.get(key)
+        if win is None:
+            win = create_window(decoder_name, vfo_id)
+            if win is None:
+                return
+            self._decoder_windows[key] = win
+        win.show()
+        win.raise_()
+        win.activateWindow()
+
     def _on_decoder_result(self, vfo_id: int, decoder_name: str, text: str):
         self.ctrl_panel.vfo_tab.add_decoder_output(vfo_id, decoder_name, text)
         try:
@@ -403,6 +434,10 @@ class ASURMainWindow(QMainWindow):
                 session.save_session(sess)
         except Exception:
             pass
+
+        for win in self._decoder_windows.values():
+            win.close()
+        self._decoder_windows.clear()
 
         self.ipc.stop()
         self.dsp.stop()

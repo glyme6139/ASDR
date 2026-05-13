@@ -4,6 +4,7 @@ pyusb
 
 # Desktop UI
 PySide6>=6.5.0
+PySide6-WebEngine>=6.5.0
 pyqtgraph>=0.13.3
 
 # Signal processing
