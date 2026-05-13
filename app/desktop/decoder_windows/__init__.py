@@ -6,11 +6,13 @@ Only decoders listed here will show an "Open View" button in the VFO tab.
 """
 
 from .adsb_map import ADSBMapWindow
+from .tetra_view import TETRAWindow
 from .base import BaseDecoderWindow
 
 # Map decoder_name → window class (constructor receives vfo_id: int)
 WINDOW_REGISTRY: dict = {
     "ADSB": ADSBMapWindow,
+    "TETRA": TETRAWindow,
 }
 
 
@@ -28,6 +30,7 @@ def create_window(decoder_name: str, vfo_id: int) -> "BaseDecoderWindow | None":
 __all__ = [
     "BaseDecoderWindow",
     "ADSBMapWindow",
+    "TETRAWindow",
     "WINDOW_REGISTRY",
     "has_window",
     "create_window",

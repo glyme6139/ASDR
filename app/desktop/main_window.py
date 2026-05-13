@@ -49,11 +49,7 @@ class ASURMainWindow(QMainWindow):
 
         self._initUI()
         self._connect_signals()
-        # connect session save/load handlers for manual save and autosave toggles
-        try:
-            self.ctrl_panel.device_panel.connect_session_signals(self._on_manual_save)
-        except Exception:
-            pass
+        # session controls moved to main menu
         self._apply_stylesheet()
 
         # Wire shared-memory display buffers into the visualization panel
@@ -79,53 +75,20 @@ class ASURMainWindow(QMainWindow):
             dev = sess.get('device', {})
             if dev:
                 self.ctrl_panel.device_panel.apply_settings(dev)
+                # Update autosave menu state if present in session device settings
+                try:
+                    if hasattr(self, '_autosave_action') and 'autosave' in dev:
+                        self._autosave_action.setChecked(bool(dev.get('autosave', True)))
+                except Exception:
+                    pass
 
-            # Apply VFOs
+            # Apply VFOs: clear existing VFOs and recreate from session
             vfos = sess.get('vfos', [])
             if vfos and isinstance(vfos, list):
-                # Apply first VFO to existing first tab, create others
-                first = True
-                for v in vfos:
-                    if first:
-                        # apply to the initial tab (tab 0)
-                        vid = self.ctrl_panel.vfo_tab.active_vfo_id()
-                        if vid is None:
-                            vid = 0
-                        self.ctrl_panel.vfo_tab.apply_settings_to_vfo(vid, v)
-                        # apply decoder settings
-                        try:
-                            tab = self.ctrl_panel.vfo_tab._tabs.get(vid)
-                            if tab:
-                                for i in range(tab.decoder_list.count()):
-                                    item = tab.decoder_list.item(i)
-                                    checked = item.text() in v.get('decoders', [])
-                                    item.setCheckState(Qt.Checked if checked else Qt.Unchecked)
-                                    # if checked:
-                                    #     try:
-                                    #         self.dsp.toggle_decoder(vid, item.text(), True)
-                                    #     except Exception:
-                                    #         pass
-                        except Exception:
-                            pass
-                        first = False
-                        continue
-
-                    new_id = self.ctrl_panel.vfo_tab.add_vfo()
-                    self.ctrl_panel.vfo_tab.apply_settings_to_vfo(new_id, v)
-                    try:
-                        tab = self.ctrl_panel.vfo_tab._tabs.get(new_id)
-                        if tab:
-                            for i in range(tab.decoder_list.count()):
-                                item = tab.decoder_list.item(i)
-                                checked = item.text() in v.get('decoders', [])
-                                item.setCheckState(Qt.Checked if checked else Qt.Unchecked)
-                                # if checked:
-                                #     try:
-                                #         self.dsp.toggle_decoder(new_id, item.text(), True)
-                                #     except Exception:
-                                #         pass
-                    except Exception:
-                        pass
+                try:
+                    self.ctrl_panel.vfo_tab.replace_all_vfos(vfos)
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -165,6 +128,30 @@ class ASURMainWindow(QMainWindow):
         self.status_bar.addWidget(self.status_label)
 
         self.vis_panel.set_freq_range(DEFAULT_CENTER_HZ, DEFAULT_SAMPLE_RATE)
+
+        # --- Session menu (Load / Save / Autosave) ---
+        try:
+            from PySide6.QtGui import QAction
+            menubar = self.menuBar()
+            session_menu = menubar.addMenu("Session")
+
+            self._load_session_action = QAction("Load Session...", self)
+            self._load_session_action.triggered.connect(self._on_load_session)
+            session_menu.addAction(self._load_session_action)
+
+            self._save_session_action = QAction("Save Session...", self)
+            self._save_session_action.triggered.connect(self._on_manual_save)
+            session_menu.addAction(self._save_session_action)
+
+            session_menu.addSeparator()
+
+            self._autosave_action = QAction("Autosave on exit", self)
+            self._autosave_action.setCheckable(True)
+            # default checked; will be set from loaded session if present
+            self._autosave_action.setChecked(True)
+            session_menu.addAction(self._autosave_action)
+        except Exception:
+            pass
 
     def _create_decoder_panel(self):
         class DecoderAggregator(QWidget):
@@ -425,7 +412,12 @@ class ASURMainWindow(QMainWindow):
         # Save session
         try:
             # only autosave if enabled
-            if self.ctrl_panel.device_panel.get_autosave_enabled():
+            autosave = True
+            try:
+                autosave = bool(getattr(self, '_autosave_action').isChecked())
+            except Exception:
+                autosave = True
+            if autosave:
                 from app import session
                 sess = {
                     'device': self.ctrl_panel.device_panel.get_settings(),
@@ -459,6 +451,33 @@ class ASURMainWindow(QMainWindow):
             session.save_session(sess, fname)
         except Exception:
             logger.exception("Manual save session failed")
+
+    def _on_load_session(self):
+        try:
+            fname, _ = QFileDialog.getOpenFileName(self, "Load session...", str(), "JSON Files (*.json);;All Files (*)")
+            if not fname:
+                return
+            from app import session
+            sess = session.load_session(fname)
+            # Apply device settings
+            dev = sess.get('device', {})
+            if dev:
+                self.ctrl_panel.device_panel.apply_settings(dev)
+                try:
+                    if hasattr(self, '_autosave_action') and 'autosave' in dev:
+                        self._autosave_action.setChecked(bool(dev.get('autosave', True)))
+                except Exception:
+                    pass
+
+            # Apply VFOs: clear existing VFOs and recreate from session
+            vfos = sess.get('vfos', [])
+            if vfos and isinstance(vfos, list):
+                try:
+                    self.ctrl_panel.vfo_tab.replace_all_vfos(vfos)
+                except Exception:
+                    pass
+        except Exception:
+            logger.exception("Load session failed")
 
     # ------------------------------------------------------------------
     # Stylesheet

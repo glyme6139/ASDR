@@ -578,6 +578,52 @@ class VFOTabPanel(QWidget):
                 return vfo_id
         return None
 
+    def replace_all_vfos(self, settings_list: list):
+        """Remove all existing VFO tabs and create new ones from settings_list.
+
+        Each entry in settings_list should be a dict suitable for
+        `apply_settings_to_vfo`. This method emits `vfo_removed` for each
+        removed VFO and `vfo_added` for each newly created VFO.
+        """
+        # Remove all existing tabs (emit vfo_removed for each)
+        try:
+            # collect indices by vfo_id so removals are safe
+            existing = list(self._tabs.keys())
+            # remove tabs in reverse tab index order to avoid shifting
+            indices = []
+            for vfo_id in existing:
+                idx = self._vfo_id_to_tab_index(vfo_id)
+                if idx >= 0:
+                    indices.append((idx, vfo_id))
+            indices.sort(reverse=True)
+            for idx, vfo_id in indices:
+                self._tab_widget.removeTab(idx)
+                if vfo_id in self._tabs:
+                    del self._tabs[vfo_id]
+                try:
+                    self.vfo_removed.emit(vfo_id)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # Create new VFOs from settings_list
+        created = []
+        try:
+            first = True
+            for s in settings_list:
+                vid = self._add_vfo()
+                self.apply_settings_to_vfo(vid, s)
+                created.append(vid)
+                first = False
+        except Exception:
+            pass
+        # Ensure at least one VFO exists
+        if not self._tabs:
+            vid = self._add_vfo()
+            created.append(vid)
+        return created
+
 
 # ---------------------------------------------------------------------------
 # Bookmark panel
@@ -895,18 +941,7 @@ class DevicePanel(QWidget):
         amp_row.addStretch()
         layout.addLayout(amp_row)
 
-        # Session controls: Save and Autosave
-        sess_row = QHBoxLayout()
-        self.save_btn = QPushButton("Save Session...")
-        self.save_btn.setToolTip("Save current session to a file")
-        sess_row.addWidget(self.save_btn)
-
-        self.autosave_check = QCheckBox("Autosave on exit")
-        self.autosave_check.setChecked(True)
-        sess_row.addWidget(self.autosave_check)
-
-        sess_row.addStretch()
-        layout.addLayout(sess_row)
+        # Session controls moved to the main window menu
 
         self.setLayout(layout)
 
@@ -925,7 +960,7 @@ class DevicePanel(QWidget):
             'lna': int(self.lna_slider.value()),
             'vga': int(self.vga_slider.value()),
             'amp_enabled': bool(self.amp_check.isChecked()),
-            'autosave': bool(self.autosave_check.isChecked()),
+            'autosave': True,
         }
 
     def apply_settings(self, settings: dict) -> None:
@@ -941,26 +976,21 @@ class DevicePanel(QWidget):
                 self.vga_slider.setValue(int(settings.get('vga', 20)))
             if 'amp_enabled' in settings:
                 self.amp_check.setChecked(bool(settings.get('amp_enabled', False)))
-            if 'autosave' in settings:
-                try:
-                    self.autosave_check.setChecked(bool(settings.get('autosave', True)))
-                except Exception:
-                    pass
+            # autosave moved to main menu; ignore here
         except Exception:
             pass
 
     def get_autosave_enabled(self) -> bool:
-        return bool(self.autosave_check.isChecked())
+        # Session autosave is controlled from the main window Session menu.
+        return True
 
     def connect_session_signals(self, save_callback, autosave_callback=None):
-        """Connect callbacks for Save button and autosave toggles.
-
-        - save_callback: callable invoked when Save button clicked
-        - autosave_callback: optional callable(bool) called when autosave toggled
-        """
-        self.save_btn.clicked.connect(lambda: save_callback())
-        if autosave_callback is not None:
-            self.autosave_check.toggled.connect(lambda v: autosave_callback(bool(v)))
+        # Deprecated: session controls moved to main window menu. Keep for compatibility.
+        try:
+            # Provide a no-op connection to preserve callers' expectations.
+            return
+        except Exception:
+            return
 
 
 # ---------------------------------------------------------------------------

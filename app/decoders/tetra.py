@@ -227,6 +227,9 @@ class TETRADecoder(BaseDecoder):
         bb      = burst[_NDB_BB_OFF : _NDB_BB_OFF + 14]
         info    = _parse_bb(bb)
         is_bcch = info.get('system_code') == 1
+        channel_type = 'BCCH' if is_bcch else 'TCH/S'
+        from .tetra_codec import get_codec
+        codec_available = get_codec().available
 
         # Extract voice payload from traffic-channel bursts.
         # Each burst's B1+B2 (432 raw bits) → 2 × 137-bit ACELP frames → 480 PCM samples.
@@ -246,8 +249,12 @@ class TETRADecoder(BaseDecoder):
             timestamp=time.time(),
             data={
                 'burst':     self._burst_n,
+                'burst_type': channel_type,
                 'sw_errors': sw_errors,
                 'inverted':  inverted,
+                'voice_burst': not is_bcch,
+                'codec_available': codec_available,
+                'pcm_samples': int(len(pcm)) if pcm is not None else 0,
                 'pcm':       pcm,
                 **info,
             },
@@ -403,7 +410,11 @@ def _parse_bb(bb: np.ndarray) -> dict:
     if len(bb) < 14:
         return {}
     sys_code = _bits_to_int(bb[:4])
-    out: dict = {'system_code': sys_code}
+    out: dict = {
+        'system_code': sys_code,
+        'bb_hex': f"0x{_bits_to_int(bb):04X}",
+        'bb_bits': ''.join('1' if int(b) else '0' for b in bb),
+    }
     if sys_code == 1:
         out['colour_code'] = _bits_to_int(bb[4:10])
         out['timeslot']    = _bits_to_int(bb[10:12])
