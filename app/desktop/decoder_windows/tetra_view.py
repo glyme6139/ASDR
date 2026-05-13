@@ -212,10 +212,17 @@ class TETRAWindow(BaseDecoderWindow):
         cards = [
             ("Latest burst", "burst"),
             ("Channel type", "burst_type"),
+            ("Burst kind", "burst_kind"),
+            ("Train seq", "train_seq"),
+            ("Mode", "mode"),
+            ("Errors", "have_errors"),
+            ("Layout", "burst_layout"),
             ("System code", "system_code"),
             ("Colour code", "colour_code"),
             ("Timeslot", "timeslot"),
             ("Sync errors", "sw_errors"),
+            ("Training errors", "training_errors"),
+            ("Sync quality", "sync_quality"),
             ("Inverted", "inverted"),
             ("Voice burst", "voice_burst"),
             ("PCM samples", "pcm_samples"),
@@ -412,9 +419,11 @@ class TETRAWindow(BaseDecoderWindow):
 
         summary_rows = []
         for key in [
-            "burst", "burst_type", "system_code", "bb_hex", "colour_code",
-            "timeslot", "sw_errors", "inverted", "voice_burst", "codec_available",
-            "pcm_samples", "confidence"
+            "burst", "burst_type", "burst_kind", "train_seq", "mode",
+            "burst_received", "have_errors", "burst_layout", "system_code", "bb_hex",
+            "colour_code", "timeslot", "sw_errors", "training_errors",
+            "sync_error_ratio", "sync_quality", "inverted", "voice_burst",
+            "codec_available", "pcm_samples", "confidence"
         ]:
             summary_rows.append(
                 f"<tr><td style='padding:2px 10px 2px 0;color:#8a9099'>{escape(str(key))}</td>"
@@ -524,17 +533,38 @@ class TETRAWindow(BaseDecoderWindow):
     def _format_metric(key: str, value) -> str:
         if value is None:
             return "-"
-        if key == "inverted" or key == "voice_burst" or key == "codec_available":
+        if key in ("inverted", "voice_burst", "codec_available", "have_errors", "burst_received"):
             return "yes" if bool(value) else "no"
         if key == "confidence":
             try:
                 return f"{float(value):.2f}"
             except Exception:
                 return str(value)
+        if key == "sync_error_ratio":
+            try:
+                return f"{float(value):.3f}"
+            except Exception:
+                return str(value)
+        if key == "sync_quality":
+            try:
+                return f"{float(value) * 100.0:.1f}%"
+            except Exception:
+                return str(value)
         if key == "timeslot" and value is not None:
             return f"TS{int(value)}"
         if key == "burst_type" and value:
             return str(value)
+        if key == "burst_kind" and value:
+            return str(value)
+        if key == "train_seq" and value:
+            return str(value)
+        if key == "mode" and value:
+            return str(value)
+        if key == "burst_layout" and isinstance(value, dict):
+            kind = value.get("kind", "-")
+            segs = value.get("segments", [])
+            seg_names = ",".join(str(seg.get("name", "?")) for seg in segs) if isinstance(segs, list) else "-"
+            return f"{kind}: {seg_names}"
         if key == "colour_code" and value is not None:
             return f"CC{int(value)}"
         if key == "pcm_samples" and value is not None:

@@ -47,13 +47,20 @@ _MIN_SAMPLE_RATE = 36_000
 # Normal Downlink Burst field layout (ETSI EN 300 392-2 Table 9.33)
 #   tail(2) | B1(216) | SW(38) | BB(14) | B2(216) | tail(2) | FS2(22) = 510
 _NDB_CHIPS  = 510
+_BURST_CHIPS = 510
 _NDB_B1_START = 2
 _NDB_B1_END   = 218   # 2 + 216
 _NDB_SW_OFF   = 218
 _NDB_BB_OFF   = 256   # 218 + 38
 _NDB_B2_START = 270   # 256 + 14
 _NDB_B2_END   = 486   # 270 + 216
+_SB_BLK1_OFFSET = (6 + 1 + 40) * 2
+_SB_BBK_OFFSET  = (6 + 1 + 40 + 60 + 19) * 2
+_SB_BLK2_OFFSET = (6 + 1 + 40 + 60 + 19 + 15) * 2
 _SW_LEN = 38
+_SYNC_TRAIN_OFF = 214
+_NDB_TRAIN_OFF = 244
+_TRAIN_MAX_ERRORS = 6
 
 _SW_BITS = np.array([
     1, 1, 0, 0, 1, 0, 0, 1,
@@ -63,6 +70,19 @@ _SW_BITS = np.array([
     1, 1, 1, 1, 1, 1,
 ], dtype=np.float32)
 _SW_BIPOLAR = 2.0 * _SW_BITS - 1.0
+
+_Q_BITS = np.array([1,0, 1,1, 0,1, 1,1, 0,0, 0,0, 0,1, 1,0, 1,0, 1,1, 0,1], dtype=np.int8)
+_N_BITS = np.array([1,1, 0,1, 0,0, 0,0, 1,1, 1,0, 1,0, 0,1, 1,1, 0,1, 0,0], dtype=np.int8)
+_P_BITS = np.array([0,1, 1,1, 1,0, 1,0, 0,1, 0,0, 0,0, 1,1, 0,1, 1,1, 1,0], dtype=np.int8)
+_X_BITS = np.array([1,0, 0,1, 1,1, 0,1, 0,0, 0,0, 1,1, 1,0, 1,0, 0,1, 1,1, 0,1, 0,0, 0,0, 1,1], dtype=np.int8)
+_Y_BITS = np.array([1,1, 0,0, 0,0, 0,1, 1,0, 0,1, 1,1, 0,0, 1,1, 1,0, 1,0, 0,1, 1,1, 0,0, 0,0, 0,1, 1,0, 0,1, 1,1], dtype=np.int8)
+_TRAIN_SEQS = {
+    'SYNC': (_Y_BITS, _SYNC_TRAIN_OFF),
+    'NDB1': (_N_BITS, _NDB_TRAIN_OFF),
+    'NDB2': (_P_BITS, _NDB_TRAIN_OFF),
+    'NDB3': (_Q_BITS, _NDB_TRAIN_OFF),
+    'EXT': (_X_BITS, _NDB_TRAIN_OFF),
+}
 
 _PI4_MAP: Tuple = (
     ( np.pi / 4,     0, 0),
@@ -189,59 +209,68 @@ class TETRADecoder(BaseDecoder):
 
     def _drain(self):
         buf = self._bits
-        while len(buf) >= _NDB_CHIPS:
-            pos, inv = _find_sw(buf)
-            if pos is None:
-                keep = _SW_LEN - 1
-                buf  = buf[-keep:] if len(buf) > keep else buf
+        while len(buf) >= _BURST_CHIPS:
+            candidate = _find_burst_candidate(buf)
+            if candidate is None:
+                keep = max(_SW_LEN, len(_Y_BITS), len(_N_BITS), len(_P_BITS), len(_Q_BITS), len(_X_BITS)) - 1
+                buf = buf[-keep:] if len(buf) > keep else buf
                 break
 
-            start = pos - _NDB_SW_OFF
-            if start < 0:
-                buf = buf[pos + _SW_LEN:]
-                continue
-
-            end = start + _NDB_CHIPS
+            start, burst_kind, train_name, train_errors = candidate
+            end = start + _BURST_CHIPS
             if end > len(buf):
                 buf = buf[start:]
                 break
 
             burst = buf[start:end].copy()
-            if inv:
-                burst = 1 - burst
-
-            r = self._decode_ndb(burst, inv)
+            r = self._decode_burst(
+                burst,
+                burst_kind=burst_kind,
+                train_name=train_name,
+                train_errors=train_errors,
+            )
             if r is not None:
                 self._pending.append(r)
             buf = buf[end:]
 
         self._bits = buf
 
-    def _decode_ndb(self, burst: np.ndarray, inverted: bool) -> Optional[DecoderResult]:
-        sw_slice  = burst[_NDB_SW_OFF : _NDB_SW_OFF + _SW_LEN]
-        sw_errors = int(np.sum(sw_slice != _SW_BITS.astype(np.int8)))
-        if sw_errors > 6:
+    def _decode_burst(
+        self,
+        burst: np.ndarray,
+        burst_kind: str,
+        train_name: str,
+        train_errors: int,
+    ) -> Optional[DecoderResult]:
+        if train_errors > _TRAIN_MAX_ERRORS:
             return None
 
         self._burst_n += 1
-        bb      = burst[_NDB_BB_OFF : _NDB_BB_OFF + 14]
-        info    = _parse_bb(bb)
-        is_bcch = info.get('system_code') == 1
-        channel_type = 'BCCH' if is_bcch else 'TCH/S'
+        is_sync = burst_kind == 'SYNC'
+        info = {}
+        if not is_sync:
+            bb = burst[_NDB_BB_OFF : _NDB_BB_OFF + 14]
+            info = _parse_bb(bb)
+        is_bcch = info.get('system_code') == 1 if info else False
+        channel_type = 'SYNC' if is_sync else ('BCCH' if is_bcch else 'TCH/S')
+        tetra_mode = 'TMO' if (info.get('system_code', 0) or 0) < 8 else 'DMO'
         from .tetra_codec import get_codec
         codec_available = get_codec().available
+        sync_error_ratio = train_errors / float(len(_TRAIN_SEQS.get(train_name, (_Q_BITS, 0))[0]))
+        sync_quality = max(0.0, 1.0 - sync_error_ratio)
+        burst_layout = _burst_layout_for_kind(burst_kind)
 
         # Extract voice payload from traffic-channel bursts.
         # Each burst's B1+B2 (432 raw bits) → 2 × 137-bit ACELP frames → 480 PCM samples.
         pcm: Optional[np.ndarray] = None
-        if not is_bcch:
+        if not is_sync and not is_bcch:
             b1  = burst[_NDB_B1_START:_NDB_B1_END]   # 216 bits
             b2  = burst[_NDB_B2_START:_NDB_B2_END]   # 216 bits
             pcm = _decode_tch_burst(np.concatenate([b1, b2]))
 
         logger.debug(
-            "TETRA NDB #%d  SW_err=%d  inv=%s  bcch=%s  voice=%s  %s",
-            self._burst_n, sw_errors, inverted, is_bcch, pcm is not None, info,
+            "TETRA BURST #%d  kind=%s  train=%s  err=%d  bcch=%s  voice=%s  %s",
+            self._burst_n, burst_kind, train_name, train_errors, is_bcch, pcm is not None, info,
         )
 
         return DecoderResult(
@@ -250,15 +279,24 @@ class TETRADecoder(BaseDecoder):
             data={
                 'burst':     self._burst_n,
                 'burst_type': channel_type,
-                'sw_errors': sw_errors,
-                'inverted':  inverted,
-                'voice_burst': not is_bcch,
+                'burst_kind': burst_kind,
+                'train_seq': train_name,
+                'mode':      tetra_mode,
+                'burst_received': True,
+                'have_errors': train_errors > 0,
+                'sw_errors': train_errors,
+                'training_errors': train_errors,
+                'sync_error_ratio': sync_error_ratio,
+                'sync_quality': sync_quality,
+                'burst_layout': burst_layout,
+                'inverted':  False,
+                'voice_burst': (not is_sync) and (not is_bcch),
                 'codec_available': codec_available,
                 'pcm_samples': int(len(pcm)) if pcm is not None else 0,
                 'pcm':       pcm,
                 **info,
             },
-            confidence=max(0.3, 1.0 - sw_errors * 0.12),
+            confidence=max(0.3, 1.0 - train_errors * 0.12),
             metadata={'type': 'tetra_ndb'},
         )
 
@@ -328,6 +366,59 @@ def _acelp_type2_to_codec(
             cur += 1
 
     return out[:_ACELP_BITS], out[_ACELP_BITS:]
+
+
+def _find_burst_candidate(buf: np.ndarray) -> Optional[Tuple[int, str, str, int]]:
+    """Find the best burst candidate by matching reference training sequences."""
+    if len(buf) < _BURST_CHIPS:
+        return None
+
+    best: Optional[Tuple[int, str, str, int]] = None
+
+    for start in range(0, len(buf) - _BURST_CHIPS + 1):
+        # SYNC burst training sequence (y_bits at offset 214)
+        sync_off = start + _SYNC_TRAIN_OFF
+        if sync_off + len(_Y_BITS) <= len(buf):
+            errs = int(np.sum(buf[sync_off:sync_off + len(_Y_BITS)] != _Y_BITS))
+            if errs <= _TRAIN_MAX_ERRORS:
+                cand = (start, 'SYNC', 'SYNC', errs)
+                if best is None or errs < best[3] or (errs == best[3] and start < best[0]):
+                    best = cand
+
+        # Normal burst training sequence at offset 244 (N/P/Q are valid markers)
+        ndb_off = start + _NDB_TRAIN_OFF
+        if ndb_off + len(_N_BITS) <= len(buf):
+            for train_name, train_bits in (('NDB1', _N_BITS), ('NDB2', _P_BITS), ('NDB3', _Q_BITS), ('EXT', _X_BITS)):
+                errs = int(np.sum(buf[ndb_off:ndb_off + len(train_bits)] != train_bits))
+                if errs <= _TRAIN_MAX_ERRORS:
+                    cand = (start, 'NDB', train_name, errs)
+                    if best is None or errs < best[3] or (errs == best[3] and start < best[0]):
+                        best = cand
+
+    return best
+
+
+def _burst_layout_for_kind(burst_kind: str) -> dict:
+    """Return a compact layout description for reference-style burst blocks."""
+    if burst_kind == 'SYNC':
+        return {
+            'kind': 'SYNC',
+            'train_offset': _SYNC_TRAIN_OFF,
+            'segments': [
+                {'name': 'SB1', 'offset': _SB_BLK1_OFFSET, 'length': 120},
+                {'name': 'BBK', 'offset': _SB_BBK_OFFSET, 'length': 30},
+                {'name': 'SB2', 'offset': _SB_BLK2_OFFSET, 'length': 216},
+            ],
+        }
+    return {
+        'kind': 'NDB',
+        'train_offset': _NDB_TRAIN_OFF,
+        'segments': [
+            {'name': 'B1', 'offset': _NDB_B1_START, 'length': _NDB_B1_END - _NDB_B1_START},
+            {'name': 'BB', 'offset': _NDB_BB_OFF, 'length': 14},
+            {'name': 'B2', 'offset': _NDB_B2_START, 'length': _NDB_B2_END - _NDB_B2_START},
+        ],
+    }
 
 
 def _demodulate(iq: np.ndarray, sps_i: int) -> Optional[np.ndarray]:
