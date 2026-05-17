@@ -77,7 +77,6 @@ class CollapsibleSection(QWidget):
             "QWidget#collapsible_content_container {"
             "  border: 1px solid rgba(255, 255, 255, 0.14);"
             "  border-radius: 6px;"
-            "  background: rgba(255, 255, 255, 0.03);"
             "}"
         )
 

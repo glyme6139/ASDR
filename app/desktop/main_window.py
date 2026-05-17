@@ -7,6 +7,7 @@ from html import escape
 
 from PySide6.QtWidgets import (
     QMainWindow,
+    QPushButton,
     QWidget,
     QHBoxLayout,
     QVBoxLayout,
@@ -160,13 +161,25 @@ class ASURMainWindow(QMainWindow):
                 layout = QVBoxLayout(self)
                 layout.setContentsMargins(4, 4, 4, 4)
                 layout.setSpacing(4)
+
+                header_row = QHBoxLayout()
+                header_row.setContentsMargins(0, 0, 0, 0)
                 header = QLabel("Decoder Output (aggregated)")
                 header.setAlignment(Qt.AlignLeft)
-                layout.addWidget(header)
+                header_row.addWidget(header)
+                header_row.addStretch()
+                self.clear_btn = QPushButton("Clear")
+                self.clear_btn.setToolTip("Clear aggregated decoder output")
+                header_row.addWidget(self.clear_btn)
+                layout.addLayout(header_row)
+
                 self.output = QTextBrowser()
                 self.output.setReadOnly(True)
                 self.output.document().setMaximumBlockCount(1000)
                 layout.addWidget(self.output)
+
+                # Wire clear button after output exists
+                self.clear_btn.clicked.connect(self.output.clear)
 
             def append(self, vfo_id: int, decoder_name: str, text: str, vfo_color: str):
                 import time

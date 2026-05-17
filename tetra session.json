@@ -1,19 +1,19 @@
 {
   "device": {
-    "center_freq": 425000000.0,
-    "sample_rate": 2000000,
-    "lna": 38,
-    "vga": 46,
+    "center_freq": 428500000.0,
+    "sample_rate": 1000000,
+    "lna": 40,
+    "vga": 30,
     "amp_enabled": true,
     "autosave": true
   },
   "vfos": [
     {
-      "name": "POCSAG 3",
-      "frequency": 428661861.0,
+      "name": "TETRA 1",
+      "frequency": 428662056.0,
       "demod_mode": "IQ",
-      "bandwidth": 75000.0,
-      "volume": 0.04,
+      "bandwidth": 100000.0,
+      "volume": 0.0,
       "squelch_level": -120.0,
       "squelch_enabled": true,
       "enabled": true,

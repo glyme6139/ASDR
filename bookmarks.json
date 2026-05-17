@@ -44,6 +44,17 @@
       "decoders": [
         "ADSB"
       ]
+    },
+    {
+      "name": "TETRA 1",
+      "frequency": 428662969.0,
+      "demod_mode": "IQ",
+      "bandwidth": 100000.0,
+      "squelch_level": -120.0,
+      "volume": 0.0,
+      "decoders": [
+        "TETRA"
+      ]
     }
   ]
 }
