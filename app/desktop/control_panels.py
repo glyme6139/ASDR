@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QSlider,
     QPushButton, QComboBox, QGroupBox,
     QListWidget, QListWidgetItem, QTextEdit, QTabWidget, QSizePolicy,
-    QCheckBox, QFileDialog, QInputDialog,
+    QCheckBox, QFileDialog, QInputDialog, QToolButton,
 )
 from PySide6.QtWidgets import QScrollArea
 from .widgets import AcceptCommaDoubleSpinBox
@@ -60,6 +60,60 @@ QDoubleSpinBox = AcceptCommaDoubleSpinBox
 DECODER_NAMES = ['POCSAG', 'RDS', 'AIS', 'ADSB', 'TETRA'] + list(MODULATION_DECODER_NAMES)
 
 _BOOKMARK_FILE = 'bookmarks.json'
+
+
+class CollapsibleSection(QWidget):
+    def __init__(self, title: str, content_widget: QWidget, expanded: bool = True, parent=None):
+        super().__init__(parent)
+
+        self._content_widget = content_widget
+        self._content_container = QWidget()
+        self._content_container.setObjectName("collapsible_content_container")
+        container_layout = QVBoxLayout(self._content_container)
+        container_layout.setContentsMargins(8, 8, 8, 8)
+        container_layout.setSpacing(0)
+        container_layout.addWidget(content_widget)
+        self._content_container.setStyleSheet(
+            "QWidget#collapsible_content_container {"
+            "  border: 1px solid rgba(255, 255, 255, 0.14);"
+            "  border-radius: 6px;"
+            "  background: rgba(255, 255, 255, 0.03);"
+            "}"
+        )
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(4)
+
+        self.toggle_button = QToolButton()
+        self.toggle_button.setText(title)
+        self.toggle_button.setCheckable(True)
+        self.toggle_button.setChecked(expanded)
+        self.toggle_button.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
+        self.toggle_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.toggle_button.setAutoRaise(True)
+        self.toggle_button.setStyleSheet(
+            "QToolButton {"
+            "  border: none;"
+            "  padding: 4px 2px;"
+            "  font-weight: 600;"
+            "  text-align: left;"
+            "}"
+            "QToolButton:hover {"
+            "  background: rgba(255, 255, 255, 0.04);"
+            "  border-radius: 4px;"
+            "}"
+        )
+        self.toggle_button.toggled.connect(self._on_toggled)
+
+        outer.addWidget(self.toggle_button)
+        outer.addWidget(self._content_container)
+
+        self._content_container.setVisible(expanded)
+
+    def _on_toggled(self, checked: bool):
+        self._content_container.setVisible(checked)
+        self.toggle_button.setArrowType(Qt.DownArrow if checked else Qt.RightArrow)
 
 
 @dataclass
@@ -151,7 +205,6 @@ class SingleVFOTab(QWidget):
         )
         bw_row.addWidget(self.bw_spin)
         demod_layout.addLayout(bw_row)
-
         demod_group.setLayout(demod_layout)
         layout.addWidget(demod_group)
 
@@ -662,11 +715,7 @@ class BookmarkPanel(QWidget):
     def _initUI(self):
         outer = QVBoxLayout()
         outer.setContentsMargins(0, 0, 0, 0)
-
-        group = QGroupBox("Bookmarks")
-        g = QVBoxLayout()
-        g.setContentsMargins(6, 6, 6, 6)
-        g.setSpacing(4)
+        outer.setSpacing(4)
 
         # ── toolbar row ──
         toolbar = QHBoxLayout()
@@ -679,7 +728,7 @@ class BookmarkPanel(QWidget):
         self.save_vfo_btn.setToolTip("Save the active VFO's settings as a new bookmark")
         for btn in (self.import_btn, self.export_btn, self.save_vfo_btn):
             toolbar.addWidget(btn)
-        g.addLayout(toolbar)
+        outer.addLayout(toolbar)
 
         # ── bookmark list ──
         self.list_widget = QListWidget()
@@ -689,7 +738,7 @@ class BookmarkPanel(QWidget):
         self.list_widget.setToolTip("Double-click a bookmark to add it as a new VFO")
         self.list_widget.itemSelectionChanged.connect(self._on_selection_changed)
         self.list_widget.itemDoubleClicked.connect(lambda _: self._on_add_to_vfo())
-        g.addWidget(self.list_widget)
+        outer.addWidget(self.list_widget)
 
         # ── action row ──
         action_row = QHBoxLayout()
@@ -702,10 +751,7 @@ class BookmarkPanel(QWidget):
         self.remove_btn.setToolTip("Delete selected bookmark from the list")
         action_row.addWidget(self.add_btn)
         action_row.addWidget(self.remove_btn)
-        g.addLayout(action_row)
-
-        group.setLayout(g)
-        outer.addWidget(group)
+        outer.addLayout(action_row)
         self.setLayout(outer)
 
         self.import_btn.clicked.connect(self._on_import)
@@ -1018,23 +1064,21 @@ class ControlPanel(QWidget):
         content_layout.setContentsMargins(6, 6, 6, 6)
         content_layout.setSpacing(8)
 
-        # Device group at the bottom
-        device_group = QGroupBox("Device")
-        device_layout = QVBoxLayout()
         self.device_panel = DevicePanel()
-        device_layout.addWidget(self.device_panel)
-        device_group.setLayout(device_layout)
-        content_layout.addWidget(device_group, stretch=0)
 
-        # VFO tabs occupy most of the space
         self.vfo_tab = VFOTabPanel()
-        content_layout.addWidget(self.vfo_tab, stretch=0)
 
-        # Bookmark panel — always visible between VFO tabs and device settings
         self.bookmark_panel = BookmarkPanel(
             get_vfo_snapshot=self.vfo_tab.get_active_vfo_snapshot
         )
-        content_layout.addWidget(self.bookmark_panel, stretch=0)
+
+        device_group = CollapsibleSection("Device", self.device_panel)
+        vfo_group = CollapsibleSection("VFOs", self.vfo_tab)
+        bookmark_group = CollapsibleSection("Bookmarks", self.bookmark_panel)
+
+        content_layout.addWidget(device_group, stretch=0)
+        content_layout.addWidget(vfo_group, stretch=0)
+        content_layout.addWidget(bookmark_group, stretch=0)
 
         content_layout.addStretch()
         content.setLayout(content_layout)
