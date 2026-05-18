@@ -15,6 +15,8 @@ from multiprocessing.shared_memory import SharedMemory
 import numpy as np
 import logging
 
+from .timing import TimingConfig
+
 logger = logging.getLogger(__name__)
 
 DISPLAY_FFT_SIZE = 32768  # must match sdr_worker.DISPLAY_FFT_SIZE
@@ -24,15 +26,28 @@ DISPLAY_FFT_SIZE = 32768  # must match sdr_worker.DISPLAY_FFT_SIZE
 # Subprocess entry point — module-level so Windows spawn can pickle it
 # ---------------------------------------------------------------------------
 
-def _dsp_worker_main(cmd_q, result_q, spec_shm_name: str, wf_shm_name: str, disp_gen):
+def _dsp_worker_main(cmd_q, result_q, spec_shm_name: str, wf_shm_name: str, disp_gen, timing_config: dict | None = None):
     """
     DSP subprocess entry point.
     Must be a module-level function (not a lambda or nested function) for
     Windows multiprocessing spawn to pickle it correctly.
     """
     import logging
+    from .timing import TimingConfig, profiler_from_config
     logging.basicConfig(level=logging.INFO,
                         format='[DSP %(process)d] %(levelname)s %(name)s: %(message)s')
+
+    def emit_timing_report(report: dict):
+        try:
+            result_q.put_nowait({'type': 'timing_report', 'data': report})
+        except Exception:
+            pass
+
+    profiler = profiler_from_config(
+        TimingConfig(**(timing_config or {})),
+        prefix="DSP",
+        report_handler=emit_timing_report,
+    )
 
     spec_shm = SharedMemory(name=spec_shm_name)
     wf_shm   = SharedMemory(name=wf_shm_name)
@@ -40,7 +55,7 @@ def _dsp_worker_main(cmd_q, result_q, spec_shm_name: str, wf_shm_name: str, disp
     wf_arr   = np.ndarray((DISPLAY_FFT_SIZE,), dtype=np.uint8,   buffer=wf_shm.buf)
 
     from app.desktop.sdr_worker import DSPWorker
-    worker = DSPWorker(cmd_q, result_q, spec_arr, wf_arr, disp_gen)
+    worker = DSPWorker(cmd_q, result_q, spec_arr, wf_arr, disp_gen, profiler=profiler)
     try:
         worker.run()
     finally:
@@ -59,7 +74,7 @@ class DSPProcess:
     into shared memory; the UI render timer reads them without copying.
     """
 
-    def __init__(self):
+    def __init__(self, timing: TimingConfig | None = None):
         # Use explicit 'spawn' context for cross-platform safety (required on Windows)
         self._ctx      = mp.get_context('spawn')
         self._cmd_q    = self._ctx.Queue()
@@ -69,6 +84,7 @@ class DSPProcess:
         self._spec_shm = SharedMemory(create=True, size=DISPLAY_FFT_SIZE * 4)
         self._wf_shm   = SharedMemory(create=True, size=DISPLAY_FFT_SIZE * 1)
         self._disp_gen = self._ctx.Value('L', 0)  # generation counter
+        self._timing   = timing or TimingConfig()
 
         # Read-only numpy views for the UI side
         self.spectrum_buf  = np.ndarray((DISPLAY_FFT_SIZE,), dtype=np.float32,
@@ -88,6 +104,7 @@ class DSPProcess:
                 self._spec_shm.name,
                 self._wf_shm.name,
                 self._disp_gen,
+                {'enabled': self._timing.enabled, 'sample_count': self._timing.sample_count},
             ),
             daemon=True,
         )
@@ -174,3 +191,6 @@ class DSPProcess:
     def toggle_decoder(self, vfo_id: int, decoder_name: str, enabled: bool):
         self._send({'cmd': 'toggle_decoder', 'vfo_id': int(vfo_id),
                     'decoder_name': str(decoder_name), 'enabled': bool(enabled)})
+
+    def set_timing_sample_count(self, n: int):
+        self._send({'cmd': 'set_timing_sample_count', 'n': int(n)})

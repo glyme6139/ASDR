@@ -1,0 +1,25 @@
+{
+  "device": {
+    "center_freq": 131000000.0,
+    "sample_rate": 2000000,
+    "lna": 40,
+    "vga": 57,
+    "amp_enabled": true,
+    "autosave": true
+  },
+  "vfos": [
+    {
+      "name": "VFO 2",
+      "frequency": 131574999.99999999,
+      "demod_mode": "AM",
+      "bandwidth": 10000.0,
+      "volume": 0.77,
+      "squelch_level": -120.0,
+      "squelch_enabled": true,
+      "enabled": true,
+      "decoders": [
+        "ACARS"
+      ]
+    }
+  ]
+}

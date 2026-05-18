@@ -26,6 +26,7 @@ TARGET_PROC_RATE = 200_000  # Hz — keeps resample_poly ratios small for any Ha
 @dataclass
 class VFOSettings:
     frequency:       float     = 100_000_000
+    name:            str       = ''
     demod_mode:      str       = 'NFM'
     bandwidth:       float     = 12_500
     volume:          float     = 1.0
@@ -195,6 +196,13 @@ class VFO:
     def set_squelch_enabled(self, enabled: bool):
         self.settings.squelch_enabled = bool(enabled)
 
+    def set_name(self, name: str):
+        """Set a human-readable name for this VFO."""
+        try:
+            self.settings.name = str(name)
+        except Exception:
+            self.settings.name = ''
+
     def enable(self):
         self.settings.enabled = True
         self.is_running = True
@@ -207,7 +215,7 @@ class VFO:
     # IQ pipeline
     # ------------------------------------------------------------------
 
-    def process_iq(self, iq_data: np.ndarray) -> Tuple[Optional[np.ndarray], list]:
+    def process_iq(self, iq_data: np.ndarray, profiler=None) -> Tuple[Optional[np.ndarray], list]:
         if not self.settings.enabled:
             return None, []
         if not self.audio_enabled:
@@ -255,7 +263,11 @@ class VFO:
             if not dec.is_enabled:
                 continue
             try:
-                result = dec.process(iq_data, audio_resampled)
+                if profiler is not None:
+                    with profiler.measure(f"decoder / {dec.name}"):
+                        result = dec.process(iq_data, audio_resampled)
+                else:
+                    result = dec.process(iq_data, audio_resampled)
                 if result is not None:
                     decoder_results.append(result)
             except Exception as e:
@@ -272,6 +284,7 @@ class VFO:
         iq: np.ndarray,
         nb_sr: float,
         audio_target: int,
+        profiler=None,
     ) -> Tuple[Optional[np.ndarray], list]:
         """
         Process pre-channelized IQ that has already been:
@@ -344,8 +357,12 @@ class VFO:
         decoder_results = []
         for decoder in self.decoders:
             try:
-                # Pass audio and optionally IQ to decoder
-                result = decoder.process(iq, audio=audio)
+                decoder.set_sample_rate(int(self._proc_rate))
+                if profiler is not None:
+                    with profiler.measure(f"decoder / {decoder.name}"):
+                        result = decoder.process(iq, audio=audio)
+                else:
+                    result = decoder.process(iq, audio=audio)
                 if result is not None:
                     decoder_results.append(result)
             except Exception as e:
@@ -463,6 +480,7 @@ class VFO:
     def get_status(self) -> dict:
         return {
             'id':              self.id,
+            'name':            self.settings.name,
             'frequency':       self.settings.frequency,
             'demod_mode':      self.settings.demod_mode,
             'volume':          self.settings.volume,

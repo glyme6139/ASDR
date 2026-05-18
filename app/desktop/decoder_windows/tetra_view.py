@@ -134,6 +134,10 @@ class TETRAWindow(BaseDecoderWindow):
         self._freeze: bool           = False
         self._tick:   int            = 0
 
+        # Received-indicator state
+        self._last_crc_ok_time:  float = 0.0   # last SYNC with CRC OK
+        self._last_sync_time:    float = 0.0   # last SYNC (any CRC outcome)
+
         # dirty flags — set by push_result(), cleared after render
         self._dirty_events:     bool = False
         self._dirty_calls:      bool = False
@@ -147,6 +151,7 @@ class TETRAWindow(BaseDecoderWindow):
         self._sds_rendered: int = -1
 
         self._build_ui()
+        self._refresh_status()   # set LED to grey immediately on open
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._on_tick)
         self._timer.start(_FAST_MS)
@@ -163,10 +168,23 @@ class TETRAWindow(BaseDecoderWindow):
         hdr = QHBoxLayout()
         title = QLabel("TETRA Channel Inspector")
         title.setStyleSheet("font-size:17px; font-weight:700; color:#f5f7fa;")
+
+        # Received indicator: LED dot + text
+        self._rx_led = QLabel()
+        self._rx_led.setFixedSize(14, 14)
+        self._rx_led.setStyleSheet(
+            "border-radius:7px; background:#333; border:1px solid #555;")
+        self._rx_lbl = QLabel("NO SIGNAL")
+        self._rx_lbl.setStyleSheet("color:#666; font-size:11px; font-weight:700;"
+                                   " letter-spacing:1px;")
+
         self._status_lbl = QLabel("Waiting…")
         self._status_lbl.setStyleSheet("color:#9aa0a6; font-weight:600;")
         hdr.addWidget(title)
         hdr.addStretch()
+        hdr.addWidget(self._rx_led)
+        hdr.addWidget(self._rx_lbl)
+        hdr.addSpacing(12)
         hdr.addWidget(self._status_lbl)
         root.addLayout(hdr)
 
@@ -349,6 +367,11 @@ class TETRAWindow(BaseDecoderWindow):
         self._dirty_events  = True
         self._dirty_status  = True
 
+        if ev.get("burst_type") == "SYNC":
+            self._last_sync_time = ev["_ts"]
+            if ev.get("crc_ok"):
+                self._last_crc_ok_time = ev["_ts"]
+
         calls = ev.get("active_calls")
         if isinstance(calls, dict) and calls:
             self._calls.update(calls)
@@ -384,9 +407,8 @@ class TETRAWindow(BaseDecoderWindow):
         self._tick += 1
 
         # Fast path: status bar + cell info cards (every tick)
-        if self._dirty_status:
-            self._refresh_status()
-            self._dirty_status = False
+        self._refresh_status()   # always — LED must decay even with no new data
+        self._dirty_status = False
         self._refresh_cell_fast()
 
         # Slow path: heavy tables (every _SLOW_TICKS ticks)
@@ -566,6 +588,37 @@ class TETRAWindow(BaseDecoderWindow):
         self._ev_rendered = n
 
     def _refresh_status(self):
+        now = time.time()
+        age_ok   = now - self._last_crc_ok_time
+        age_sync = now - self._last_sync_time
+
+        # Received indicator
+        if age_ok < 0.6:
+            # Bright flash immediately after a good decode
+            led_css = "border-radius:7px; background:#00ff88; border:1px solid #00cc66;"
+            rx_css  = "color:#00ff88; font-size:11px; font-weight:700; letter-spacing:1px;"
+            rx_txt  = "RECEIVED"
+        elif age_ok < 2.0:
+            # Steady green — still within lock window
+            led_css = "border-radius:7px; background:#22c970; border:1px solid #1a9a56;"
+            rx_css  = "color:#22c970; font-size:11px; font-weight:700; letter-spacing:1px;"
+            rx_txt  = "RECEIVED"
+        elif age_sync < 2.0:
+            # Seeing sync bursts but CRC failing — on-frequency but not locked
+            led_css = "border-radius:7px; background:#f0a030; border:1px solid #c07820;"
+            rx_css  = "color:#f0a030; font-size:11px; font-weight:700; letter-spacing:1px;"
+            rx_txt  = "SEARCHING"
+        else:
+            led_css = "border-radius:7px; background:#333; border:1px solid #555;"
+            rx_css  = "color:#555; font-size:11px; font-weight:700; letter-spacing:1px;"
+            rx_txt  = "NO SIGNAL"
+
+        self._rx_led.setStyleSheet(led_css)
+        if self._rx_lbl.text() != rx_txt:
+            self._rx_lbl.setText(rx_txt)
+        if self._rx_lbl.styleSheet() != rx_css:
+            self._rx_lbl.setStyleSheet(rx_css)
+
         total = len(self._events)
         if total == 0:
             self._status_lbl.setText("Waiting for TETRA bursts…")
@@ -648,6 +701,8 @@ class TETRAWindow(BaseDecoderWindow):
         self._sds_rendered = -1
         self._dirty_events = self._dirty_calls = True
         self._dirty_neighbours = self._dirty_sds = True
+        self._last_crc_ok_time = 0.0
+        self._last_sync_time   = 0.0
         self._refresh_events()
         self._refresh_calls()
         self._refresh_neighbours()

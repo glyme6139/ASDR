@@ -21,6 +21,8 @@ pg.setConfigOptions(useOpenGL=True, antialias=False)
 import logging
 import time
 
+from .timing import TimingConfig, TimingProfiler, profiler_from_config
+
 logger = logging.getLogger(__name__)
 
 VFO_COLORS = [
@@ -58,9 +60,10 @@ class SpectrumViewer(QObject):
 
     frequency_clicked = Signal(float)   # Hz
 
-    def __init__(self, plot: pg.PlotItem):
+    def __init__(self, plot: pg.PlotItem, profiler: TimingProfiler | None = None):
         super().__init__()
         self._plot = plot
+        self._profiler = profiler
 
         plot.setLabel('left', 'dB')
         plot.showGrid(x=True, y=True, alpha=0.3)
@@ -140,13 +143,23 @@ class SpectrumViewer(QObject):
             self._x_cache   = x
             self._x_cache_n = n
 
-        self.plot_curve.setData(x, spectrum_data)
+        if self._profiler is not None:
+            with self._profiler.measure("visual / spectrum update"):
+                self.plot_curve.setData(x, spectrum_data)
 
-        if self._peak_data is None or len(self._peak_data) != n:
-            self._peak_data = spectrum_data.copy()
+                if self._peak_data is None or len(self._peak_data) != n:
+                    self._peak_data = spectrum_data.copy()
+                else:
+                    np.maximum(self._peak_data, spectrum_data, out=self._peak_data)
+                self.peak_curve.setData(x, self._peak_data)
         else:
-            np.maximum(self._peak_data, spectrum_data, out=self._peak_data)
-        self.peak_curve.setData(x, self._peak_data)
+            self.plot_curve.setData(x, spectrum_data)
+
+            if self._peak_data is None or len(self._peak_data) != n:
+                self._peak_data = spectrum_data.copy()
+            else:
+                np.maximum(self._peak_data, spectrum_data, out=self._peak_data)
+            self.peak_curve.setData(x, self._peak_data)
 
         # Auto Y: fit min/max of current data with a small margin
         lo = float(spectrum_data.min()) - 3.0
@@ -218,6 +231,20 @@ class SpectrumViewer(QObject):
         if bandwidth_hz is not None:
             marker.bandwidth_hz = bandwidth_hz
         self._reposition_marker(marker)
+
+    def set_vfo_label(self, vfo_id: int, label: str):
+        marker = self._vfo_markers.get(vfo_id)
+        if marker is None:
+            return
+        try:
+            # Update the center line label and the floating text item
+            marker.center.setLabel(label)
+        except Exception:
+            pass
+        try:
+            marker.label.setText(label)
+        except Exception:
+            pass
 
     def remove_vfo_marker(self, vfo_id: int):
         marker = self._vfo_markers.pop(vfo_id, None)
@@ -300,10 +327,12 @@ class WaterfallViewer:
     """
 
     def __init__(self, plot: pg.PlotItem,
-                 history_size: int = 300, freq_bins: int = 1024):
+                 history_size: int = 300, freq_bins: int = 1024,
+                 profiler: TimingProfiler | None = None):
         self._plot        = plot
         self.history_size = history_size
         self.freq_bins    = freq_bins
+        self._profiler    = profiler
 
         plot.setLabel('bottom', 'Frequency (MHz)')
         plot.showGrid(x=True, y=False)
@@ -397,6 +426,14 @@ class WaterfallViewer:
             if text:
                 text.setPos(mhz, self.history_size * 0.97)
 
+    def set_vfo_label(self, vfo_id: int, label: str):
+        text = self._wf_labels.get(vfo_id)
+        if text:
+            try:
+                text.setText(label)
+            except Exception:
+                pass
+
     def remove_vfo_marker(self, vfo_id: int):
         line = self._wf_markers.pop(vfo_id, None)
         text = self._wf_labels.pop(vfo_id, None)
@@ -419,22 +456,39 @@ class WaterfallViewer:
             src_x = np.linspace(0, len(col) - 1, self.freq_bins)
             col = np.interp(src_x, np.arange(len(col)), col.astype(np.float32)).astype(np.uint8)
 
-        # In-place ring write — no allocation
-        self._ring[:, self._write_idx] = col
-        self._write_idx = (self._write_idx + 1) % self.history_size
-        self._dirty = True
+        if self._profiler is not None:
+            with self._profiler.measure("visual / waterfall update"):
+                # In-place ring write — no allocation
+                self._ring[:, self._write_idx] = col
+                self._write_idx = (self._write_idx + 1) % self.history_size
+                self._dirty = True
+        else:
+            # In-place ring write — no allocation
+            self._ring[:, self._write_idx] = col
+            self._write_idx = (self._write_idx + 1) % self.history_size
+            self._dirty = True
 
     def render_pending(self):
         """Reorder ring buffer into pre-allocated scratch and send to GPU."""
         if not self._dirty:
             return
-        self._dirty = False
-        idx   = self._write_idx
-        first = self.history_size - idx
-        # In-place reorder: oldest column → left (Y=0), newest → right (Y=top)
-        self._ordered[:, :first] = self._ring[:, idx:]
-        self._ordered[:, first:] = self._ring[:, :idx]
-        self.image_item.setImage(self._ordered, autoLevels=False)
+        if self._profiler is not None:
+            with self._profiler.measure("visual / waterfall render"):
+                self._dirty = False
+                idx   = self._write_idx
+                first = self.history_size - idx
+                # In-place reorder: oldest column → left (Y=0), newest → right (Y=top)
+                self._ordered[:, :first] = self._ring[:, idx:]
+                self._ordered[:, first:] = self._ring[:, :idx]
+                self.image_item.setImage(self._ordered, autoLevels=False)
+        else:
+            self._dirty = False
+            idx   = self._write_idx
+            first = self.history_size - idx
+            # In-place reorder: oldest column → left (Y=0), newest → right (Y=top)
+            self._ordered[:, :first] = self._ring[:, idx:]
+            self._ordered[:, first:] = self._ring[:, :idx]
+            self.image_item.setImage(self._ordered, autoLevels=False)
 
     # ------------------------------------------------------------------
     # Colormap (blue→cyan→green→yellow→red)
@@ -482,8 +536,11 @@ class VisualizationPanel(QWidget):
     The X axes are linked — panning/zooming one tracks the other.
     """
 
-    def __init__(self, parent=None, display_buffers=None):
+    def __init__(self, parent=None, display_buffers=None, timing: TimingConfig | None = None,
+                 report_handler=None):
         super().__init__(parent)
+        self._timing = timing or TimingConfig()
+        self._profiler = profiler_from_config(self._timing, prefix="UI", report_handler=report_handler)
 
         layout = QVBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
@@ -506,8 +563,8 @@ class VisualizationPanel(QWidget):
         # Link X so zoom/pan in one view mirrors the other
         wf_plot.setXLink(spec_plot)
 
-        self.spectrum  = SpectrumViewer(spec_plot)
-        self.waterfall = WaterfallViewer(wf_plot, freq_bins=32768)
+        self.spectrum  = SpectrumViewer(spec_plot, profiler=self._profiler)
+        self.waterfall = WaterfallViewer(wf_plot, freq_bins=32768, profiler=self._profiler)
 
         self._pending_spectrum:  Optional[np.ndarray] = None
         self._pending_waterfall: Optional[np.ndarray] = None
@@ -542,50 +599,51 @@ class VisualizationPanel(QWidget):
         self._shm_last_gen = -1
 
     def _flush_pending(self):
-        t0 = time.monotonic()
+        with self._profiler.measure("visual / frame flush"):
+            t0 = time.monotonic()
 
-        # Fast path: shared memory from DSP subprocess
-        if hasattr(self, '_shm_spec'):
-            gen = self._shm_gen.value
-            if gen != self._shm_last_gen:
-                self._shm_last_gen = gen
-                self.spectrum.update_spectrum(self._shm_spec)
-                self.waterfall.update_waterfall(self._shm_wf)
+            # Fast path: shared memory from DSP subprocess
+            if hasattr(self, '_shm_spec'):
+                gen = self._shm_gen.value
+                if gen != self._shm_last_gen:
+                    self._shm_last_gen = gen
+                    self.spectrum.update_spectrum(self._shm_spec)
+                    self.waterfall.update_waterfall(self._shm_wf)
+                self.waterfall.render_pending()
+                return
+
+            # Legacy path: SharedLatest buffers or direct push
+            if self._display_buffers:
+                try:
+                    sb = self._display_buffers.get('spectrum')
+                    if sb is not None:
+                        latest = sb.get_and_clear()
+                        if latest is not None:
+                            self.spectrum.update_spectrum(latest)
+                            self._pending_spectrum = None
+
+                    wb = self._display_buffers.get('waterfall')
+                    if wb is not None:
+                        latest_w = wb.get_and_clear()
+                        if latest_w is not None:
+                            self.waterfall.update_waterfall(latest_w)
+                            self._pending_waterfall = None
+                except Exception:
+                    pass
+
+            if self._pending_spectrum is not None:
+                self.spectrum.update_spectrum(self._pending_spectrum)
+                self._pending_spectrum = None
+            if self._pending_waterfall is not None:
+                self.waterfall.update_waterfall(self._pending_waterfall)
+                self._pending_waterfall = None
+
+            # Render waterfall ring buffer → GPU (no-op if no new data since last tick)
             self.waterfall.render_pending()
-            return
 
-        # Legacy path: SharedLatest buffers or direct push
-        if self._display_buffers:
-            try:
-                sb = self._display_buffers.get('spectrum')
-                if sb is not None:
-                    latest = sb.get_and_clear()
-                    if latest is not None:
-                        self.spectrum.update_spectrum(latest)
-                        self._pending_spectrum = None
-
-                wb = self._display_buffers.get('waterfall')
-                if wb is not None:
-                    latest_w = wb.get_and_clear()
-                    if latest_w is not None:
-                        self.waterfall.update_waterfall(latest_w)
-                        self._pending_waterfall = None
-            except Exception:
-                pass
-
-        if self._pending_spectrum is not None:
-            self.spectrum.update_spectrum(self._pending_spectrum)
-            self._pending_spectrum = None
-        if self._pending_waterfall is not None:
-            self.waterfall.update_waterfall(self._pending_waterfall)
-            self._pending_waterfall = None
-
-        # Render waterfall ring buffer → GPU (no-op if no new data since last tick)
-        self.waterfall.render_pending()
-
-        dt = (time.monotonic() - t0) * 1000.0
-        if dt > 30.0:
-            logger.warning(f"[Visualization] render slow: {dt:.1f} ms")
+            dt = (time.monotonic() - t0) * 1000.0
+            if dt > 30.0:
+                logger.warning(f"[Visualization] render slow: {dt:.1f} ms")
 
     # ------------------------------------------------------------------
     # Proxy helpers so callers don't need to reach into .spectrum/.waterfall
@@ -604,6 +662,17 @@ class VisualizationPanel(QWidget):
                           bandwidth_hz: Optional[float] = None):
         self.spectrum.update_vfo_marker(vfo_id, freq_hz, bandwidth_hz)
         self.waterfall.update_vfo_marker(vfo_id, freq_hz)
+
+    def set_vfo_label(self, vfo_id: int, label: str):
+        """Update label for a VFO marker on both spectrum and waterfall."""
+        try:
+            self.spectrum.set_vfo_label(vfo_id, label)
+        except Exception:
+            pass
+        try:
+            self.waterfall.set_vfo_label(vfo_id, label)
+        except Exception:
+            pass
 
     def remove_vfo_marker(self, vfo_id: int):
         self.spectrum.remove_vfo_marker(vfo_id)

@@ -236,6 +236,6 @@ class AudioMixer:
                 fill_ms   = ring.fill / AUDIO_RATE * 1000
                 underruns = ring.underruns
                 parts.append(f"VFO{vfo_id}: fill={fill_ms:.0f}ms underruns={underruns}")
-            logger.warning(
-                f"[AudioMixer] callbacks={self._cb_count}  " + ("  ".join(parts) or "(no VFOs)")
-            )
+            # logger.warning(
+            #     f"[AudioMixer] callbacks={self._cb_count}  " + ("  ".join(parts) or "(no VFOs)")
+            # )

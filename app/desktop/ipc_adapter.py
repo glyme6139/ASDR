@@ -10,6 +10,8 @@ import queue
 import logging
 from PySide6.QtCore import QThread, Signal
 
+from .timing import TimingConfig, TimingProfiler, profiler_from_config
+
 logger = logging.getLogger(__name__)
 
 
@@ -21,28 +23,33 @@ class IPCAdapterThread(QThread):
     decoder_data          = Signal(int, str, object) # vfo_id, decoder_name, data-dict
     error_occurred        = Signal(str)
     signal_strength       = Signal(object)          # dict — same reason
+    timing_report         = Signal(object)
 
-    def __init__(self, result_queue, parent=None):
+    def __init__(self, result_queue, parent=None, profiler: TimingProfiler | None = None):
         super().__init__(parent)
         self._queue   = result_queue
         self._running = False
+        self._profiler = profiler or profiler_from_config(TimingConfig(), prefix="UI")
 
     def run(self):
         self._running = True
         while self._running:
             try:
                 msg = self._queue.get(timeout=0.05)
-                t   = msg.get('type')
-                if   t == 'device_status':
-                    self.device_status_changed.emit(msg['data'])
-                elif t == 'decoder_result':
-                    self.decoder_result.emit(msg['vfo_id'], msg['name'], msg['text'])
-                    if msg.get('data'):
-                        self.decoder_data.emit(msg['vfo_id'], msg['name'], msg['data'])
-                elif t == 'error':
-                    self.error_occurred.emit(msg['message'])
-                elif t == 'signal_strength':
-                    self.signal_strength.emit(msg['updates'])
+                with self._profiler.measure("UI / ipc dispatch"):
+                    t   = msg.get('type')
+                    if   t == 'device_status':
+                        self.device_status_changed.emit(msg['data'])
+                    elif t == 'decoder_result':
+                        self.decoder_result.emit(msg['vfo_id'], msg['name'], msg['text'])
+                        if msg.get('data'):
+                            self.decoder_data.emit(msg['vfo_id'], msg['name'], msg['data'])
+                    elif t == 'error':
+                        self.error_occurred.emit(msg['message'])
+                    elif t == 'signal_strength':
+                        self.signal_strength.emit(msg['updates'])
+                    elif t == 'timing_report':
+                        self.timing_report.emit(msg['data'])
             except queue.Empty:
                 pass
             except Exception as e:

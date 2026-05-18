@@ -20,6 +20,8 @@ import time
 import numpy as np
 import logging
 
+from .timing import TimingConfig, TimingProfiler, profiler_from_config
+
 logger = logging.getLogger(__name__)
 
 FFT_SIZE         = 4096
@@ -53,12 +55,13 @@ class DSPWorker:
     DEMO_TICK        = 0.05
 
     def __init__(self, cmd_q, result_q, spec_arr: np.ndarray,
-                 wf_arr: np.ndarray, disp_gen):
+                 wf_arr: np.ndarray, disp_gen, profiler: TimingProfiler | None = None):
         self._cmd_q    = cmd_q
         self._result_q = result_q
         self._spec_arr = spec_arr   # shared memory float32 view
         self._wf_arr   = wf_arr     # shared memory uint8 view
         self._disp_gen = disp_gen   # mp.Value('L', 0)
+        self._profiler = profiler or profiler_from_config(TimingConfig())
 
         from app.sdr.vfo import VFOManager
         from app.desktop.audio_output import AudioMixer, AUDIO_RATE, CHUNK
@@ -238,6 +241,8 @@ class DSPWorker:
             self.audio_mixer.set_volume(msg['vfo_id'], msg['volume'])
         elif cmd == 'toggle_decoder':
             self._do_toggle_decoder(msg['vfo_id'], msg['decoder_name'], msg['enabled'])
+        elif cmd == 'set_timing_sample_count':
+            self._profiler.set_sample_count(msg['n'])
 
     # ------------------------------------------------------------------
     # Hardware commands
@@ -313,6 +318,9 @@ class DSPWorker:
             elif name == 'TETRA':
                 from app.decoders.tetra import TETRADecoder
                 return TETRADecoder()
+            elif name == 'ACARS':
+                from app.decoders.acars import ACARSDecoder
+                return ACARSDecoder()
             else:
                 from app.decoders.modulation import create_modulation_decoder
                 return create_modulation_decoder(name)
@@ -328,127 +336,133 @@ class DSPWorker:
         if not self.running:
             return
         try:
-            # Fill rolling display buffer (circular)
-            n = len(iq_data)
-            w = self._disp_write
-            if n >= DISPLAY_FFT_SIZE:
-                self._disp_buf[:] = iq_data[-DISPLAY_FFT_SIZE:]
-                self._disp_write  = 0
-            else:
-                end = w + n
-                if end <= DISPLAY_FFT_SIZE:
-                    self._disp_buf[w:end] = iq_data
+            with self._profiler.measure("DSP / iq callback total"):
+                # Fill rolling display buffer (circular)
+                n = len(iq_data)
+                w = self._disp_write
+                if n >= DISPLAY_FFT_SIZE:
+                    self._disp_buf[:] = iq_data[-DISPLAY_FFT_SIZE:]
+                    self._disp_write  = 0
                 else:
-                    first = DISPLAY_FFT_SIZE - w
-                    self._disp_buf[w:]          = iq_data[:first]
-                    self._disp_buf[:n - first]  = iq_data[first:]
-                self._disp_write = end % DISPLAY_FFT_SIZE
+                    end = w + n
+                    if end <= DISPLAY_FFT_SIZE:
+                        self._disp_buf[w:end] = iq_data
+                    else:
+                        first = DISPLAY_FFT_SIZE - w
+                        self._disp_buf[w:]          = iq_data[:first]
+                        self._disp_buf[:n - first]  = iq_data[first:]
+                    self._disp_write = end % DISPLAY_FFT_SIZE
 
-            # Audio FFT accumulation
-            pos = 0
-            while pos < len(iq_data):
-                space   = FFT_SIZE - self._buf_idx
-                to_copy = min(len(iq_data) - pos, space)
-                self._iq_buf[self._buf_idx:self._buf_idx + to_copy] = iq_data[pos:pos + to_copy]
-                self._buf_idx += to_copy
-                pos           += to_copy
-                if self._buf_idx >= FFT_SIZE:
-                    self._process_block(self._iq_buf)
-                    self._buf_idx = 0
+                # Audio FFT accumulation
+                pos = 0
+                while pos < len(iq_data):
+                    space   = FFT_SIZE - self._buf_idx
+                    to_copy = min(len(iq_data) - pos, space)
+                    self._iq_buf[self._buf_idx:self._buf_idx + to_copy] = iq_data[pos:pos + to_copy]
+                    self._buf_idx += to_copy
+                    pos           += to_copy
+                    if self._buf_idx >= FFT_SIZE:
+                        self._process_block(self._iq_buf)
+                        self._buf_idx = 0
         except Exception as e:
             logger.error(f"IQ processing error: {e}")
 
     def _process_block(self, block: np.ndarray):
-        sr     = self._sample_rate
-        N      = FFT_SIZE
-        bin_hz = sr / N
+        with self._profiler.measure("DSP / block total"):
+            sr     = self._sample_rate
+            N      = FFT_SIZE
+            bin_hz = sr / N
 
-        fft_out = np.fft.fftshift(np.fft.fft(block))
+            with self._profiler.measure("DSP / block fft"):
+                fft_out = np.fft.fftshift(np.fft.fft(block))
 
-        # High-res display FFT (rate-limited)
-        self._display_tick += 1
-        if self._display_tick >= self._display_skip:
-            self._display_tick = 0
-            w = self._disp_write
-            if w == 0:
-                ordered = self._disp_buf.copy()
-            else:
-                ordered = np.empty(DISPLAY_FFT_SIZE, dtype=np.complex64)
-                ordered[:DISPLAY_FFT_SIZE - w] = self._disp_buf[w:]
-                ordered[DISPLAY_FFT_SIZE - w:] = self._disp_buf[:w]
+            # High-res display FFT (rate-limited)
+            self._display_tick += 1
+            if self._display_tick >= self._display_skip:
+                with self._profiler.measure("DSP / display fft"):
+                    self._display_tick = 0
+                    w = self._disp_write
+                    if w == 0:
+                        ordered = self._disp_buf.copy()
+                    else:
+                        ordered = np.empty(DISPLAY_FFT_SIZE, dtype=np.complex64)
+                        ordered[:DISPLAY_FFT_SIZE - w] = self._disp_buf[w:]
+                        ordered[DISPLAY_FFT_SIZE - w:] = self._disp_buf[:w]
 
-            fft_disp = np.fft.fftshift(np.fft.fft(ordered * self._disp_window))
-            spectrum = (10.0 * np.log10(np.abs(fft_disp) ** 2 + 1e-10)).astype(np.float32)
+                    fft_disp = np.fft.fftshift(np.fft.fft(ordered * self._disp_window))
+                    spectrum = (10.0 * np.log10(np.abs(fft_disp) ** 2 + 1e-10)).astype(np.float32)
 
-            np.copyto(self._spec_arr, spectrum)
-            np.copyto(self._wf_arr,   self._make_waterfall_row(spectrum))
-            self._disp_gen.value += 1
+                    np.copyto(self._spec_arr, spectrum)
+                    np.copyto(self._wf_arr,   self._make_waterfall_row(spectrum))
+                    self._disp_gen.value += 1
 
-        # Per-VFO audio channelization
-        center_freq = self.vfo_manager.center_freq
-        for vfo in self.vfo_manager.get_all_vfos():
-            iq_nb, nb_sr = self._extract_vfo_iq(fft_out, vfo, sr, N, bin_hz, center_freq)
-            if iq_nb is None:
-                continue
+            # Per-VFO audio channelization
+            center_freq = self.vfo_manager.center_freq
+            for vfo in self.vfo_manager.get_all_vfos():
+                with self._profiler.measure(f"DSP / VFO {vfo.id} channelize"):
+                    iq_nb, nb_sr = self._extract_vfo_iq(fft_out, vfo, sr, N, bin_hz, center_freq)
+                    if iq_nb is None:
+                        continue
 
-            vfo_id = vfo.id
-            if vfo_id in self._vfo_iq_nb_sr and abs(self._vfo_iq_nb_sr[vfo_id] - nb_sr) > 1.0:
-                self._vfo_iq_accum[vfo_id] = []
-            self._vfo_iq_nb_sr[vfo_id] = nb_sr
+                    vfo_id = vfo.id
+                    if vfo_id in self._vfo_iq_nb_sr and abs(self._vfo_iq_nb_sr[vfo_id] - nb_sr) > 1.0:
+                        self._vfo_iq_accum[vfo_id] = []
+                    self._vfo_iq_nb_sr[vfo_id] = nb_sr
 
-            self._vfo_iq_accum.setdefault(vfo_id, []).append(iq_nb)
+                    self._vfo_iq_accum.setdefault(vfo_id, []).append(iq_nb)
 
-            iq_needed = max(1, int(nb_sr * _CHUNK / _AUDIO_RATE))
-            total_iq  = sum(len(x) for x in self._vfo_iq_accum[vfo_id])
-            if total_iq < iq_needed:
-                continue
+                    iq_needed = max(1, int(nb_sr * _CHUNK / _AUDIO_RATE))
+                    total_iq  = sum(len(x) for x in self._vfo_iq_accum[vfo_id])
+                    if total_iq < iq_needed:
+                        continue
 
-            buf   = np.concatenate(self._vfo_iq_accum[vfo_id])
-            total = len(buf)
-            pos   = 0
-            while pos + iq_needed <= total:
-                audio, dec_results = vfo.process_narrowband_iq(
-                    buf[pos:pos + iq_needed], nb_sr, _CHUNK
-                )
+                    buf   = np.concatenate(self._vfo_iq_accum[vfo_id])
+                    total = len(buf)
+                    pos   = 0
+                    while pos + iq_needed <= total:
+                        with self._profiler.measure(f"DSP / VFO {vfo_id} process"):
+                            audio, dec_results = vfo.process_narrowband_iq(
+                                buf[pos:pos + iq_needed], nb_sr, _CHUNK, profiler=self._profiler
+                            )
 
-                # Check whether any decoder produced PCM audio (e.g. TETRA voice).
-                # If so, use it instead of the VFO's FM-demodulated audio.
-                tetra_pcm = None
-                for result in dec_results:
-                    if result.decoder_name == 'TETRA' and isinstance(result.data, dict):
-                        pcm = result.data.pop('pcm', None)   # remove before IPC
-                        if pcm is not None and len(pcm) > 0:
-                            tetra_pcm = pcm
+                        # Check whether any decoder produced PCM audio (e.g. TETRA voice).
+                        # If so, use it instead of the VFO's FM-demodulated audio.
+                        tetra_pcm = None
+                        for result in dec_results:
+                            if result.decoder_name == 'TETRA' and isinstance(result.data, dict):
+                                pcm = result.data.pop('pcm', None)   # remove before IPC
+                                if pcm is not None and len(pcm) > 0:
+                                    tetra_pcm = pcm
 
-                if tetra_pcm is not None:
-                    self.audio_mixer.push_audio(vfo_id, _resample_8k_to_48k(tetra_pcm))
-                elif audio is not None and len(audio) > 0:
-                    self.audio_mixer.push_audio(vfo_id, audio)
+                        if tetra_pcm is not None:
+                            self.audio_mixer.push_audio(vfo_id, _resample_8k_to_48k(tetra_pcm))
+                        elif audio is not None and len(audio) > 0:
+                            self.audio_mixer.push_audio(vfo_id, audio)
 
-                for result in dec_results:
-                    formatted = str(result.data)
-                    for dec in vfo.decoders:
-                        if dec.name == result.decoder_name:
-                            try:
-                                formatted = dec.format_result(result)
-                            except Exception:
-                                pass
-                            break
-                    raw_data = result.data if isinstance(result.data, dict) else {}
-                    self._emit({'type': 'decoder_result', 'vfo_id': vfo_id,
-                                'name': result.decoder_name, 'text': formatted,
-                                'data': raw_data})
-                pos += iq_needed
-            self._vfo_iq_accum[vfo_id] = [buf[pos:]] if pos < total else []
+                        for result in dec_results:
+                            formatted = str(result.data)
+                            for dec in vfo.decoders:
+                                if dec.name == result.decoder_name:
+                                    try:
+                                        formatted = dec.format_result(result)
+                                    except Exception:
+                                        pass
+                                    break
+                            raw_data = result.data if isinstance(result.data, dict) else {}
+                            self._emit({'type': 'decoder_result', 'vfo_id': vfo_id,
+                                        'name': result.decoder_name, 'text': formatted,
+                                        'data': raw_data})
+                        pos += iq_needed
+                    self._vfo_iq_accum[vfo_id] = [buf[pos:]] if pos < total else []
 
-        # Signal strength (throttled to ~150 ms)
-        now = time.monotonic()
-        if now - self._last_sig_t >= 0.15:
-            self._last_sig_t = now
-            updates = {vfo.id: (vfo.signal_db, vfo.is_active)
-                       for vfo in self.vfo_manager.get_all_vfos()}
-            if updates:
-                self._emit({'type': 'signal_strength', 'updates': updates})
+            # Signal strength (throttled to ~150 ms)
+            now = time.monotonic()
+            if now - self._last_sig_t >= 0.15:
+                self._last_sig_t = now
+                updates = {vfo.id: (vfo.signal_db, vfo.is_active)
+                           for vfo in self.vfo_manager.get_all_vfos()}
+                if updates:
+                    self._emit({'type': 'signal_strength', 'updates': updates})
 
     def _extract_vfo_iq(self, fft_shifted, vfo, sr, N, bin_hz, center_freq):
         if not vfo.settings.enabled:

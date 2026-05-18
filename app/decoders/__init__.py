@@ -20,6 +20,7 @@ from .rds import RDSDecoder
 from .ais import AISDecoder
 from .adsb import ADSBDecoder
 from .tetra import TETRADecoder  # now a package: app/decoders/tetra/
+from .acars import ACARSDecoder
 
 __all__ = [
     'BaseDecoder',
@@ -33,8 +34,7 @@ __all__ = [
     'create_modulation_decoder',
     'POCSAGDecoder',
     'POCSAGIQDecoder',
-    'RDSDecoder',
-    'AISDecoder',
     'ADSBDecoder',
     'TETRADecoder',
+    'ACARSDecoder',
 ]

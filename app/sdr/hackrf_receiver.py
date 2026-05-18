@@ -75,14 +75,15 @@ class HackRFReceiver:
                 # Configure device
                 logger.info("Configuring HackRF device...")
 
-                # # Set baseband filter bandwidth
-                # try:
-                #     baseband_bw = pyhackrf.pyhackrf_compute_baseband_filter_bw_round_down_lt(self.config.sample_rate)
-                #     logger.info(f"Setting baseband filter bandwidth to {baseband_bw} Hz...")
-                #     self.device.pyhackrf_set_baseband_filter_bandwidth(int(baseband_bw))
-                #     logger.info("Baseband filter bandwidth set successfully")
-                # except Exception as e:
-                #     logger.warning(f"Could not set baseband filter bandwidth: {e}")
+                # Set baseband filter bandwidth to match sample rate (reduces aliased noise)
+                try:
+                    baseband_bw = pyhackrf.pyhackrf_compute_baseband_filter_bw_round_down_lt(
+                        int(self.config.sample_rate))
+                    logger.info(f"Setting baseband filter bandwidth to {baseband_bw} Hz...")
+                    self.device.pyhackrf_set_baseband_filter_bandwidth(int(baseband_bw))
+                    logger.info("Baseband filter bandwidth set successfully")
+                except Exception as e:
+                    logger.warning(f"Could not set baseband filter bandwidth: {e}")
                 
                 logger.info(f"Setting sample rate to {self.config.sample_rate} Hz...")
                 self.device.pyhackrf_set_sample_rate(int(self.config.sample_rate))

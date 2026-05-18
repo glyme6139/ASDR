@@ -3,7 +3,7 @@
     "center_freq": 428500000.0,
     "sample_rate": 1000000,
     "lna": 40,
-    "vga": 30,
+    "vga": 46,
     "amp_enabled": true,
     "autosave": true
   },
@@ -12,7 +12,7 @@
       "name": "TETRA 1",
       "frequency": 428662056.0,
       "demod_mode": "IQ",
-      "bandwidth": 100000.0,
+      "bandwidth": 25000.0,
       "volume": 0.0,
       "squelch_level": -120.0,
       "squelch_enabled": true,

@@ -22,6 +22,8 @@ from .visualizations import VisualizationPanel, VFO_COLORS
 from .control_panels import ControlPanel
 from .dsp_process import DSPProcess
 from .ipc_adapter import IPCAdapterThread
+from .timing import TimingConfig, profiler_from_config
+from .timing_window import TimingWindow
 
 logger = logging.getLogger(__name__)
 
@@ -32,8 +34,15 @@ DEFAULT_SAMPLE_RATE = 20e6
 class ASURMainWindow(QMainWindow):
     """Main application window."""
 
-    def __init__(self):
+    def __init__(self, timing: TimingConfig | None = None):
         super().__init__()
+        self._timing = timing or TimingConfig()
+        self._profiler = profiler_from_config(
+            self._timing,
+            logger=logger,
+            prefix="UI",
+            report_handler=self._handle_timing_report,
+        )
         self.setWindowTitle("Advanced SDR (ASDR)")
         self.setGeometry(100, 100, 1400, 900)
 
@@ -45,8 +54,10 @@ class ASURMainWindow(QMainWindow):
         self._center_hz   = DEFAULT_CENTER_HZ
         self._sample_rate = DEFAULT_SAMPLE_RATE
 
-        self.dsp = DSPProcess()
-        self.ipc = IPCAdapterThread(self.dsp.result_queue)
+        self.timing_window = TimingWindow()
+
+        self.dsp = DSPProcess(timing=self._timing)
+        self.ipc = IPCAdapterThread(self.dsp.result_queue, profiler=self._profiler)
 
         self._initUI()
         self._connect_signals()
@@ -106,7 +117,10 @@ class ASURMainWindow(QMainWindow):
         top_layout.setContentsMargins(4, 4, 4, 4)
         top_layout.setSpacing(4)
 
-        self.vis_panel = VisualizationPanel()
+        self.vis_panel = VisualizationPanel(
+            timing=self._timing,
+            report_handler=self._handle_timing_report,
+        )
         top_layout.addWidget(self.vis_panel, stretch=2)
 
         self.ctrl_panel = ControlPanel()
@@ -151,6 +165,14 @@ class ASURMainWindow(QMainWindow):
             # default checked; will be set from loaded session if present
             self._autosave_action.setChecked(True)
             session_menu.addAction(self._autosave_action)
+        except Exception:
+            pass
+
+        try:
+            menubar = self.menuBar()
+            view_menu = menubar.addMenu("View")
+            self._timing_action = view_menu.addAction("Performance Timing")
+            self._timing_action.triggered.connect(self._show_timing_window)
         except Exception:
             pass
 
@@ -204,6 +226,7 @@ class ASURMainWindow(QMainWindow):
         self.ipc.decoder_result.connect(self._on_decoder_result, Q)
         self.ipc.decoder_data.connect(self._on_decoder_data, Q)
         self.ipc.signal_strength.connect(self._on_signal_strength, Q)
+        self.ipc.timing_report.connect(self._handle_timing_report, Q)
 
         # ---- VFO tab lifecycle ----
         self.ctrl_panel.vfo_tab.vfo_added.connect(self._on_vfo_added)
@@ -211,6 +234,11 @@ class ASURMainWindow(QMainWindow):
         self.ctrl_panel.vfo_tab.active_vfo_changed.connect(
             self.vis_panel.set_active_vfo_marker
         )
+        # VFO rename → update visualization labels
+        try:
+            self.ctrl_panel.vfo_tab.vfo_renamed.connect(self._on_vfo_renamed)
+        except Exception:
+            pass
 
         # ---- VFO settings → DSP ----
         self.ctrl_panel.vfo_tab.frequency_changed.connect(self._on_vfo_frequency_changed)
@@ -252,6 +280,8 @@ class ASURMainWindow(QMainWindow):
         # ---- Spectrum click → tune active VFO ----
         self.vis_panel.spectrum.frequency_clicked.connect(self._on_spectrum_clicked)
 
+        self.timing_window.sample_count_changed.connect(self._on_timing_sample_count_changed)
+
     # ------------------------------------------------------------------
     # VFO lifecycle
     # ------------------------------------------------------------------
@@ -262,8 +292,10 @@ class ASURMainWindow(QMainWindow):
         color = VFO_COLORS[vfo_id % len(VFO_COLORS)]
 
         self._vfo_state[vfo_id] = {'freq_hz': freq, 'bandwidth_hz': bw}
+        label = f"VFO {vfo_id + 1}"
+        self._vfo_state[vfo_id]['name'] = label
         self.vis_panel.add_vfo_marker(
-            vfo_id, freq_hz=freq, bandwidth_hz=bw, color=color, label=f"VFO {vfo_id + 1}"
+            vfo_id, freq_hz=freq, bandwidth_hz=bw, color=color, label=label
         )
         self.ctrl_panel.vfo_tab.set_vfo_color(vfo_id, color)
         self.dsp.add_vfo(vfo_id, freq)
@@ -296,6 +328,16 @@ class ASURMainWindow(QMainWindow):
             self._vfo_state[vfo_id]['bandwidth_hz'] = bandwidth_hz
             freq_hz = self._vfo_state[vfo_id]['freq_hz']
             self.vis_panel.update_vfo_marker(vfo_id, freq_hz, bandwidth_hz)
+
+    def _on_vfo_renamed(self, vfo_id: int, name: str):
+        """Handle user-initiated VFO rename: update visual labels and state."""
+        try:
+            if vfo_id in self._vfo_state:
+                self._vfo_state[vfo_id]['name'] = name
+            # Update visualization labels
+            self.vis_panel.set_vfo_label(vfo_id, name)
+        except Exception:
+            pass
 
     def _on_spectrum_clicked(self, freq_hz: float):
         active_id = self.ctrl_panel.vfo_tab.active_vfo_id()
@@ -376,45 +418,63 @@ class ASURMainWindow(QMainWindow):
         win.activateWindow()
 
     def _on_decoder_result(self, vfo_id: int, decoder_name: str, text: str):
-        self.ctrl_panel.vfo_tab.add_decoder_output(vfo_id, decoder_name, text)
-        try:
-            if self.decoder_panel is not None:
-                vfo_color = VFO_COLORS[vfo_id % len(VFO_COLORS)]
-                self.decoder_panel.append(vfo_id, decoder_name, text, vfo_color)
-        except Exception:
-            logger.exception("Failed to append to global decoder panel")
+        with self._profiler.measure("UI / decoder result"):
+            self.ctrl_panel.vfo_tab.add_decoder_output(vfo_id, decoder_name, text)
+            try:
+                if self.decoder_panel is not None:
+                    vfo_color = VFO_COLORS[vfo_id % len(VFO_COLORS)]
+                    self.decoder_panel.append(vfo_id, decoder_name, text, vfo_color)
+            except Exception:
+                logger.exception("Failed to append to global decoder panel")
 
     # ------------------------------------------------------------------
     # Device status
     # ------------------------------------------------------------------
 
     def _on_device_status(self, status: dict):
-        if 'connected' in status:
-            self.ctrl_panel.device_panel.set_connected(status['connected'])
+        with self._profiler.measure("UI / device status"):
+            if 'connected' in status:
+                self.ctrl_panel.device_panel.set_connected(status['connected'])
 
-        connected = status.get('connected', True)
-        center    = status.get('frequency', self._center_hz)
-        sr        = status.get('sample_rate', self._sample_rate)
+            connected = status.get('connected', True)
+            center    = status.get('frequency', self._center_hz)
+            sr        = status.get('sample_rate', self._sample_rate)
 
-        if 'frequency' in status:
-            self._center_hz = center
-        if 'sample_rate' in status:
-            self._sample_rate = sr
+            if 'frequency' in status:
+                self._center_hz = center
+            if 'sample_rate' in status:
+                self._sample_rate = sr
 
-        if connected:
-            self.status_label.setText(
-                f"Connected | {center/1e6:.3f} MHz | {sr/1e6:.1f} MHz SR"
-            )
-        else:
-            self.status_label.setText("Disconnected")
+            if connected:
+                self.status_label.setText(
+                    f"Connected | {center/1e6:.3f} MHz | {sr/1e6:.1f} MHz SR"
+                )
+            else:
+                self.status_label.setText("Disconnected")
 
-        if 'frequency' in status or 'sample_rate' in status:
-            self.vis_panel.set_freq_range(center, sr)
-            self._check_vfo_ranges()
+            if 'frequency' in status or 'sample_rate' in status:
+                self.vis_panel.set_freq_range(center, sr)
+                self._check_vfo_ranges()
 
     def _on_error(self, error_msg: str):
         logger.error(f"DSP Error: {error_msg}")
         self.status_label.setText(f"Error: {error_msg}")
+
+    def _on_timing_sample_count_changed(self, n: int):
+        self._profiler.set_sample_count(n)
+        self.vis_panel._profiler.set_sample_count(n)
+        self.dsp.set_timing_sample_count(n)
+
+    def _handle_timing_report(self, report: dict):
+        try:
+            self.timing_window.report_received.emit(report)
+        except Exception:
+            pass
+
+    def _show_timing_window(self):
+        self.timing_window.show()
+        self.timing_window.raise_()
+        self.timing_window.activateWindow()
 
     # ------------------------------------------------------------------
     # Shutdown

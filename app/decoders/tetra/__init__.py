@@ -33,10 +33,10 @@ logger = logging.getLogger(__name__)
 
 # ── Physical constants ────────────────────────────────────────────────────────
 
-_SYMBOL_RATE      = 18_000
-_MIN_SAMPLE_RATE  = 36_000
-_AUDIO_RATE       = 48_000
-_CHUNK            = 2_048
+_SYMBOL_RATE     = 18_000
+_MIN_SAMPLE_RATE = 36_000
+_TETRA_BW        = 25_000   # TETRA channel bandwidth in Hz
+_TAIL_LEN        = 24    # IQ samples kept between chunks (~2 symbol periods)
 
 # NDB burst field layout (chips = dibits = 2 bits each after DQPSK)
 # ETSI EN 300 392-2 Table 9.33
@@ -46,20 +46,14 @@ _NDB_SW_OFF = 218; _NDB_SW_LEN = 38
 _NDB_BB_OFF = 256; _NDB_BB_LEN = 14
 _NDB_B2_S   = 270; _NDB_B2_E   = 486   # 216 bits
 
-# SB burst block offsets
-_SB_BLK1_S  = 14;  _SB_BLK1_E  = 134   # 120 bits
-_SB_BBK_OFF = 252; _SB_BBK_LEN = 30
-_SB_BLK2_S  = 282; _SB_BLK2_E  = 498   # 216 bits
+# SB burst field offsets (from actual burst start — ETSI EN 300 392-2 Table 9.34)
+# tail(2)+SB1(120)+SW(38)+BBK(30)+SB2(216)+tail(2)+FS2(102)=510
+_SB_BLK1_S  = 2;   _SB_BLK1_E  = 122   # 120 bits — BSCH content
+_SB_BBK_OFF = 160; _SB_BBK_LEN = 30    # 30 bits — AACH broadcast block
+_SB_BLK2_S  = 190; _SB_BLK2_E  = 406  # 216 bits — BNCH/SYSINFO
 
-_TRAIN_MAX_ERRORS = 5
-
-# Synchronisation word (38 chips)
-_SW_BITS = np.array([
-    1,1,0,0,1,0,0,1, 0,1,0,1,1,1,1,0,
-    1,0,0,1,0,0,0,1, 0,0,0,0,0,1,0,0,
-    1,1,1,1,1,1,
-], dtype=np.float32)
-_SW_BIPOLAR = 2.0 * _SW_BITS - 1.0
+_SYNC_MAX_ERRORS = 3   # Y-word is 38 bits — at good SNR expect ≤2 errors
+_NDB_MAX_ERRORS  = 3   # NDB training is 22 bits — stricter threshold
 
 # Training sequences (22 chips each)
 _N_BITS = np.array([1,1,0,1, 0,0,0,0, 1,1,1,0, 1,0,0,1, 1,1,0,1, 0,0], dtype=np.int8)
@@ -67,17 +61,22 @@ _P_BITS = np.array([0,1,1,1, 1,0,1,0, 0,1,0,0, 0,0,1,1, 0,1,1,1, 1,0], dtype=np.
 _Q_BITS = np.array([1,0,1,1, 0,1,1,1, 0,0,0,0, 0,1,1,0, 1,0,1,1, 0,1], dtype=np.int8)
 _X_BITS = np.array([1,0,0,1, 1,1,0,1, 0,0,0,0, 1,1,1,0, 1,0,0,1, 1,1,
                     0,1,0,0, 0,0,1,1], dtype=np.int8)
-_Y_BITS = np.array([1,1,0,0, 0,0,0,1, 1,0,0,1, 1,1,0,0, 1,1,1,0,
-                    1,0,0,1, 1,1,0,0, 0,0,0,1, 1,0,0,1, 1,1,0,0], dtype=np.int8)
-_SYNC_TRAIN_OFF = 214
+# ETSI EN 300 392-2 Table 9.31 — 38-chip synchronisation word (SW)
+_Y_BITS = np.array([1,1,0,1,0,1,1,1, 1,0,1,0,0,0,1,0,
+                    0,0,1,0,1,0,1,1, 1,0,1,1,0,0,1,1,
+                    0,0,0,0,0,1], dtype=np.int8)
+_SYNC_TRAIN_OFF = 122   # SW at offset 122 from actual SB burst start
 _NDB_TRAIN_OFF  = 244
 
-_PI4_MAP = (
-    ( np.pi / 4,     0, 0),
-    ( 3*np.pi / 4,   0, 1),
-    (-3*np.pi / 4,   1, 1),
-    (-np.pi / 4,     1, 0),
-)
+# Expected differential phase for each of the 19 SW symbols.
+# Derived from the 19 dibits of _Y_BITS using TETRA π/4-DQPSK mapping:
+#   (0,0)→+π/4  (0,1)→+3π/4  (1,0)→-π/4  (1,1)→-3π/4
+_Y_EXPECTED_PHASES = np.array([
+    -3*np.pi/4, 3*np.pi/4, 3*np.pi/4, -3*np.pi/4, -np.pi/4, -np.pi/4,
+    np.pi/4, -np.pi/4, np.pi/4, -np.pi/4, -np.pi/4, -3*np.pi/4,
+    -np.pi/4, -3*np.pi/4, np.pi/4, -3*np.pi/4, np.pi/4, np.pi/4, 3*np.pi/4,
+], dtype=np.float32)
+
 
 # ACELP bit reordering tables (osmo-tetra tch_reordering.c, 0-indexed)
 _CLASS0 = np.array([
@@ -104,6 +103,12 @@ _N0, _N1, _N2 = len(_CLASS0), len(_CLASS1), len(_CLASS2)  # 51, 56, 30
 _ACELP_BITS   = _N0 + _N1 + _N2                            # 137
 
 
+def _afc_estimate(y_phases: np.ndarray) -> float:
+    """Circular mean of (measured − expected) for the 19 Y sync symbols → per-symbol phase bias."""
+    diffs = np.angle(np.exp(1j * (y_phases.astype(np.float64) - _Y_EXPECTED_PHASES.astype(np.float64))))
+    return float(np.angle(np.mean(np.exp(1j * diffs))))
+
+
 class TETRADecoder(BaseDecoder):
     """
     Full-stack TETRA π/4-DQPSK decoder.
@@ -118,6 +123,7 @@ class TETRADecoder(BaseDecoder):
     def __init__(self):
         super().__init__('TETRA', sample_rate=_MIN_SAMPLE_RATE)
         self._bits:     np.ndarray = np.zeros(0, dtype=np.int8)
+        self._phases:   np.ndarray = np.zeros(0, dtype=np.float32)
         self._tail:     Optional[np.ndarray] = None
         self._tail_sps: int = 4
         self._burst_n:  int = 0
@@ -130,6 +136,8 @@ class TETRADecoder(BaseDecoder):
         self._neighbours: list = []  # NeighbourCell list
 
         self._scramble_seed: int = BSCH_SEED
+        self._net_synced:    bool = False
+        self._soft_last_log: float = 0.0
 
     # ── BaseDecoder ──────────────────────────────────────────────────────────
 
@@ -139,30 +147,34 @@ class TETRADecoder(BaseDecoder):
         if not np.iscomplexobj(data):
             return None
 
-        nb_sr = len(data) * _AUDIO_RATE / _CHUNK
-        sps   = max(1, int(nb_sr / _SYMBOL_RATE))
-        if nb_sr < _MIN_SAMPLE_RATE:
-            return None
+        sr = float(max(self.sample_rate, _MIN_SAMPLE_RATE))
 
-        if self._tail is not None and self._tail_sps == sps:
+        # Narrow to TETRA channel bandwidth: 200 kHz → 25 kHz cuts 9 dB of excess noise
+        data, sr = _narrowband_filter(data, sr)
+
+        if self._tail is not None:
             iq = np.concatenate([self._tail, data])
         else:
             iq = data
-        self._tail     = data[-sps:].copy()
-        self._tail_sps = sps
+        self._tail = iq[-_TAIL_LEN:].copy()
 
-        new_bits = _demodulate(iq, sps)
-        if new_bits is None or len(new_bits) == 0:
+        result = _demodulate(iq, sr)
+        if result is None:
+            return None
+        new_bits, new_phases = result
+        if len(new_bits) == 0:
             return None
 
-        self._bits = np.concatenate([self._bits, new_bits])
+        self._bits   = np.concatenate([self._bits,   new_bits])
+        self._phases = np.concatenate([self._phases, new_phases])
         self._drain()
 
         return self._pending.popleft() if self._pending else None
 
     def reset(self):
-        self._bits  = np.zeros(0, dtype=np.int8)
-        self._tail  = None
+        self._bits   = np.zeros(0, dtype=np.int8)
+        self._phases = np.zeros(0, dtype=np.float32)
+        self._tail   = None
         self._burst_n = 0
         self._pending.clear()
         self._net   = NetworkTime()
@@ -170,6 +182,7 @@ class TETRADecoder(BaseDecoder):
         self._sds   = []
         self._neighbours = []
         self._scramble_seed = BSCH_SEED
+        self._net_synced    = False
 
     def format_result(self, result: DecoderResult) -> str:
         d = result.data if isinstance(result.data, dict) else {}
@@ -202,29 +215,139 @@ class TETRADecoder(BaseDecoder):
 
     def _drain(self):
         buf = self._bits
+        pha = self._phases
         min_lookahead = max(len(_Y_BITS) + _SYNC_TRAIN_OFF,
                             len(_N_BITS) + _NDB_TRAIN_OFF)
         while len(buf) >= _NDB_CHIPS:
-            hit = _find_burst(buf)
+
+            # Cap buffer to keep soft-correlator matrix multiply O(1) in time.
+            if len(pha) > _MAX_PHASE_BUF:
+                trim = len(pha) - _MAX_PHASE_BUF
+                pha = pha[trim:]
+                buf = buf[trim * 2:]
+
+            # ── Primary: soft phase-domain SYNC correlator ──────────────────
+            # Scans ±18 kHz residual carrier grid — covers the full range of
+            # 4th-power estimation error (±sr/8 ≈ ±9.3 kHz after 3× upsample).
+            soft_result = _find_burst_soft(pha)
+            if soft_result is not None:
+                start_bit, residual_df, soft_score = soft_result
+            else:
+                soft_score = 0.0
+            above_thresh = soft_result is not None and soft_score >= _SOFT_THRESHOLD
+
+            if above_thresh:
+                soft = soft_result
+            else:
+                # Rate-limited diagnostic: show best score every 2 s
+                now = time.time()
+                if now - self._soft_last_log > 2.0:
+                    logger.info(
+                        "TETRA soft miss: best score=%.1f/19 df=%.0f Hz buf=%d sym",
+                        soft_score,
+                        residual_df if soft_result else 0.0,
+                        len(pha),
+                    )
+                    self._soft_last_log = now
+                soft = None
+
+            if soft is not None:
+                start_bit, residual_df, soft_score = soft
+                end = start_bit + _NDB_CHIPS
+                if end > len(buf):
+                    buf = buf[start_bit:]
+                    pha = pha[start_bit // 2:]
+                    break
+
+                # Re-derive bits from phases corrected for the found df
+                ps = start_bit // 2
+                pe = ps + _NDB_CHIPS // 2
+                if pe <= len(pha):
+                    # Apply residual-df ramp correction then re-decide bits
+                    sym_idx  = np.arange(pe - ps, dtype=np.float64)
+                    ramp     = sym_idx * (2.0 * np.pi * residual_df / _SYMBOL_RATE)
+                    corr_pha = np.angle(
+                        np.exp(1j * (pha[ps:pe].astype(np.float64) - ramp))
+                    ).astype(np.float32)
+                    b0 = (corr_pha < 0).astype(np.int8)
+                    b1 = (np.abs(corr_pha) > (np.pi / 2)).astype(np.int8)
+                    burst = np.empty(_NDB_CHIPS, dtype=np.int8)
+                    burst[0::2] = b0
+                    burst[1::2] = b1
+
+                    # Verify sync word quality (hard check on corrected bits)
+                    sw_s = _SYNC_TRAIN_OFF
+                    sw_e = sw_s + len(_Y_BITS)
+                    errs = int(np.sum(burst[sw_s:sw_e] != _Y_BITS))
+                    # logger.info(
+                    #     "TETRA soft-SYNC: score=%.1f df=%.0f Hz sw_errs=%d",
+                    #     soft_score, residual_df, errs,
+                    # )
+
+                    r = self._decode_burst(burst, 'SYNC', 'SYNC', errs, corr_pha)
+                    if r is not None:
+                        self._pending.append(r)
+                buf = buf[end:]
+                pha = pha[end // 2:]
+                continue
+
+            # ── Fallback: hard-decision burst finder (NDB + weak SYNC) ──────
+            best_hit = None
+            best_k   = 0
+            best_buf = buf
+            for k in range(4):
+                test_buf = buf if k == 0 else _bits_from_phases(pha, k)
+                h = _find_burst(test_buf)
+                if h is not None:
+                    if best_hit is None or h[3] < best_hit[3]:
+                        best_hit = h
+                        best_k   = k
+                        best_buf = test_buf
+
+            hit = best_hit
             if hit is None:
                 keep = min_lookahead
-                buf = buf[-keep:] if len(buf) > keep else buf
+                buf = buf[-keep:]      if len(buf) > keep      else buf
+                pha = pha[-(keep//2):] if len(pha) > keep // 2 else pha
                 break
+
             start, kind, train, errs = hit
             end = start + _NDB_CHIPS
-            if end > len(buf):
+            if end > len(best_buf):
                 buf = buf[start:]
+                pha = pha[start // 2:]
                 break
-            burst = buf[start:end].copy()
-            r = self._decode_burst(burst, kind, train, errs)
+
+            burst = best_buf[start:end].copy()
+
+            ps = start // 2
+            pe = (start + _NDB_CHIPS) // 2
+            burst_pha = None
+            if kind == 'SYNC' and pe <= len(pha):
+                raw_slice = pha[ps:pe]
+                if best_k == 0:
+                    burst_pha = raw_slice.copy()
+                else:
+                    burst_pha = ((raw_slice - best_k * np.pi / 2 + np.pi)
+                                 % (2 * np.pi) - np.pi).astype(np.float32)
+
+            r = self._decode_burst(burst, kind, train, errs, burst_pha)
             if r is not None:
                 self._pending.append(r)
             buf = buf[end:]
-        self._bits = buf
+            pha = pha[end // 2:]
+        self._bits   = buf
+        self._phases = pha
 
-    def _decode_burst(self, burst, kind, train, errs) -> Optional[DecoderResult]:
-        if errs > _TRAIN_MAX_ERRORS:
+    def _decode_burst(self, burst, kind, train, errs, phases=None) -> Optional[DecoderResult]:
+        max_errs = _SYNC_MAX_ERRORS if kind == 'SYNC' else _NDB_MAX_ERRORS
+        if errs > max_errs:
             return None
+        now = time.time()
+        if hasattr(self, '_last_burst_time'):
+            interval_ms = (now - self._last_burst_time) * 1000
+            logger.info("TETRA burst interval: %.0f ms (real SB≈453ms, false-positive=random)", interval_ms)
+        self._last_burst_time = now
         self._burst_n += 1
         is_sync = (kind == 'SYNC')
         bb_info: dict = {}
@@ -237,16 +360,51 @@ class TETRADecoder(BaseDecoder):
 
         if is_sync:
             burst_type = 'SYNC'
-            # Decode BSCH from SB1 (120 bits)
-            sb1 = burst[_SB_BLK1_S:_SB_BLK1_E]
+            sb1 = burst[_SB_BLK1_S:_SB_BLK1_E]  # 120 bits
+
+            # AFC: estimate per-symbol phase bias from Y sync word, re-decode SB1
+            if phases is not None:
+                y_s = _SYNC_TRAIN_OFF // 2          # symbol 61
+                y_e = y_s + len(_Y_EXPECTED_PHASES) # symbol 80
+                sb1_s = _SB_BLK1_S // 2             # symbol 1
+                sb1_e = _SB_BLK1_E // 2             # symbol 61
+                if y_e <= len(phases) and (sb1_e - sb1_s) == 60:
+                    theta = _afc_estimate(phases[y_s:y_e])
+                    # Wrapped subtraction keeps corrected in [-π, π]
+                    corrected = np.angle(
+                        np.exp(1j * (phases[sb1_s:sb1_e].astype(np.float64) - theta))
+                    ).astype(np.float32)
+
+                    b0_tmp = (corrected < 0).astype(np.int8)
+                    b1_tmp = (np.abs(corrected) > (np.pi / 2)).astype(np.int8)
+                    # Distance from nearest constellation point (0 = perfect)
+                    expected_phase = ((1 - 2 * b0_tmp.astype(np.float32)) *
+                                      (np.pi / 4 + b1_tmp.astype(np.float32) * np.pi / 2))
+                    phase_err = np.angle(
+                        np.exp(1j * (corrected.astype(np.float64) -
+                                     expected_phase.astype(np.float64)))
+                    )
+                    rms_phase_err = float(np.sqrt(np.mean(phase_err ** 2)))
+                    logger.info(
+                        "TETRA AFC: theta=%.4f rad (%.0f Hz)  "
+                        "SB1 phase-rms=%.3f rad (0=perfect, >0.4=low-SNR, "
+                        "0.56rad→14%%BER)",
+                        theta, theta * _SYMBOL_RATE / (2 * np.pi), rms_phase_err,
+                    )
+
+                    b0 = (corrected < 0).astype(np.int8)
+                    b1 = (np.abs(corrected) > (np.pi / 2)).astype(np.int8)
+                    sb1 = np.empty(120, dtype=np.int8)
+                    sb1[0::2] = b0
+                    sb1[1::2] = b1
+
             bsch, crc_ok = decode_bsch(sb1, self._scramble_seed)
             if crc_ok and bsch is not None:
                 self._net.update_from_bsch(bsch)
                 self._scramble_seed = scramble_seed(
                     self._net.mcc, self._net.mnc, self._net.cc)
-                logger.info(
-                    "TETRA SYNC: %s", self._net.cell_id
-                )
+                self._net_synced = True
+                logger.info("TETRA SYNC: %s", self._net.cell_id)
             # BBK (30 bits) → AACH decode
             bbk = burst[_SB_BBK_OFF:_SB_BBK_OFF + _SB_BBK_LEN]
             if len(bbk) >= 14:
@@ -269,7 +427,9 @@ class TETRADecoder(BaseDecoder):
             if is_bcch:
                 # Decode control channel payload
                 payload, crc_ok = decode_bkn(b1, b2, self._scramble_seed)
-                if payload is not None:
+                if not crc_ok:
+                    return None   # suppress false BCCH noise
+                if crc_ok and payload is not None:
                     frame = parse_mac_block(payload, tn=self._net.tn)
                     if frame is not None:
                         bb_info.update(frame.to_dict())
@@ -295,7 +455,9 @@ class TETRADecoder(BaseDecoder):
                         self._cell = si
                         sysinfo_dict = si.to_dict()
             else:
-                # Traffic channel — decode voice
+                # Traffic channel — only decode voice when synced to a cell
+                if not self._net_synced:
+                    return None
                 pcm = _decode_tch(np.concatenate([b1, b2]))
 
         net_dict = self._net.to_dict()
@@ -360,60 +522,250 @@ def _acelp_reorder(bits_274: np.ndarray):
 
 # ── Demodulation ──────────────────────────────────────────────────────────────
 
-def _demodulate(iq: np.ndarray, sps: int) -> Optional[np.ndarray]:
-    if sps < 1 or len(iq) <= sps:
+_MIN_PERIOD = 3.0   # min samples/symbol before upsampling (Nyquist margin)
+
+
+def _fft_upsample(iq: np.ndarray, factor: int) -> np.ndarray:
+    """Upsample complex IQ by integer factor via FFT zero-padding.
+
+    Equivalent to ideal (sinc) interpolation — correct for any band-limited
+    signal.  Much better than linear interpolation when the input sample rate
+    is only 1-2× the symbol rate, which aliases the high-frequency spectral
+    tails of the RRC pulse into the decision region.
+    """
+    n  = len(iq)
+    F  = np.fft.fft(iq)
+    N2 = n * factor
+    F2 = np.zeros(N2, dtype=np.complex128)
+    h  = n // 2
+    F2[:h + 1]          = F[:h + 1]
+    F2[N2 - (n-h-1):]   = F[h + 1:]
+    return np.fft.ifft(F2) * factor
+
+
+def _narrowband_filter(iq: np.ndarray, sr: float) -> tuple:
+    """FFT brick-wall LPF to TETRA channel bandwidth, keeping sample rate unchanged.
+
+    Zero out FFT bins outside ±(TETRA_BW/2) Hz.  No decimation — _demodulate
+    continues to run at the original sr with its existing oversampling ratio.
+    Typical gain: 75 kHz VFO → 25 kHz pass-band removes 4.8 dB of OOB noise.
+    """
+    if sr <= _TETRA_BW * 1.5:
+        return iq, sr
+    n = len(iq)
+    if n < 16:
+        return iq, sr
+    keep = max(2, round(n * _TETRA_BW / (2.0 * sr)))  # bins to keep each side of DC
+    F = np.fft.fft(iq)
+    F[keep + 1 : n - keep] = 0
+    return np.fft.ifft(F).astype(np.complex64), sr
+
+
+_N_TIMING = 8   # symbol timing hypotheses tried per chunk (evenly spaced over 1 period)
+
+
+def _demodulate(iq: np.ndarray, sr: float) -> Optional[tuple]:
+    """
+    π/4-DQPSK differential demodulator with symbol timing recovery.
+
+    Returns (bits, phases) for the timing hypothesis with maximum mean
+    squared amplitude at the symbol sample points (eye-opening criterion —
+    carrier-agnostic, robust even when the 4th-power carrier estimate is
+    noise-dominated).
+
+    FFT upsamples to ≥ _MIN_PERIOD samples/symbol first; the timing search
+    then runs cheaply on the upsampled signal using linear interpolation.
+    """
+    period = sr / _SYMBOL_RATE          # samples/symbol
+    n_syms = int((len(iq) - 1) / period)
+    if n_syms < 2:
         return None
-    idx   = np.arange(sps, len(iq), sps)
-    if len(idx) == 0:
-        return None
-    curr  = iq[idx].astype(np.complex64)
-    prev  = iq[idx - sps].astype(np.complex64)
-    phase = np.angle(curr * np.conj(prev)).astype(np.float32)
-    bits  = np.empty(len(phase) * 2, dtype=np.int8)
-    for i, p in enumerate(phase):
-        b0, b1 = _pi4_decode(float(p))
-        bits[2*i] = b0; bits[2*i+1] = b1
+
+    if period < _MIN_PERIOD:
+        up     = int(np.ceil(_MIN_PERIOD / period))
+        iq     = _fft_upsample(iq, up)
+        sr     = sr * up
+        period = sr / _SYMBOL_RATE
+        n_syms = int((len(iq) - 1) / period)
+        if n_syms < 2:
+            return None
+
+    # ── Carrier frequency offset correction ──────────────────────────────
+    diffs         = iq[1:] * np.conj(iq[:-1])
+    bias_per_samp = float(np.angle(np.mean(diffs ** 4))) / 4.0  # rad/sample
+    freq_corr     = float(bias_per_samp * period)               # rad/symbol
+
+    # ── Symbol timing search ──────────────────────────────────────────────
+    # For RRC-filtered DQPSK, amplitude |iq| is maximised at the centre of
+    # each symbol eye.  Try _N_TIMING evenly-spaced offsets over one period
+    # and keep the one with the highest mean squared sample power — this
+    # requires no knowledge of carrier phase or data symbols.
+    k   = np.arange(1, n_syms + 1, dtype=np.float64)
+    lim = len(iq) - 2
+
+    best_bits   = None
+    best_phases = None
+    best_power  = -1.0
+
+    for i in range(_N_TIMING):
+        tau   = i * period / _N_TIMING       # fractional timing offset (samples)
+        c_pos = k * period + tau
+        p_pos = c_pos - period
+
+        ci = c_pos.astype(np.int32);  cf = (c_pos - ci).astype(np.float32)
+        pi = p_pos.astype(np.int32);  pf = (p_pos - pi).astype(np.float32)
+        ci = np.clip(ci, 0, lim);     pi = np.clip(pi, 0, lim)
+
+        curr = iq[ci] + cf * (iq[ci + 1] - iq[ci])
+        prev = iq[pi] + pf * (iq[pi + 1] - iq[pi])
+
+        pwr = float(np.mean(np.abs(curr) ** 2))
+        if pwr <= best_power:
+            continue
+
+        best_power = pwr
+        raw        = np.angle(curr * np.conj(prev)) - freq_corr
+        phase      = ((raw + np.pi) % (2 * np.pi) - np.pi).astype(np.float32)
+        b0         = (phase < 0).astype(np.int8)
+        b1         = (np.abs(phase) > (np.pi / 2)).astype(np.int8)
+        bits       = np.empty(n_syms * 2, dtype=np.int8)
+        bits[0::2] = b0
+        bits[1::2] = b1
+        best_bits   = bits
+        best_phases = phase
+
+    return best_bits, best_phases
+
+
+# ── Frequency-hypothesis bit derivation ──────────────────────────────────────
+
+def _bits_from_phases(phases: np.ndarray, k: int) -> np.ndarray:
+    """Re-derive bits from hypothesis-0 corrected phases shifted by k × π/2.
+
+    The 4th-power carrier estimator has a 4-fold ambiguity: adding k×π/2
+    (rad/symbol) to the frequency correction gives an equally valid estimate.
+    Trying k ∈ {1,2,3} extends the correctable carrier range from ±sr/8 to ±sr/2.
+    """
+    phase = ((phases - k * np.pi / 2 + np.pi) % (2 * np.pi) - np.pi).astype(np.float32)
+    b0 = (phase < 0).astype(np.int8)
+    b1 = (np.abs(phase) > (np.pi / 2)).astype(np.int8)
+    bits = np.empty(len(phase) * 2, dtype=np.int8)
+    bits[0::2] = b0
+    bits[1::2] = b1
     return bits
 
 
-def _pi4_decode(phase: float):
-    best_d, best_b0, best_b1 = 999.0, 0, 0
-    for ref, b0, b1 in _PI4_MAP:
-        d = abs(phase - ref)
-        if d > np.pi:
-            d = 2.0*np.pi - d
-        if d < best_d:
-            best_d, best_b0, best_b1 = d, b0, b1
-    return best_b0, best_b1
+# ── Soft sync-word correlator ─────────────────────────────────────────────────
+
+_SOFT_THRESHOLD  = 12.0   # minimum |Σ exp(j·Δφ)| over 19 Y symbols (max=19)
+_SOFT_DF_STEP    = 300    # Hz — residual carrier offset search step
+_SOFT_DF_MAX     = 18000  # Hz — ±range; covers full 4th-power error (±sr/8 ≈ ±9.3 kHz)
+_MAX_PHASE_BUF   = 1500   # symbols — hard cap to bound soft-correlator cost
+
+# Pre-compute the symbol index ramp for the Y sync word (19 elements)
+_Y_SYM_IDX = np.arange(len(_Y_EXPECTED_PHASES), dtype=np.float64)
+
+
+def _find_burst_soft(phases: np.ndarray) -> Optional[tuple]:
+    """Phase-domain sync word search over a carrier-offset grid.
+
+    For each candidate burst start, tries ±_SOFT_DF_MAX Hz of residual carrier
+    offset in _SOFT_DF_STEP Hz steps.  The 2-D correlation (position × df) is
+    computed as a single matrix multiply, making it fast enough for real-time use.
+
+    Returns (start_bit, residual_df_hz, score) or None.
+    """
+    y_off = _SYNC_TRAIN_OFF // 2          # 61 — sync word symbol offset
+    y_len = len(_Y_EXPECTED_PHASES)        # 19
+
+    n_sym = len(phases)
+    limit = n_sym - y_off - y_len + 1
+    if limit <= 0:
+        return None
+
+    # Sliding windows of 19 phases starting at the Y-word offset
+    seg = phases[y_off : y_off + limit + y_len - 1]
+    if len(seg) < y_len:
+        return None
+    windows = np.lib.stride_tricks.sliding_window_view(
+        seg.astype(np.float64), y_len)      # (limit, 19)
+
+    # Unit-complex IQ from measured phases: (limit, 19)
+    iq_win = np.exp(1j * windows)
+
+    # Template bank: for each df candidate, exp(-j × (Y_expected + ramp))
+    # Shape: (19, n_df) so we can do a single matmul
+    df_values = np.arange(-_SOFT_DF_MAX, _SOFT_DF_MAX + 1,
+                           _SOFT_DF_STEP, dtype=np.float64)   # (n_df,)
+    # ramp[m, df] = m × 2π × df / symbol_rate
+    ramp_mat  = _Y_SYM_IDX[:, None] * (2.0 * np.pi / _SYMBOL_RATE) * df_values  # (19, n_df)
+    templates = np.exp(-1j * (_Y_EXPECTED_PHASES[:, None].astype(np.float64)
+                               + ramp_mat))                    # (19, n_df)
+
+    # (limit, 19) @ (19, n_df) → (limit, n_df)  — one BLAS call
+    corr = np.abs(iq_win @ templates)                          # (limit, n_df)
+
+    flat_idx   = int(np.argmax(corr))
+    best_pos, best_df_idx = np.unravel_index(flat_idx, corr.shape)
+    best_score = float(corr[best_pos, best_df_idx])
+
+    # Always return best result — caller applies threshold and logs misses.
+    return (int(best_pos) * 2, float(df_values[best_df_idx]), best_score)
 
 
 # ── Burst detection ───────────────────────────────────────────────────────────
 
-def _find_burst(buf: np.ndarray):
-    """Scan buf for the best sync-word hit. Returns (start, kind, train, errs) or None."""
-    best = None
-    limit = len(buf) - _NDB_CHIPS + 1
-    for start in range(0, limit):
-        # Try SYNC training at offset 214
-        sync_off = start + _SYNC_TRAIN_OFF
-        if sync_off + len(_Y_BITS) <= len(buf):
-            e = int(np.sum(buf[sync_off:sync_off+len(_Y_BITS)] != _Y_BITS))
-            if e <= _TRAIN_MAX_ERRORS:
-                if best is None or e < best[3]:
-                    best = (start, 'SYNC', 'SYNC', e)
+_NDB_SEQS = (('NDB1', _N_BITS), ('NDB2', _P_BITS), ('NDB3', _Q_BITS), ('EXT', _X_BITS))
 
-        # Try NDB training at offset 244
-        ndb_off = start + _NDB_TRAIN_OFF
-        if ndb_off + max(len(_N_BITS), len(_X_BITS)) <= len(buf):
-            for tname, tbits in (('NDB1',_N_BITS),('NDB2',_P_BITS),
-                                  ('NDB3',_Q_BITS),('EXT',_X_BITS)):
-                e = int(np.sum(buf[ndb_off:ndb_off+len(tbits)] != tbits))
-                if e <= _TRAIN_MAX_ERRORS:
-                    if best is None or e < best[3]:
-                        best = (start, 'NDB', tname, e)
-        if best is not None and best[3] == 0:
-            break  # perfect match, stop scanning
-    return best
+
+def _find_burst(buf: np.ndarray):
+    """
+    Vectorised burst scan — O(N) numpy instead of O(N) Python loop.
+
+    Uses sliding_window_view to compute Hamming distances between every
+    candidate window and each training sequence in one numpy call, then
+    picks the earliest position below the error threshold.
+    SYNC is preferred over NDB at the same position.
+    """
+    limit = len(buf) - _NDB_CHIPS + 1
+    if limit <= 0:
+        return None
+
+    y_len = len(_Y_BITS)
+
+    # ── SYNC: Y-word at offset _SYNC_TRAIN_OFF from burst start ──────────
+    # Windows: buf[SYNC_TRAIN_OFF + start : SYNC_TRAIN_OFF + start + y_len]
+    # for start in [0, limit)
+    sw = np.lib.stride_tricks.sliding_window_view(
+        buf[_SYNC_TRAIN_OFF : _SYNC_TRAIN_OFF + limit + y_len - 1], y_len)
+    sync_errs = np.sum(sw != _Y_BITS, axis=1, dtype=np.int32)   # shape (limit,)
+
+    # ── NDB: best-of-4 training sequences at offset _NDB_TRAIN_OFF ───────
+    ndb_errs  = np.full(limit, 999, dtype=np.int32)
+    ndb_which = np.full(limit, -1,  dtype=np.int8)
+    for ti, (tname, tbits) in enumerate(_NDB_SEQS):
+        t_len = len(tbits)
+        seg   = buf[_NDB_TRAIN_OFF : _NDB_TRAIN_OFF + limit + t_len - 1]
+        if len(seg) < t_len:
+            continue
+        nw   = np.lib.stride_tricks.sliding_window_view(seg, t_len)
+        errs = np.sum(nw != tbits, axis=1, dtype=np.int32)
+        better = errs < ndb_errs[:len(errs)]
+        ndb_errs[:len(errs)]  = np.where(better, errs, ndb_errs[:len(errs)])
+        ndb_which[:len(errs)] = np.where(better, ti,   ndb_which[:len(errs)])
+
+    # ── Pick earliest start that satisfies either threshold ───────────────
+    sync_ok = sync_errs <= _SYNC_MAX_ERRORS
+    ndb_ok  = ndb_errs  <= _NDB_MAX_ERRORS
+    either  = sync_ok | ndb_ok
+    if not np.any(either):
+        return None
+
+    first = int(np.argmax(either))   # argmax returns first True index
+    if sync_ok[first]:
+        return (first, 'SYNC', 'SYNC', int(sync_errs[first]))
+    ti = int(ndb_which[first])
+    return (first, 'NDB', _NDB_SEQS[ti][0], int(ndb_errs[first]))
 
 
 # ── BB field parser ───────────────────────────────────────────────────────────

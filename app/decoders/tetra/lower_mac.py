@@ -28,15 +28,21 @@ def scramble_seed(mcc: int, mnc: int, colour_code: int) -> int:
 
 
 def scramble(bits: np.ndarray, seed: int) -> np.ndarray:
-    """XOR bits with LFSR sequence seeded at *seed*. Returns new array."""
+    """XOR bits with LFSR sequence seeded at *seed*. Returns new array.
+
+    Galois LFSR with parity feedback, matching SDRSharp Scrambler.cs:
+      key = lfsr & poly; bit = parity(key); lfsr = (lfsr >> 1) | (bit << 31)
+    """
     out = bits.copy().astype(np.uint8)
     lfsr = seed & 0xFFFFFFFF
     for i in range(len(out)):
-        lsb = lfsr & 1
-        lfsr >>= 1
-        if lsb:
-            lfsr ^= _LFSR_POLY
-        out[i] ^= lsb
+        key = lfsr & _LFSR_POLY
+        # popcount(key) mod 2 — parallel XOR reduction
+        key ^= key >> 16; key ^= key >> 8; key ^= key >> 4
+        key ^= key >> 2;  key ^= key >> 1
+        bit = key & 1
+        lfsr = ((lfsr >> 1) | (bit << 31)) & 0xFFFFFFFF
+        out[i] ^= bit
     return out
 
 
@@ -52,7 +58,10 @@ DEINT_TCH     = (432, 13)   # TCH/S  — B1+B2 combined
 
 
 def deinterleave(bits: np.ndarray, N: int, a: int) -> np.ndarray:
-    """Block deinterleaver: dest[i-1] = source[(1+a*i % N)-1], i=1..N."""
+    """
+    Block deinterleaver per ETSI EN 300 392-2 §8.2.4.1.
+    Matches SDRSharp Deinterleave.cs: dest[i-1] = source[(a*i) % N] for i=1..N.
+    """
     if len(bits) < N:
         return bits.copy()
     dest = np.empty(N, dtype=bits.dtype)
@@ -62,12 +71,13 @@ def deinterleave(bits: np.ndarray, N: int, a: int) -> np.ndarray:
 
 
 # ── Convolutional code parameters ────────────────────────────────────────────
-# Rate 1/4 mother code, K=5 (ETSI EN 300 392-2 §8.2.3)
-# Generator polynomials (octal): G1=0o23, G2=0o33, G3=0o25, G4=0o37
+# Rate 1/4 mother code, K=5 (ETSI EN 300 392-2 §8.2.3 / Table 8.36)
+# Generators in octal: 23, 33, 25, 37  → decimal: 19, 27, 21, 31
+# (osmo-tetra uses 0x17=23, 0x13=19, 0x15=21, 0x1f=31 in hex — same values)
 
-_K      = 5          # constraint length
+_K      = 5
 _STATES = 1 << (_K - 1)  # 16 states
-_G = [0b10011, 0b11011, 0b10111, 0b11111]  # rate-1/4 generators
+_G = [0b10011, 0b11011, 0b10101, 0b11111]  # G0=19, G1=27, G2=21, G3=31
 
 
 def _parity(x: int) -> int:
@@ -80,41 +90,23 @@ _CONV_OUTPUT = np.zeros((_STATES, 2, 4), dtype=np.uint8)
 _CONV_NEXT   = np.zeros((_STATES, 2), dtype=np.int32)
 for _s in range(_STATES):
     for _b in range(2):
-        _reg = (_b << (_K - 1)) | (_s >> 1)
+        _reg = (_b << (_K - 1)) | _s
         _CONV_NEXT[_s, _b] = (_s >> 1) | (_b << (_K - 2))
         for _gi, _g in enumerate(_G):
             _CONV_OUTPUT[_s, _b, _gi] = _parity(_reg & _g)
 
 
-# ── Puncture rates ────────────────────────────────────────────────────────────
-# Each entry: (period, keep_mask)  where keep_mask[i] = True means coded bit i
-# within the period is kept (not punctured).
-# Source: ETSI EN 300 392-2 §8.2.3, SDRSharp Depuncture.cs
+# ── Puncture masks (ETSI EN 300 392-2 §8.2.3) ────────────────────────────────
+# Each mask cycles over the mother-code output (4 bits per info bit).
+# 1 = keep this coded bit; 0 = it was punctured (depuncture inserts erasure=2).
 
-# PUNCT_2_3: effective rate 1/2 — keep 8 of 12 mother-code bits per 3 info bits
-# Period of 12 coded bits (3 info × 4 outputs), remove positions 3, 7, 11 → keep 9?
-# From SDRSharp: P2/3 keeps the bits NOT at indices {3,7,11} in a group of 12
-_P23_MASK = np.array(
-    [1,1,1,0, 1,1,1,0, 1,1,1,0], dtype=np.uint8  # keep 9 of 12
-)
+# SCH/F (BSCH): 60 info bits × 4 = 240 mother bits → keep 120 → rate 1/2
+# Remove generators G2,G3 for each info bit.
+_BSCH_PUNCT_MASK = np.array([1, 1, 0, 0], dtype=np.uint8)
 
-# PUNCT_1_3: effective rate 1/3 — used for BCCH control channels
-# From SDRSharp: keeps positions {0,1,2} of every 4-bit mother group → keep 3/4
-# resulting in effective rate 1/4 × 4/3 = 1/3
-_P13_MASK = np.array(
-    [1,1,1,0, 1,1,1,0, 1,1,1,0, 1,1,1,0, 1,1,1,0, 1,1,1,0], dtype=np.uint8
-)
-
-# For SCH/F (BSCH): 60 info+crc+tail bits, 120 coded → keep 1/2 of mother code
-# Mother code produces 60×4=240 bits; depuncture target=120 → keep 120/240 = 1/2
-# Pattern: keep 2 of every 4 coded bits (positions 0,1)
-_BSCH_PUNCT_MASK = np.array([1,1,0,0], dtype=np.uint8)  # keep 2 of 4 → rate 1/2
-
-# For TCH/S: 274 info bits → 432 coded (approx)
-# Actual TETRA uses: mother 274×4=1096 coded, punct to 432
-# Keep 432/1096 ≈ 0.394 per bit; nearest clean: keep {0,1} of groups of 5 + some
-# In osmo-tetra the exact pattern is per viterbi_tch.c — use identity (no-punct) as fallback
-_TCH_PUNCT_MASK = None  # no puncturing (raw bits fed to Viterbi)
+# BKN type-1 (BCCH/DCCH): 144 info bits × 4 = 576 mother bits → keep 432 → rate 3/4
+# Remove generator G3 for each info bit: [G0,G1,G2,_].
+_BKN_PUNCT_MASK = np.array([1, 1, 1, 0], dtype=np.uint8)
 
 
 def depuncture(coded_bits: np.ndarray, punct_mask: np.ndarray) -> np.ndarray:
@@ -173,7 +165,8 @@ def viterbi_decode(soft_bits: np.ndarray) -> np.ndarray:
     INF = 10**7
     metric = np.full(_STATES, INF, dtype=np.int64)
     metric[0] = 0
-    path = np.zeros((n_steps, _STATES), dtype=np.int8)
+    # path stores the previous state (not the input bit) for clean traceback
+    path = np.zeros((n_steps, _STATES), dtype=np.int32)
 
     for t in range(n_steps):
         obs = soft_bits[t * 4:(t + 1) * 4]
@@ -184,7 +177,6 @@ def viterbi_decode(soft_bits: np.ndarray) -> np.ndarray:
             for inp in range(2):
                 next_s = int(_CONV_NEXT[prev_s, inp])
                 out_bits = _CONV_OUTPUT[prev_s, inp]
-                # Branch metric: hamming distance, skip erasures
                 bm = 0
                 for gi in range(4):
                     if obs[gi] != 2:
@@ -192,39 +184,34 @@ def viterbi_decode(soft_bits: np.ndarray) -> np.ndarray:
                 total = metric[prev_s] + bm
                 if total < new_metric[next_s]:
                     new_metric[next_s] = total
-                    path[t, next_s] = inp
+                    path[t, next_s] = prev_s   # store previous state
         metric = new_metric
 
-    # Traceback from state 0 (trellis termination)
+    # Traceback: recover input bit from state MSB (state = inp<<(K-2) | prev>>1)
     decoded = np.empty(n_steps, dtype=np.uint8)
     state = int(np.argmin(metric))
     for t in range(n_steps - 1, -1, -1):
-        decoded[t] = path[t, state]
-        # Reverse the state transition
-        inp = decoded[t]
-        state = (state << 1) & (_STATES - 1)
-        state |= inp
+        decoded[t] = (state >> (_K - 2)) & 1   # inp is the MSB of next_s
+        state = int(path[t, state])             # follow stored previous state
     return decoded
 
 
 # ── CRC-16 ────────────────────────────────────────────────────────────────────
 # ETSI EN 300 392-2 §8.2.6: GenPoly=0x8408 (reflected), GoodCRC=0xF0B8
 
-_GOOD_CRC = 0xF0B8  # CRC-16 value for valid decoded block (post-decode check)
+_GOOD_CRC = 0xF0B8  # CRC residue for valid block (SDRSharp CRC16.cs GoodCRC=61624)
 _CRC_POLY = 0x8408  # x^16+x^12+x^5+1 reflected
 
 
 def crc16(bits: np.ndarray) -> int:
-    """Compute CRC-16/CCITT remainder over bit array. Returns 16-bit integer."""
+    """Bit-at-a-time CRC-16/CCITT over a bit array (each element 0 or 1)."""
     reg = 0xFFFF
     for b in bits:
-        reg ^= int(b)
-        for _ in range(8):
-            lsb = reg & 1
-            reg >>= 1
-            if lsb:
-                reg ^= _CRC_POLY
-    return reg ^ 0xFFFF
+        lsb = (reg ^ int(b)) & 1
+        reg >>= 1
+        if lsb:
+            reg ^= _CRC_POLY
+    return reg
 
 
 def check_crc(bits: np.ndarray) -> bool:
@@ -306,6 +293,35 @@ def rm_decode(bits_30: np.ndarray) -> Tuple[Optional[np.ndarray], bool]:
 
 # ── Full decode pipeline ──────────────────────────────────────────────────────
 
+import logging as _log
+_bsch_log = _log.getLogger(__name__)
+
+def _viterbi_min_metric(soft_bits: np.ndarray) -> int:
+    """Run Viterbi and return minimum final path metric (= estimated bit errors)."""
+    n = len(soft_bits)
+    n_steps = n // 4
+    if n_steps == 0:
+        return 0
+    INF = 10 ** 7
+    metric = np.full(_STATES, INF, dtype=np.int64)
+    metric[0] = 0
+    for t in range(n_steps):
+        obs = soft_bits[t * 4:(t + 1) * 4]
+        new_metric = np.full(_STATES, INF, dtype=np.int64)
+        for prev_s in range(_STATES):
+            if metric[prev_s] == INF:
+                continue
+            for inp in range(2):
+                next_s = int(_CONV_NEXT[prev_s, inp])
+                out_bits = _CONV_OUTPUT[prev_s, inp]
+                bm = sum(int(obs[gi] != out_bits[gi]) for gi in range(4) if obs[gi] != 2)
+                total = metric[prev_s] + bm
+                if total < new_metric[next_s]:
+                    new_metric[next_s] = total
+        metric = new_metric
+    return int(np.min(metric))
+
+
 def decode_bsch(raw_bits: np.ndarray, seed: int = BSCH_SEED) -> Tuple[Optional[np.ndarray], bool]:
     """
     Decode BSCH (SCH/F) from 120 raw SB1 bits.
@@ -315,15 +331,30 @@ def decode_bsch(raw_bits: np.ndarray, seed: int = BSCH_SEED) -> Tuple[Optional[n
     """
     if len(raw_bits) < 120:
         return None, False
-    b = raw_bits[:120]
-    b = scramble(b, seed)
+    raw = raw_bits[:120].copy()
+
+    # Log raw SB1 bits as a hex-encoded bit string (8 bits per hex digit pair)
+    raw_hex = ''.join(f"{int(''.join(str(int(b)) for b in raw[i:i+8]), 2):02X}"
+                      for i in range(0, 120, 8))
+
+    b = scramble(raw, seed)
     N, a = DEINT_BSCH
     b = deinterleave(b, N, a)
-    b = depuncture(b, _BSCH_PUNCT_MASK)
-    decoded = viterbi_decode(b)
+    dep = depuncture(b, _BSCH_PUNCT_MASK)
+
+    # Viterbi minimum path metric tells us estimated channel BER
+    vit_errs = _viterbi_min_metric(dep)
+
+    decoded = viterbi_decode(dep)
     if len(decoded) < 60:
         return None, False
-    ok = check_crc(decoded[:60])
+    crc_val = crc16(decoded[:60])
+    ok = (crc_val == _GOOD_CRC)
+    _bsch_log.debug(
+        "BSCH: raw=%s vit_errs=%d crc=0x%04X ok=%s bits=%s",
+        raw_hex, vit_errs, crc_val, ok,
+        ''.join(str(int(x)) for x in decoded[:44]),
+    )
     return decoded[:60], ok
 
 
@@ -343,17 +374,20 @@ def decode_bkn(raw_b1: np.ndarray, raw_b2: np.ndarray, seed: int) -> Tuple[Optio
     """
     Decode BKN1+BKN2 from B1 (216 bits) + B2 (216 bits) of an NDB burst.
 
-    Returns (payload bits excl. CRC and tail, crc_ok).
-    Used for BCCH, MCCH, DCCH logical channels.
+    Pipeline: scramble → deinterleave(N=432,a=13) → depuncture(3/4) → Viterbi → CRC
+    144 info bits (128 payload + 16 CRC) are recovered; CRC covers the payload.
+    Returns (payload_bits, crc_ok).  payload is 128 bits if CRC passes.
     """
-    raw = np.concatenate([raw_b1[:216], raw_b2[:216]])  # 432 bits
+    raw = np.concatenate([raw_b1[:216], raw_b2[:216]])  # 432 coded bits
     b = scramble(raw, seed)
     N, a = DEINT_TCH
     b = deinterleave(b, N, a)
-    # No puncturing for BKN in this implementation (raw bits used)
-    decoded = viterbi_decode(b)
+    # Depuncture: 432 → 576 (insert erasures at G3 output of each info bit)
+    b = depuncture(b, _BKN_PUNCT_MASK)      # 432 → 576
+    decoded = viterbi_decode(b)             # 576 → 144 bits
     if len(decoded) < 20:
         return None, False
     ok = check_crc(decoded)
-    payload = decoded[:-20] if len(decoded) > 20 else decoded  # strip CRC+tail
+    # Strip last 16 CRC bits (tail bits already consumed by Viterbi flush)
+    payload = decoded[:-16] if len(decoded) >= 16 else decoded
     return payload, ok

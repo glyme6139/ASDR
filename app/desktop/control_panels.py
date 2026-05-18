@@ -57,7 +57,7 @@ class AcceptCommaDoubleSpinBox(QDoubleSpinBox):
 # Use our subclass throughout this module wherever QDoubleSpinBox is used.
 QDoubleSpinBox = AcceptCommaDoubleSpinBox
 
-DECODER_NAMES = ['POCSAG', 'RDS', 'AIS', 'ADSB', 'TETRA'] + list(MODULATION_DECODER_NAMES)
+DECODER_NAMES = ['POCSAG', 'ADSB', 'TETRA', 'ACARS'] + list(MODULATION_DECODER_NAMES)
 
 _BOOKMARK_FILE = 'bookmarks.json'
 
@@ -390,6 +390,7 @@ class VFOTabPanel(QWidget):
     vfo_added = Signal(int)          # new vfo_id
     vfo_removed = Signal(int)        # removed vfo_id
     active_vfo_changed = Signal(int) # vfo_id of newly selected tab
+    vfo_renamed = Signal(int, str)   # vfo_id, new name
 
     # Re-emitted per-VFO signals
     frequency_changed = Signal(int, float)
@@ -411,6 +412,14 @@ class VFOTabPanel(QWidget):
         self._tab_widget.setTabsClosable(True)
         self._tab_widget.tabCloseRequested.connect(self._on_tab_close_requested)
         self._tab_widget.currentChanged.connect(self._on_current_changed)
+
+        # Context menu on tab bar for rename
+        try:
+            tabbar = self._tab_widget.tabBar()
+            tabbar.setContextMenuPolicy(Qt.CustomContextMenu)
+            tabbar.customContextMenuRequested.connect(self._on_tab_context_menu)
+        except Exception:
+            pass
 
         # "+" button in the corner
         add_btn = QPushButton("+")
@@ -476,6 +485,33 @@ class VFOTabPanel(QWidget):
         vfo_id = self._widget_to_vfo_id(widget)
         if vfo_id is not None:
             self.active_vfo_changed.emit(vfo_id)
+
+    def _on_tab_context_menu(self, pos):
+        """Handle right-click on a tab to offer rename option."""
+        try:
+            tabbar = self._tab_widget.tabBar()
+            idx = tabbar.tabAt(pos)
+            if idx < 0:
+                return
+            widget = self._tab_widget.widget(idx)
+            vfo_id = self._widget_to_vfo_id(widget)
+            if vfo_id is None:
+                return
+            current = self._tab_widget.tabText(idx)
+            name, ok = QInputDialog.getText(self, "Rename VFO", "Name:", text=current)
+            if not ok:
+                return
+            name = name.strip()
+            if not name:
+                name = current
+            # Truncate to fit tab space
+            self._tab_widget.setTabText(idx, name[:12])
+            try:
+                self.vfo_renamed.emit(vfo_id, name)
+            except Exception:
+                pass
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Public API
