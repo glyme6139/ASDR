@@ -16,6 +16,8 @@ from PySide6.QtCore import Qt, QTimer, QUrl
 from PySide6.QtGui import QPixmap
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtWidgets import (
+    QCheckBox,
+    QComboBox,
     QFileDialog,
     QGridLayout,
     QHBoxLayout,
@@ -28,6 +30,7 @@ from PySide6.QtWidgets import (
     QSlider,
     QTabWidget,
     QTextEdit,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -419,8 +422,6 @@ class SignalIDPanel(QWidget):
     def set_frequency(self, freq_hz: float):
         self._current_freq_hz = freq_hz
         self._freq_label.setText(f"{freq_hz / 1e6:.6f} MHz")
-        if self._db_conn is not None and not self._keyword_mode:
-            self._search_timer.start(600)
         if self._pop_window is not None and self._pop_window.isVisible():
             self._pop_window.panel.set_frequency(freq_hz)
 
@@ -477,6 +478,112 @@ class SignalIDPanel(QWidget):
             if result is not None:
                 tab_name, widget = result
                 self._result_tabs.addTab(widget, tab_name[:18])
+
+    def search_with_filters(self, modulations: list, modes: list, locations: list,
+                           categories: list, bandwidth_min_hz: Optional[float] = None,
+                           bandwidth_max_hz: Optional[float] = None) -> list:
+        """
+        Search signals applying multiple metadata filters.
+        Empty lists = no filter for that category.
+        Returns list of matching SIG_IDs.
+        """
+        if self._db_conn is None:
+            return []
+
+        try:
+            base_query = "SELECT DISTINCT s.SIG_ID FROM signals s"
+            conditions = []
+            params = []
+
+            # Modulation filter
+            if modulations:
+                ph = ",".join("?" * len(modulations))
+                base_query += f" LEFT JOIN modulation m ON m.SIG_ID = s.SIG_ID"
+                conditions.append(f"m.VALUE IN ({ph})")
+                params.extend(modulations)
+
+            # Mode filter
+            if modes:
+                ph = ",".join("?" * len(modes))
+                base_query += f" LEFT JOIN mode mo ON mo.SIG_ID = s.SIG_ID"
+                conditions.append(f"mo.VALUE IN ({ph})")
+                params.extend(modes)
+
+            # Location filter
+            if locations:
+                ph = ",".join("?" * len(locations))
+                base_query += f" LEFT JOIN location l ON l.SIG_ID = s.SIG_ID"
+                conditions.append(f"l.VALUE IN ({ph})")
+                params.extend(locations)
+
+            # Category filter
+            if categories:
+                ph = ",".join("?" * len(categories))
+                base_query += (
+                    f" LEFT JOIN category c ON c.SIG_ID = s.SIG_ID"
+                    f" LEFT JOIN category_label cl ON cl.CLB_ID = c.CLB_ID"
+                )
+                conditions.append(f"cl.VALUE IN ({ph})")
+                params.extend(categories)
+
+            # Bandwidth filter
+            if bandwidth_min_hz is not None or bandwidth_max_hz is not None:
+                base_query += " LEFT JOIN bandwidth b ON b.SIG_ID = s.SIG_ID"
+                if bandwidth_min_hz is not None and bandwidth_max_hz is not None:
+                    conditions.append(f"(b.VALUE >= ? AND b.VALUE <= ?)")
+                    params.extend([bandwidth_min_hz, bandwidth_max_hz])
+                elif bandwidth_min_hz is not None:
+                    conditions.append(f"b.VALUE >= ?")
+                    params.append(bandwidth_min_hz)
+                elif bandwidth_max_hz is not None:
+                    conditions.append(f"b.VALUE <= ?")
+                    params.append(bandwidth_max_hz)
+
+            # Add WHERE clause if we have conditions
+            if conditions:
+                base_query += " WHERE " + " AND ".join(conditions)
+
+            base_query += " ORDER BY s.SIG_ID"
+            rows = self._db_conn.execute(base_query, params).fetchall()
+            return [row[0] for row in rows]
+        except Exception as exc:
+            logger.error("Filter search failed: %s", exc)
+            return []
+
+    def get_filter_values(self) -> dict:
+        """Retrieve unique values for all filter types from the database."""
+        if self._db_conn is None:
+            return {}
+
+        result = {}
+        try:
+            # Modulations
+            rows = self._db_conn.execute(
+                "SELECT DISTINCT VALUE FROM modulation ORDER BY VALUE"
+            ).fetchall()
+            result['modulations'] = sorted([r[0] for r in rows if r[0]])
+
+            # Modes
+            rows = self._db_conn.execute(
+                "SELECT DISTINCT VALUE FROM mode ORDER BY VALUE"
+            ).fetchall()
+            result['modes'] = sorted([r[0] for r in rows if r[0]])
+
+            # Locations
+            rows = self._db_conn.execute(
+                "SELECT DISTINCT VALUE FROM location ORDER BY VALUE"
+            ).fetchall()
+            result['locations'] = sorted([r[0] for r in rows if r[0]])
+
+            # Categories
+            rows = self._db_conn.execute(
+                "SELECT DISTINCT cl.VALUE FROM category_label cl ORDER BY cl.VALUE"
+            ).fetchall()
+            result['categories'] = sorted([r[0] for r in rows if r[0]])
+        except Exception as exc:
+            logger.warning("Failed to load filter values: %s", exc)
+
+        return result
 
     # ------------------------------------------------------------------
     # Database
@@ -729,7 +836,7 @@ class SignalIDWindow(QMainWindow):
     def __init__(self, db_path: Optional[str], freq_hz: float, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Signal ID")
-        self.resize(900, 720)
+        self.resize(1000, 780)
         self.setStyleSheet("""
             QMainWindow, QWidget { background-color: #1a1a1a; color: #ffffff; }
             QGroupBox { color: #00ffff; border: 1px solid #404040;
@@ -758,9 +865,7 @@ class SignalIDWindow(QMainWindow):
         # Search bar
         self._kw_timer = QTimer()
         self._kw_timer.setSingleShot(True)
-        self._kw_timer.timeout.connect(
-            lambda: self.panel.search_keywords(self._search_edit.text())
-        )
+        self._kw_timer.timeout.connect(self._apply_all_filters)
 
         search_bar = QWidget()
         search_row = QHBoxLayout(search_bar)
@@ -775,14 +880,221 @@ class SignalIDWindow(QMainWindow):
         self._search_edit.textChanged.connect(lambda _: self._kw_timer.start(350))
         search_row.addWidget(self._search_edit)
 
+        # Filter panel
+        self._filter_panel = self._build_filter_panel()
+        
+        # Container for filters with collapse button
+        filter_container = QWidget()
+        filter_layout = QVBoxLayout(filter_container)
+        filter_layout.setContentsMargins(0, 0, 0, 0)
+        filter_layout.setSpacing(0)
+        
+        self._filter_toggle = QToolButton()
+        self._filter_toggle.setText("▼ Filters")
+        self._filter_toggle.setCheckable(True)
+        self._filter_toggle.setChecked(False)
+        self._filter_toggle.setAutoRaise(True)
+        self._filter_toggle.setArrowType(Qt.RightArrow)
+        self._filter_toggle.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self._filter_toggle.setStyleSheet("""
+            QToolButton { border: none; padding: 4px; color: #7dd3fc; }
+            QToolButton:hover { background: rgba(255,255,255,0.05); }
+        """)
+        self._filter_toggle.toggled.connect(self._on_filter_toggle)
+        filter_layout.addWidget(self._filter_toggle)
+        
+        self._filter_panel.setVisible(False)
+        filter_layout.addWidget(self._filter_panel)
+        
         container = QWidget()
         vlay = QVBoxLayout(container)
         vlay.setContentsMargins(0, 0, 0, 0)
         vlay.setSpacing(0)
         vlay.addWidget(search_bar)
+        vlay.addWidget(filter_container)
         vlay.addWidget(self.panel)
         self.setCentralWidget(container)
 
         if db_path:
             self.panel._load_db(db_path)
         self.panel.set_frequency(freq_hz)
+
+    def _build_filter_panel(self) -> QWidget:
+        """Build the filter UI widget with modulation, mode, location, category, and bandwidth filters."""
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(8, 4, 8, 4)
+        layout.setSpacing(8)
+
+        # Get available filter values from the database
+        filter_values = self.panel.get_filter_values()
+
+        # Modulation filter
+        mod_label = QLabel("Modulation:")
+        mod_label.setStyleSheet("color: #7dd3fc; font-weight: bold; font-size: 11px;")
+        layout.addWidget(mod_label)
+        
+        self._mod_checks = {}
+        mod_row = QHBoxLayout()
+        for mod in filter_values.get('modulations', []):
+            cb = QCheckBox(mod)
+            cb.stateChanged.connect(self._apply_all_filters)
+            self._mod_checks[mod] = cb
+            mod_row.addWidget(cb)
+        mod_row.addStretch()
+        layout.addLayout(mod_row)
+
+        # Mode filter
+        mode_label = QLabel("Mode:")
+        mode_label.setStyleSheet("color: #7dd3fc; font-weight: bold; font-size: 11px;")
+        layout.addWidget(mode_label)
+        
+        self._mode_checks = {}
+        mode_row = QHBoxLayout()
+        for mode in filter_values.get('modes', []):
+            cb = QCheckBox(mode)
+            cb.stateChanged.connect(self._apply_all_filters)
+            self._mode_checks[mode] = cb
+            mode_row.addWidget(cb)
+        mode_row.addStretch()
+        layout.addLayout(mode_row)
+
+        # Location filter
+        loc_label = QLabel("Location:")
+        loc_label.setStyleSheet("color: #7dd3fc; font-weight: bold; font-size: 11px;")
+        layout.addWidget(loc_label)
+        
+        self._loc_checks = {}
+        loc_row = QHBoxLayout()
+        for loc in filter_values.get('locations', [])[:15]:  # Limit display
+            cb = QCheckBox(loc)
+            cb.stateChanged.connect(self._apply_all_filters)
+            self._loc_checks[loc] = cb
+            loc_row.addWidget(cb)
+        loc_row.addStretch()
+        layout.addLayout(loc_row)
+
+        # Category filter
+        cat_label = QLabel("Category:")
+        cat_label.setStyleSheet("color: #7dd3fc; font-weight: bold; font-size: 11px;")
+        layout.addWidget(cat_label)
+        
+        self._cat_checks = {}
+        cat_row = QHBoxLayout()
+        for cat in filter_values.get('categories', [])[:10]:  # Limit display
+            cb = QCheckBox(cat)
+            cb.stateChanged.connect(self._apply_all_filters)
+            self._cat_checks[cat] = cb
+            cat_row.addWidget(cb)
+        cat_row.addStretch()
+        layout.addLayout(cat_row)
+
+        # Bandwidth range
+        bw_label = QLabel("Bandwidth (kHz):")
+        bw_label.setStyleSheet("color: #7dd3fc; font-weight: bold; font-size: 11px;")
+        layout.addWidget(bw_label)
+        
+        bw_row = QHBoxLayout()
+        bw_row.addWidget(QLabel("Min:"))
+        self._bw_min_combo = QComboBox()
+        self._bw_min_combo.addItem("Any")
+        for bw in [0.5, 1, 5, 10, 12.5, 25, 50, 100]:
+            self._bw_min_combo.addItem(f"{bw}", bw * 1000)
+        self._bw_min_combo.currentIndexChanged.connect(self._apply_all_filters)
+        bw_row.addWidget(self._bw_min_combo)
+        
+        bw_row.addWidget(QLabel("Max:"))
+        self._bw_max_combo = QComboBox()
+        self._bw_max_combo.addItem("Any")
+        for bw in [1, 5, 10, 12.5, 25, 50, 100, 200, 500, 1000]:
+            self._bw_max_combo.addItem(f"{bw}", bw * 1000)
+        self._bw_max_combo.setCurrentIndex(self._bw_max_combo.count() - 1)  # Default to max
+        self._bw_max_combo.currentIndexChanged.connect(self._apply_all_filters)
+        bw_row.addWidget(self._bw_max_combo)
+        
+        bw_row.addStretch()
+        layout.addLayout(bw_row)
+
+        # Reset filters button
+        reset_btn = QPushButton("Reset Filters")
+        reset_btn.setMaximumWidth(120)
+        reset_btn.clicked.connect(self._reset_filters)
+        layout.addWidget(reset_btn)
+
+        panel.setStyleSheet("""
+            QWidget { background-color: #252525; }
+            QCheckBox { color: #cccccc; }
+            QComboBox { background-color: #1a1a1a; color: #ffffff;
+                        border: 1px solid #404040; border-radius: 2px; padding: 2px; }
+        """)
+
+        return panel
+
+    def _on_filter_toggle(self, checked: bool):
+        self._filter_panel.setVisible(checked)
+        self._filter_toggle.setArrowType(Qt.DownArrow if checked else Qt.RightArrow)
+
+    def _apply_all_filters(self):
+        """Apply all active filters to search results."""
+        # Get keyword search
+        keyword = self._search_edit.text().strip()
+        
+        # Get selected filters
+        mods = [m for m, cb in self._mod_checks.items() if cb.isChecked()]
+        modes = [m for m, cb in self._mode_checks.items() if cb.isChecked()]
+        locs = [l for l, cb in self._loc_checks.items() if cb.isChecked()]
+        cats = [c for c, cb in self._cat_checks.items() if cb.isChecked()]
+        
+        bw_min = None
+        if self._bw_min_combo.currentIndex() > 0:
+            bw_min = self._bw_min_combo.currentData()
+        
+        bw_max = None
+        if self._bw_max_combo.currentIndex() > 0:
+            bw_max = self._bw_max_combo.currentData()
+
+        self.panel._result_tabs.clear()
+        if self.panel._db_conn is None:
+            return
+
+        # If keyword search, use keyword method; else use filter search
+        if keyword:
+            self.panel.search_keywords(keyword)
+        elif mods or modes or locs or cats or bw_min is not None or bw_max is not None:
+            sig_ids = self.panel.search_with_filters(
+                modulations=mods,
+                modes=modes,
+                locations=locs,
+                categories=cats,
+                bandwidth_min_hz=bw_min,
+                bandwidth_max_hz=bw_max,
+            )
+            
+            if not sig_ids:
+                self.panel._status_label.setText("No signals match the selected filters")
+                return
+
+            self.panel._status_label.setText(f"{len(sig_ids)} signal(s) match filters")
+            for sig_id in sig_ids:
+                result = self.panel._build_signal_tab(sig_id)
+                if result is not None:
+                    tab_name, widget = result
+                    self.panel._result_tabs.addTab(widget, tab_name[:18])
+        else:
+            # No filters active, show frequency-based results
+            self.panel._do_search()
+
+    def _reset_filters(self):
+        """Clear all filter selections."""
+        for cb in self._mod_checks.values():
+            cb.setChecked(False)
+        for cb in self._mode_checks.values():
+            cb.setChecked(False)
+        for cb in self._loc_checks.values():
+            cb.setChecked(False)
+        for cb in self._cat_checks.values():
+            cb.setChecked(False)
+        self._bw_min_combo.setCurrentIndex(0)
+        self._bw_max_combo.setCurrentIndex(0)
+        self._search_edit.clear()
+        self.panel._do_search()
