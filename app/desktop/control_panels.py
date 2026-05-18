@@ -57,7 +57,7 @@ class AcceptCommaDoubleSpinBox(QDoubleSpinBox):
 # Use our subclass throughout this module wherever QDoubleSpinBox is used.
 QDoubleSpinBox = AcceptCommaDoubleSpinBox
 
-DECODER_NAMES = ['POCSAG', 'ADSB', 'TETRA', 'ACARS'] + list(MODULATION_DECODER_NAMES)
+DECODER_NAMES = ['POCSAG', 'ADSB', 'TETRA', 'ACARS', 'DMR'] + list(MODULATION_DECODER_NAMES)
 
 _BOOKMARK_FILE = 'bookmarks.json'
 
@@ -1086,7 +1086,8 @@ class ControlPanel(QWidget):
         self._initUI()
 
     def _initUI(self):
-        # Make the control panel scrollable to give a less compact interface
+        from .signal_id_panel import SignalIDPanel
+
         outer_layout = QVBoxLayout()
         outer_layout.setContentsMargins(4, 4, 4, 4)
         outer_layout.setSpacing(4)
@@ -1100,20 +1101,23 @@ class ControlPanel(QWidget):
         content_layout.setSpacing(8)
 
         self.device_panel = DevicePanel()
-
         self.vfo_tab = VFOTabPanel()
-
         self.bookmark_panel = BookmarkPanel(
             get_vfo_snapshot=self.vfo_tab.get_active_vfo_snapshot
         )
+        self.signal_id_panel = SignalIDPanel()
 
-        device_group = CollapsibleSection("Device", self.device_panel)
-        vfo_group = CollapsibleSection("VFOs", self.vfo_tab)
+        device_group   = CollapsibleSection("Device",    self.device_panel)
+        vfo_group      = CollapsibleSection("VFOs",      self.vfo_tab)
         bookmark_group = CollapsibleSection("Bookmarks", self.bookmark_panel)
+        signal_id_group = CollapsibleSection(
+            "Signal ID", self.signal_id_panel, expanded=False
+        )
 
-        content_layout.addWidget(device_group, stretch=0)
-        content_layout.addWidget(vfo_group, stretch=0)
-        content_layout.addWidget(bookmark_group, stretch=0)
+        content_layout.addWidget(device_group,    stretch=0)
+        content_layout.addWidget(vfo_group,       stretch=0)
+        content_layout.addWidget(bookmark_group,  stretch=0)
+        content_layout.addWidget(signal_id_group, stretch=0)
 
         content_layout.addStretch()
         content.setLayout(content_layout)

@@ -321,6 +321,9 @@ class DSPWorker:
             elif name == 'ACARS':
                 from app.decoders.acars import ACARSDecoder
                 return ACARSDecoder()
+            elif name == 'DMR':
+                from app.decoders.dmr import DMRDecoder
+                return DMRDecoder()
             else:
                 from app.decoders.modulation import create_modulation_decoder
                 return create_modulation_decoder(name)

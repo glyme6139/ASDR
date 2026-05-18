@@ -280,6 +280,10 @@ class ASURMainWindow(QMainWindow):
         # ---- Spectrum click → tune active VFO ----
         self.vis_panel.spectrum.frequency_clicked.connect(self._on_spectrum_clicked)
 
+        # ---- Signal ID panel — track active VFO frequency ----
+        self.ctrl_panel.vfo_tab.frequency_changed.connect(self._on_vfo_freq_for_signal_id)
+        self.ctrl_panel.vfo_tab.active_vfo_changed.connect(self._on_active_vfo_for_signal_id)
+
         self.timing_window.sample_count_changed.connect(self._on_timing_sample_count_changed)
 
     # ------------------------------------------------------------------
@@ -350,6 +354,15 @@ class ASURMainWindow(QMainWindow):
         bw = self._vfo_state.get(active_id, {}).get('bandwidth_hz', 12_500)
         self.vis_panel.update_vfo_marker(active_id, freq_hz, bw)
         self._check_vfo_ranges()
+        self.ctrl_panel.signal_id_panel.set_frequency(freq_hz)
+
+    def _on_vfo_freq_for_signal_id(self, vfo_id: int, freq_hz: float):
+        if vfo_id == self.ctrl_panel.vfo_tab.active_vfo_id():
+            self.ctrl_panel.signal_id_panel.set_frequency(freq_hz)
+
+    def _on_active_vfo_for_signal_id(self, vfo_id: int):
+        freq_hz = self._vfo_state.get(vfo_id, {}).get('freq_hz', 100e6)
+        self.ctrl_panel.signal_id_panel.set_frequency(freq_hz)
 
     def _on_signal_strength(self, updates: dict):
         for vfo_id, (db, is_active) in updates.items():
