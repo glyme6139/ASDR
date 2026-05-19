@@ -2,7 +2,8 @@
   "permissions": {
     "allow": [
       "Bash(gh repo *)",
-      "WebFetch(domain:aresvalley.github.io)"
+      "WebFetch(domain:aresvalley.github.io)",
+      "Bash(dir /s)"
     ]
   }
 }

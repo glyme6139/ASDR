@@ -358,6 +358,113 @@ def decode_bsch(raw_bits: np.ndarray, seed: int = BSCH_SEED) -> Tuple[Optional[n
     return decoded[:60], ok
 
 
+def _scramble_soft(soft: np.ndarray, seed: int) -> np.ndarray:
+    """Scramble soft bits: LFSR bit=1 → negate, bit=0 → unchanged."""
+    out = soft.copy().astype(np.float32)
+    lfsr = seed & 0xFFFFFFFF
+    for i in range(len(out)):
+        key = lfsr & _LFSR_POLY
+        key ^= key >> 16; key ^= key >> 8; key ^= key >> 4
+        key ^= key >> 2;  key ^= key >> 1
+        bit = key & 1
+        lfsr = ((lfsr >> 1) | (bit << 31)) & 0xFFFFFFFF
+        if bit:
+            out[i] = -out[i]
+    return out
+
+
+def _viterbi_soft(soft_bits: np.ndarray) -> np.ndarray:
+    """
+    Soft-decision Viterbi for rate-1/4 mother code.
+
+    soft_bits: float32 array where +value → confident 0, -value → confident 1,
+               0.0 → erasure (no contribution to branch metric).
+    Branch metric: sum of max(0, soft × (2*code_bit − 1)) per position.
+    Returns decoded info bits as uint8.
+    """
+    n_steps = len(soft_bits) // 4
+    if n_steps == 0:
+        return np.array([], dtype=np.uint8)
+    INF = 1e12
+    metric = np.full(_STATES, INF, dtype=np.float64)
+    metric[0] = 0.0
+    path = np.zeros((n_steps, _STATES), dtype=np.int32)
+    for t in range(n_steps):
+        obs = soft_bits[t * 4:(t + 1) * 4]
+        new_metric = np.full(_STATES, INF, dtype=np.float64)
+        for prev_s in range(_STATES):
+            if metric[prev_s] >= INF:
+                continue
+            for inp in range(2):
+                next_s = int(_CONV_NEXT[prev_s, inp])
+                out_bits = _CONV_OUTPUT[prev_s, inp]
+                bm = 0.0
+                for gi in range(4):
+                    s = float(obs[gi])
+                    if s != 0.0:
+                        # code_bit=0 → expect s>0; code_bit=1 → expect s<0
+                        sign = 1.0 if out_bits[gi] == 0 else -1.0
+                        bm += max(0.0, -sign * s)
+                total = metric[prev_s] + bm
+                if total < new_metric[next_s]:
+                    new_metric[next_s] = total
+                    path[t, next_s] = prev_s
+        metric = new_metric
+    decoded = np.empty(n_steps, dtype=np.uint8)
+    state = int(np.argmin(metric))
+    for t in range(n_steps - 1, -1, -1):
+        decoded[t] = (state >> (_K - 2)) & 1
+        state = int(path[t, state])
+    return decoded
+
+
+def decode_bsch_soft(phases_60: np.ndarray, seed: int = BSCH_SEED) -> Tuple[Optional[np.ndarray], bool]:
+    """
+    Soft-decision BSCH decode from 60 AFC-corrected SB1 differential phases.
+
+    Converts phases to soft LLRs, applies soft scrambling/deinterleaving/
+    depuncturing, then runs soft-decision Viterbi for ~3 dB over hard-decision.
+
+    soft_b0 = phase          (positive phase → confident bit=0)
+    soft_b1 = π/2 − |phase|  (|phase| < π/2 → confident bit=0)
+    """
+    if len(phases_60) < 60:
+        return None, False
+    ph = phases_60[:60].astype(np.float32)
+    soft = np.empty(120, dtype=np.float32)
+    soft[0::2] = ph
+    soft[1::2] = (np.pi / 2) - np.abs(ph)
+
+    soft = _scramble_soft(soft, seed)
+
+    N, a = DEINT_BSCH  # (120, 11)
+    soft_deint = np.empty(N, dtype=np.float32)
+    for i in range(1, N + 1):
+        soft_deint[i - 1] = soft[(a * i) % N]
+
+    # Depuncture: insert 0.0 (erasure) at punctured positions
+    period = len(_BSCH_PUNCT_MASK)
+    kept = int(np.sum(_BSCH_PUNCT_MASK))
+    n_p = len(soft_deint) // kept
+    dep = np.zeros(n_p * period, dtype=np.float32)
+    src = 0
+    for j in range(len(dep)):
+        if _BSCH_PUNCT_MASK[j % period]:
+            dep[j] = soft_deint[src]; src += 1
+
+    decoded = _viterbi_soft(dep)
+    if len(decoded) < 60:
+        return None, False
+    crc_val = crc16(decoded[:60])
+    ok = (crc_val == _GOOD_CRC)
+    _bsch_log.debug(
+        "BSCH soft: crc=0x%04X ok=%s bits=%s",
+        crc_val, ok,
+        ''.join(str(int(x)) for x in decoded[:44]),
+    )
+    return decoded[:60], ok
+
+
 def decode_aach(raw_bits_14: np.ndarray) -> Tuple[Optional[np.ndarray], bool]:
     """Decode AACH from 14 raw BB-field bits using Reed-Muller (30,14)."""
     # BB field is already 14 bits; RM code uses the full 30-bit codeword

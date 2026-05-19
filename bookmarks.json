@@ -55,6 +55,15 @@
       "decoders": [
         "TETRA"
       ]
+    },
+    {
+      "name": "Unknown beacon",
+      "frequency": 444601165.0,
+      "demod_mode": "NFM",
+      "bandwidth": 6000.0,
+      "squelch_level": 60.0,
+      "volume": 0.03,
+      "decoders": []
     }
   ]
 }

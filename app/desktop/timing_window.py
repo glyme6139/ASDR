@@ -41,6 +41,17 @@ class TimingWindow(QMainWindow):
         title.setStyleSheet("font-weight: 600;")
         header.addWidget(title)
         header.addStretch()
+
+        self.dsp_health_label = QLabel("DSP: waiting for timing data")
+        self.dsp_health_label.setStyleSheet("color: #aaaaaa; font-weight: 600;")
+        header.addWidget(self.dsp_health_label)
+        header.addSpacing(12)
+
+        self.signal_id_label = QLabel("Signal ID: idle")
+        self.signal_id_label.setStyleSheet("color: #aaaaaa; font-weight: 600;")
+        header.addWidget(self.signal_id_label)
+        header.addSpacing(12)
+
         samples_label = QLabel("Samples:")
         header.addWidget(samples_label)
         self.samples_spin = QSpinBox()
@@ -74,11 +85,22 @@ class TimingWindow(QMainWindow):
         self.clear_btn.clicked.connect(self.clear_reports)
         self.report_received.connect(self.add_report)
 
+        self._reports: dict[tuple[str, str], dict] = {}
+        self._dsp_sample_rate_hz: float | None = None
+        self._dsp_block_size: int = 4096
+
         self.setCentralWidget(content)
         self.resize(900, 420)
 
     def clear_reports(self):
         self.table.setRowCount(0)
+        self._reports.clear()
+        self._refresh_summary()
+
+    def set_dsp_context(self, sample_rate: float | None = None, block_size: int = 4096):
+        self._dsp_sample_rate_hz = sample_rate
+        self._dsp_block_size = int(block_size)
+        self._refresh_summary()
 
     def add_report(self, report: object):
         if not isinstance(report, dict):
@@ -112,6 +134,8 @@ class TimingWindow(QMainWindow):
             self.table.setItem(row, col, item)
 
         self.table.setSortingEnabled(True)
+        self._reports[(source, stage)] = report
+        self._refresh_summary()
 
     def _find_row(self, source: str, stage: str) -> int | None:
         for item in self.table.findItems(source, Qt.MatchExactly):
@@ -138,6 +162,45 @@ class TimingWindow(QMainWindow):
     def closeEvent(self, event):
         event.ignore()
         self.hide()
+
+    def _refresh_summary(self):
+        dsp_report = self._reports.get(("DSP", "DSP / block total"))
+        if dsp_report and self._dsp_sample_rate_hz:
+            budget_ms = (self._dsp_block_size / float(self._dsp_sample_rate_hz)) * 1000.0
+            mean_ms = float(dsp_report.get("mean_ms", 0.0))
+            headroom_ms = budget_ms - mean_ms
+            if headroom_ms >= 0:
+                self.dsp_health_label.setText(
+                    f"DSP: OK {mean_ms:.2f} / {budget_ms:.2f} ms ({headroom_ms:.2f} ms headroom)"
+                )
+                self.dsp_health_label.setStyleSheet("color: #00cc44; font-weight: 600;")
+            else:
+                self.dsp_health_label.setText(
+                    f"DSP: OVER {mean_ms:.2f} / {budget_ms:.2f} ms ({-headroom_ms:.2f} ms slow)"
+                )
+                self.dsp_health_label.setStyleSheet("color: #cc2222; font-weight: 600;")
+        else:
+            self.dsp_health_label.setText("DSP: waiting for timing data")
+            self.dsp_health_label.setStyleSheet("color: #aaaaaa; font-weight: 600;")
+
+        sig_report = None
+        for key in (
+            ("UI / Signal ID", "Signal ID / frequency search"),
+            ("UI / Signal ID", "Signal ID / filter search"),
+            ("UI / Signal ID", "Signal ID / keyword search"),
+            ("UI / Signal ID", "Signal ID / load database"),
+        ):
+            sig_report = self._reports.get(key)
+            if sig_report:
+                break
+        if sig_report:
+            self.signal_id_label.setText(
+                f"Signal ID: {float(sig_report.get('mean_ms', 0.0)):.2f} ms avg"
+            )
+            self.signal_id_label.setStyleSheet("color: #7dd3fc; font-weight: 600;")
+        else:
+            self.signal_id_label.setText("Signal ID: idle")
+            self.signal_id_label.setStyleSheet("color: #aaaaaa; font-weight: 600;")
 
     @staticmethod
     def _format_timestamp(timestamp: float) -> str:

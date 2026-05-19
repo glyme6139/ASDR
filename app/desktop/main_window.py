@@ -125,6 +125,10 @@ class ASURMainWindow(QMainWindow):
 
         self.ctrl_panel = ControlPanel()
         top_layout.addWidget(self.ctrl_panel, stretch=1)
+        try:
+            self.ctrl_panel.signal_id_panel.set_timing_report_handler(self._handle_timing_report)
+        except Exception:
+            pass
 
         top_widget.setLayout(top_layout)
 
@@ -383,6 +387,10 @@ class ASURMainWindow(QMainWindow):
         self.dsp.set_sample_rate(sample_rate)
         self.vis_panel.set_freq_range(self._center_hz, sample_rate)
         self._check_vfo_ranges()
+        try:
+            self.timing_window.set_dsp_context(sample_rate=sample_rate)
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # VFO range enforcement
@@ -468,6 +476,10 @@ class ASURMainWindow(QMainWindow):
             if 'frequency' in status or 'sample_rate' in status:
                 self.vis_panel.set_freq_range(center, sr)
                 self._check_vfo_ranges()
+                try:
+                    self.timing_window.set_dsp_context(sample_rate=sr)
+                except Exception:
+                    pass
 
     def _on_error(self, error_msg: str):
         logger.error(f"DSP Error: {error_msg}")

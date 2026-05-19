@@ -21,7 +21,7 @@ from .network_time import NetworkTime
 from .lower_mac import (
     BSCH_SEED, scramble_seed, scramble,
     deinterleave, DEINT_BSCH, DEINT_TCH,
-    decode_bsch, decode_aach, decode_bkn,
+    decode_bsch, decode_bsch_soft, decode_bkn,
     rm_decode, check_crc,
 )
 from .mac import (
@@ -39,12 +39,13 @@ _TETRA_BW        = 25_000   # TETRA channel bandwidth in Hz
 _TAIL_LEN        = 24    # IQ samples kept between chunks (~2 symbol periods)
 
 # NDB burst field layout (chips = dibits = 2 bits each after DQPSK)
-# ETSI EN 300 392-2 Table 9.33
+# ETSI EN 300 392-2 Table 9.33 (0-indexed, 2 bits per symbol)
+# [0:2] tail | [2:218] B1 | [218:240] training(22) | [240:256] BB | [256:472] B2 | [472:474] tail | [474:510] guard
 _NDB_CHIPS  = 510
 _NDB_B1_S   = 2;   _NDB_B1_E   = 218   # 216 bits
-_NDB_SW_OFF = 218; _NDB_SW_LEN = 38
-_NDB_BB_OFF = 256; _NDB_BB_LEN = 14
-_NDB_B2_S   = 270; _NDB_B2_E   = 486   # 216 bits
+_NDB_TRAIN_OFF = 218                    # training sequence starts at bit 218
+_NDB_BB_OFF = 240; _NDB_BB_LEN = 16    # stolen channel (BB/AACH) = 16 bits
+_NDB_B2_S   = 256; _NDB_B2_E   = 472   # 216 bits
 
 # SB burst field offsets (from actual burst start — ETSI EN 300 392-2 Table 9.34)
 # tail(2)+SB1(120)+SW(38)+BBK(30)+SB2(216)+tail(2)+FS2(102)=510
@@ -53,7 +54,7 @@ _SB_BBK_OFF = 160; _SB_BBK_LEN = 30    # 30 bits — AACH broadcast block
 _SB_BLK2_S  = 190; _SB_BLK2_E  = 406  # 216 bits — BNCH/SYSINFO
 
 _SYNC_MAX_ERRORS = 3   # Y-word is 38 bits — at good SNR expect ≤2 errors
-_NDB_MAX_ERRORS  = 3   # NDB training is 22 bits — stricter threshold
+_NDB_MAX_ERRORS  = 2   # NDB training is 22 bits — 2 errors = 9% BER ceiling
 
 # Training sequences (22 chips each)
 _N_BITS = np.array([1,1,0,1, 0,0,0,0, 1,1,1,0, 1,0,0,1, 1,1,0,1, 0,0], dtype=np.int8)
@@ -65,8 +66,7 @@ _X_BITS = np.array([1,0,0,1, 1,1,0,1, 0,0,0,0, 1,1,1,0, 1,0,0,1, 1,1,
 _Y_BITS = np.array([1,1,0,1,0,1,1,1, 1,0,1,0,0,0,1,0,
                     0,0,1,0,1,0,1,1, 1,0,1,1,0,0,1,1,
                     0,0,0,0,0,1], dtype=np.int8)
-_SYNC_TRAIN_OFF = 122   # SW at offset 122 from actual SB burst start
-_NDB_TRAIN_OFF  = 244
+_SYNC_TRAIN_OFF = 122   # SW at offset 122 from actual SB burst start (symbol 61)
 
 # Expected differential phase for each of the 19 SW symbols.
 # Derived from the 19 dibits of _Y_BITS using TETRA π/4-DQPSK mapping:
@@ -363,6 +363,7 @@ class TETRADecoder(BaseDecoder):
             sb1 = burst[_SB_BLK1_S:_SB_BLK1_E]  # 120 bits
 
             # AFC: estimate per-symbol phase bias from Y sync word, re-decode SB1
+            bsch, crc_ok = None, False
             if phases is not None:
                 y_s = _SYNC_TRAIN_OFF // 2          # symbol 61
                 y_e = y_s + len(_Y_EXPECTED_PHASES) # symbol 80
@@ -370,14 +371,12 @@ class TETRADecoder(BaseDecoder):
                 sb1_e = _SB_BLK1_E // 2             # symbol 61
                 if y_e <= len(phases) and (sb1_e - sb1_s) == 60:
                     theta = _afc_estimate(phases[y_s:y_e])
-                    # Wrapped subtraction keeps corrected in [-π, π]
                     corrected = np.angle(
                         np.exp(1j * (phases[sb1_s:sb1_e].astype(np.float64) - theta))
                     ).astype(np.float32)
 
                     b0_tmp = (corrected < 0).astype(np.int8)
                     b1_tmp = (np.abs(corrected) > (np.pi / 2)).astype(np.int8)
-                    # Distance from nearest constellation point (0 = perfect)
                     expected_phase = ((1 - 2 * b0_tmp.astype(np.float32)) *
                                       (np.pi / 4 + b1_tmp.astype(np.float32) * np.pi / 2))
                     phase_err = np.angle(
@@ -398,7 +397,12 @@ class TETRADecoder(BaseDecoder):
                     sb1[0::2] = b0
                     sb1[1::2] = b1
 
-            bsch, crc_ok = decode_bsch(sb1, self._scramble_seed)
+                    # Soft-decision decode using AFC-corrected phases (~3 dB gain over hard)
+                    bsch, crc_ok = decode_bsch_soft(corrected, self._scramble_seed)
+
+            # Fall back to hard-decision if soft unavailable or failed
+            if not crc_ok:
+                bsch, crc_ok = decode_bsch(sb1, self._scramble_seed)
             if crc_ok and bsch is not None:
                 self._net.update_from_bsch(bsch)
                 self._scramble_seed = scramble_seed(
@@ -657,7 +661,7 @@ def _bits_from_phases(phases: np.ndarray, k: int) -> np.ndarray:
 
 # ── Soft sync-word correlator ─────────────────────────────────────────────────
 
-_SOFT_THRESHOLD  = 12.0   # minimum |Σ exp(j·Δφ)| over 19 Y symbols (max=19)
+_SOFT_THRESHOLD  = 10.0   # minimum |Σ exp(j·Δφ)| over 19 Y symbols (max=19; noise≈4.4)
 _SOFT_DF_STEP    = 300    # Hz — residual carrier offset search step
 _SOFT_DF_MAX     = 18000  # Hz — ±range; covers full 4th-power error (±sr/8 ≈ ±9.3 kHz)
 _MAX_PHASE_BUF   = 1500   # symbols — hard cap to bound soft-correlator cost

@@ -143,3 +143,4 @@ logs/
 .env
 config/local_settings.py
 ARTEMIS/
+.claude/

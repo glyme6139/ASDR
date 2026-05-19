@@ -3,19 +3,19 @@
     "center_freq": 444500000.0,
     "sample_rate": 1000000,
     "lna": 40,
-    "vga": 34,
+    "vga": 36,
     "amp_enabled": true,
     "autosave": true
   },
   "vfos": [
     {
-      "name": "VFO 2",
-      "frequency": 444601161.0,
+      "name": "Unknown beac",
+      "frequency": 444601165.0,
       "demod_mode": "NFM",
       "bandwidth": 6000.0,
-      "volume": 0.38,
-      "squelch_level": -120.0,
-      "squelch_enabled": false,
+      "volume": 0.03,
+      "squelch_level": -24.0,
+      "squelch_enabled": true,
       "enabled": true,
       "decoders": []
     }
