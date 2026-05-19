@@ -24,6 +24,8 @@ class IPCAdapterThread(QThread):
     error_occurred        = Signal(str)
     signal_strength       = Signal(object)          # dict — same reason
     timing_report         = Signal(object)
+    vfo_bandwidth_update  = Signal(int, float)      # vfo_id, bandwidth_hz
+    eye_samples           = Signal(int, object)     # vfo_id, list[float]
 
     def __init__(self, result_queue, parent=None, profiler: TimingProfiler | None = None):
         super().__init__(parent)
@@ -41,6 +43,7 @@ class IPCAdapterThread(QThread):
                     if   t == 'device_status':
                         self.device_status_changed.emit(msg['data'])
                     elif t == 'decoder_result':
+                        print(msg)
                         self.decoder_result.emit(msg['vfo_id'], msg['name'], msg['text'])
                         if msg.get('data'):
                             self.decoder_data.emit(msg['vfo_id'], msg['name'], msg['data'])
@@ -50,6 +53,10 @@ class IPCAdapterThread(QThread):
                         self.signal_strength.emit(msg['updates'])
                     elif t == 'timing_report':
                         self.timing_report.emit(msg['data'])
+                    elif t == 'vfo_bandwidth_update':
+                        self.vfo_bandwidth_update.emit(msg['vfo_id'], msg['bandwidth_hz'])
+                    elif t == 'eye_samples':
+                        self.eye_samples.emit(msg['vfo_id'], msg['samples'])
             except queue.Empty:
                 pass
             except Exception as e:

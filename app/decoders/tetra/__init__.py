@@ -138,6 +138,7 @@ class TETRADecoder(BaseDecoder):
         self._scramble_seed: int = BSCH_SEED
         self._net_synced:    bool = False
         self._soft_last_log: float = 0.0
+        self._last_sr:       float = 0.0
 
     # ── BaseDecoder ──────────────────────────────────────────────────────────
 
@@ -147,7 +148,20 @@ class TETRADecoder(BaseDecoder):
         if not np.iscomplexobj(data):
             return None
 
-        sr = float(max(self.sample_rate, _MIN_SAMPLE_RATE))
+        sr = float(self.sample_rate)
+        if sr < 12_000:
+            logger.warning("TETRA: sample rate %.0f Hz too low (need ≥12 kHz)", sr)
+            return None
+
+        if abs(sr - self._last_sr) > 100 and self._last_sr > 0:
+            self._bits   = np.zeros(0, dtype=np.int8)
+            self._phases = np.zeros(0, dtype=np.float32)
+            self._tail   = None
+            logger.info("TETRA: sample rate changed %.0f→%.0f Hz, clearing buffers", self._last_sr, sr)
+        self._last_sr = sr
+
+        # Remove DC (HackRF LO leakthrough) before filtering
+        data = data - np.mean(data)
 
         # Narrow to TETRA channel bandwidth: 200 kHz → 25 kHz cuts 9 dB of excess noise
         data, sr = _narrowband_filter(data, sr)
@@ -346,7 +360,7 @@ class TETRADecoder(BaseDecoder):
         now = time.time()
         if hasattr(self, '_last_burst_time'):
             interval_ms = (now - self._last_burst_time) * 1000
-            logger.info("TETRA burst interval: %.0f ms (real SB≈453ms, false-positive=random)", interval_ms)
+            # logger.info("TETRA burst interval: %.0f ms (real SB≈453ms, false-positive=random)", interval_ms)
         self._last_burst_time = now
         self._burst_n += 1
         is_sync = (kind == 'SYNC')
@@ -661,7 +675,8 @@ def _bits_from_phases(phases: np.ndarray, k: int) -> np.ndarray:
 
 # ── Soft sync-word correlator ─────────────────────────────────────────────────
 
-_SOFT_THRESHOLD  = 10.0   # minimum |Σ exp(j·Δφ)| over 19 Y symbols (max=19; noise≈4.4)
+_SOFT_THRESHOLD  = 15.5   # minimum |Σ exp(j·Δφ)| over 19 Y symbols (max=19); noise max ≈14.8 for 102K tests
+                          # noise max ≈13–14 over 2500 effective tests; real signal ≈17
 _SOFT_DF_STEP    = 300    # Hz — residual carrier offset search step
 _SOFT_DF_MAX     = 18000  # Hz — ±range; covers full 4th-power error (±sr/8 ≈ ±9.3 kHz)
 _MAX_PHASE_BUF   = 1500   # symbols — hard cap to bound soft-correlator cost

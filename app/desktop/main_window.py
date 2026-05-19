@@ -22,6 +22,7 @@ from .visualizations import VisualizationPanel, VFO_COLORS
 from .control_panels import ControlPanel
 from .dsp_process import DSPProcess
 from .ipc_adapter import IPCAdapterThread
+from .eye_diagram_window import EyeDiagramWindow
 from .timing import TimingConfig, profiler_from_config
 from .timing_window import TimingWindow
 
@@ -55,6 +56,7 @@ class ASURMainWindow(QMainWindow):
         self._sample_rate = DEFAULT_SAMPLE_RATE
 
         self.timing_window = TimingWindow()
+        self.eye_window = EyeDiagramWindow(self)
 
         self.dsp = DSPProcess(timing=self._timing)
         self.ipc = IPCAdapterThread(self.dsp.result_queue, profiler=self._profiler)
@@ -75,6 +77,7 @@ class ASURMainWindow(QMainWindow):
         # so bootstrap any pre-existing tabs now.
         for vfo_id in sorted(self.ctrl_panel.vfo_tab._tabs.keys()):
             self._on_vfo_added(vfo_id)
+        self._sync_eye_vfo_choices()
 
         self.dsp.start()
         self.ipc.start()
@@ -177,6 +180,8 @@ class ASURMainWindow(QMainWindow):
             view_menu = menubar.addMenu("View")
             self._timing_action = view_menu.addAction("Performance Timing")
             self._timing_action.triggered.connect(self._show_timing_window)
+            self._eye_action = view_menu.addAction("Eye Diagram")
+            self._eye_action.triggered.connect(self._show_eye_window)
         except Exception:
             pass
 
@@ -231,6 +236,8 @@ class ASURMainWindow(QMainWindow):
         self.ipc.decoder_data.connect(self._on_decoder_data, Q)
         self.ipc.signal_strength.connect(self._on_signal_strength, Q)
         self.ipc.timing_report.connect(self._handle_timing_report, Q)
+        self.ipc.vfo_bandwidth_update.connect(self._on_vfo_bandwidth_update, Q)
+        self.ipc.eye_samples.connect(self._on_eye_samples, Q)
 
         # ---- VFO tab lifecycle ----
         self.ctrl_panel.vfo_tab.vfo_added.connect(self._on_vfo_added)
@@ -287,8 +294,11 @@ class ASURMainWindow(QMainWindow):
         # ---- Signal ID panel — track active VFO frequency ----
         self.ctrl_panel.vfo_tab.frequency_changed.connect(self._on_vfo_freq_for_signal_id)
         self.ctrl_panel.vfo_tab.active_vfo_changed.connect(self._on_active_vfo_for_signal_id)
+        self.ctrl_panel.vfo_tab.active_vfo_changed.connect(self._on_active_vfo_changed)
 
         self.timing_window.sample_count_changed.connect(self._on_timing_sample_count_changed)
+        self.eye_window.visibility_changed.connect(self._on_eye_window_visibility_changed)
+        self.eye_window.vfo_changed.connect(self._on_eye_window_vfo_changed)
 
     # ------------------------------------------------------------------
     # VFO lifecycle
@@ -308,6 +318,7 @@ class ASURMainWindow(QMainWindow):
         self.ctrl_panel.vfo_tab.set_vfo_color(vfo_id, color)
         self.dsp.add_vfo(vfo_id, freq)
         self._check_vfo_ranges()
+        self._sync_eye_vfo_choices()
 
     def _on_vfo_removed(self, vfo_id: int):
         self._vfo_state.pop(vfo_id, None)
@@ -317,6 +328,7 @@ class ASURMainWindow(QMainWindow):
             if key[0] == vfo_id:
                 win = self._decoder_windows.pop(key)
                 win.close()
+        self._sync_eye_vfo_choices()
 
     # ------------------------------------------------------------------
     # VFO control handlers
@@ -336,6 +348,14 @@ class ASURMainWindow(QMainWindow):
             self._vfo_state[vfo_id]['bandwidth_hz'] = bandwidth_hz
             freq_hz = self._vfo_state[vfo_id]['freq_hz']
             self.vis_panel.update_vfo_marker(vfo_id, freq_hz, bandwidth_hz)
+
+    def _on_vfo_bandwidth_update(self, vfo_id: int, bandwidth_hz: float):
+        """Handle backend-initiated bandwidth change (e.g. TETRA auto-set)."""
+        if vfo_id in self._vfo_state:
+            self._vfo_state[vfo_id]['bandwidth_hz'] = bandwidth_hz
+            freq_hz = self._vfo_state[vfo_id]['freq_hz']
+            self.vis_panel.update_vfo_marker(vfo_id, freq_hz, bandwidth_hz)
+        self.ctrl_panel.vfo_tab.set_vfo_bandwidth(vfo_id, bandwidth_hz)
 
     def _on_vfo_renamed(self, vfo_id: int, name: str):
         """Handle user-initiated VFO rename: update visual labels and state."""
@@ -367,6 +387,10 @@ class ASURMainWindow(QMainWindow):
     def _on_active_vfo_for_signal_id(self, vfo_id: int):
         freq_hz = self._vfo_state.get(vfo_id, {}).get('freq_hz', 100e6)
         self.ctrl_panel.signal_id_panel.set_frequency(freq_hz)
+
+    def _on_active_vfo_changed(self, vfo_id: int):
+        if self.eye_window.isVisible() and self.eye_window._current_vfo is None:
+            self.eye_window.set_active_vfo(vfo_id)
 
     def _on_signal_strength(self, updates: dict):
         for vfo_id, (db, is_active) in updates.items():
@@ -440,11 +464,11 @@ class ASURMainWindow(QMainWindow):
 
     def _on_decoder_result(self, vfo_id: int, decoder_name: str, text: str):
         with self._profiler.measure("UI / decoder result"):
-            self.ctrl_panel.vfo_tab.add_decoder_output(vfo_id, decoder_name, text)
+            self.ctrl_panel.vfo_tab.add_decoder_output(vfo_id, self._vfo_state[vfo_id]['name'], text)
             try:
                 if self.decoder_panel is not None:
                     vfo_color = VFO_COLORS[vfo_id % len(VFO_COLORS)]
-                    self.decoder_panel.append(vfo_id, decoder_name, text, vfo_color)
+                    self.decoder_panel.append(vfo_id, self._vfo_state[vfo_id]['name'], text, vfo_color)
             except Exception:
                 logger.exception("Failed to append to global decoder panel")
 
@@ -485,6 +509,16 @@ class ASURMainWindow(QMainWindow):
         logger.error(f"DSP Error: {error_msg}")
         self.status_label.setText(f"Error: {error_msg}")
 
+    def _on_eye_samples(self, vfo_id: int, samples):
+        if self.eye_window.isVisible():
+            self.eye_window.push_samples(vfo_id, samples)
+
+    def _on_eye_window_vfo_changed(self, vfo_id: object):
+        if vfo_id is None:
+            self.dsp.set_eye_stream(False, None)
+            return
+        self.dsp.set_eye_stream(self.eye_window.isVisible(), int(vfo_id))
+
     def _on_timing_sample_count_changed(self, n: int):
         self._profiler.set_sample_count(n)
         self.vis_panel._profiler.set_sample_count(n)
@@ -500,6 +534,33 @@ class ASURMainWindow(QMainWindow):
         self.timing_window.show()
         self.timing_window.raise_()
         self.timing_window.activateWindow()
+
+    def _show_eye_window(self):
+        self._sync_eye_vfo_choices()
+        self.eye_window.show()
+        self.eye_window.raise_()
+        self.eye_window.activateWindow()
+
+    def _on_eye_window_visibility_changed(self, visible: bool):
+        if visible:
+            if self.eye_window._current_vfo is None:
+                vfo_id = self.ctrl_panel.vfo_tab.active_vfo_id()
+                if vfo_id is not None:
+                    self.eye_window.set_active_vfo(vfo_id)
+                    return
+            self.dsp.set_eye_stream(True, self.eye_window._current_vfo)
+            return
+        self.dsp.set_eye_stream(False, None)
+
+    def _sync_eye_vfo_choices(self):
+        choices = []
+        for vfo_id in sorted(self._vfo_state.keys()):
+            name = self._vfo_state.get(vfo_id, {}).get('name', f'VFO {vfo_id + 1}')
+            bw = self._vfo_state.get(vfo_id, {}).get('bandwidth_hz', 12_500.0)
+            freq = self._vfo_state.get(vfo_id, {}).get('freq_hz', self._center_hz)
+            label = f"{name}  |  {freq/1e6:.3f} MHz  |  {bw/1e3:.1f} kHz"
+            choices.append((vfo_id, label))
+        self.eye_window.set_vfo_choices(choices, active_vfo_id=self.ctrl_panel.vfo_tab.active_vfo_id())
 
     # ------------------------------------------------------------------
     # Shutdown
@@ -528,6 +589,7 @@ class ASURMainWindow(QMainWindow):
         for win in self._decoder_windows.values():
             win.close()
         self._decoder_windows.clear()
+        self.eye_window.close()
 
         self.ipc.stop()
         self.dsp.stop()
@@ -612,9 +674,6 @@ class ASURMainWindow(QMainWindow):
         QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QTextEdit {
             background-color: #252525;
             color: #ffffff;
-            border: 1px solid #404040;
-            border-radius: 3px;
-            padding: 3px;
         }
         QListWidget {
             background-color: #252525;

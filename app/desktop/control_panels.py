@@ -633,6 +633,15 @@ class VFOTabPanel(QWidget):
             item = tab.decoder_list.item(i)
             item.setCheckState(Qt.CheckState.Checked if item.text() in decoder_names else Qt.CheckState.Unchecked)
 
+    def set_vfo_bandwidth(self, vfo_id: int, bandwidth_hz: float):
+        """Update the bandwidth spinbox without re-emitting bandwidth_changed."""
+        tab = self._tabs.get(vfo_id)
+        if tab is None:
+            return
+        tab.bw_spin.blockSignals(True)
+        tab.bw_spin.setValue(bandwidth_hz / 1e3)
+        tab.bw_spin.blockSignals(False)
+
     def set_vfo_out_of_range(self, vfo_id: int, out_of_range: bool):
         """Gray the tab label and disable only decoding when the VFO is outside the SDR bandwidth."""
         tab = self._tabs.get(vfo_id)

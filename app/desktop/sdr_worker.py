@@ -91,6 +91,9 @@ class DSPWorker:
         self._wf_floor    = None
 
         self._last_sig_t  = 0.0
+        self._eye_enabled = False
+        self._eye_vfo_id = None
+        self._last_eye_t = 0.0
 
     # ------------------------------------------------------------------
     # Entry point
@@ -243,6 +246,10 @@ class DSPWorker:
             self._do_toggle_decoder(msg['vfo_id'], msg['decoder_name'], msg['enabled'])
         elif cmd == 'set_timing_sample_count':
             self._profiler.set_sample_count(msg['n'])
+        elif cmd == 'set_eye_stream':
+            self._eye_enabled = bool(msg.get('enabled', False))
+            vfo_id = msg.get('vfo_id')
+            self._eye_vfo_id = int(vfo_id) if vfo_id is not None else None
 
     # ------------------------------------------------------------------
     # Hardware commands
@@ -290,6 +297,8 @@ class DSPWorker:
             except Exception as e:
                 logger.error(f"Amp enable: {e}")
 
+    _TETRA_MIN_BW = 50_000  # Hz — TETRA needs ≥2× the 18 kbaud symbol rate
+
     def _do_toggle_decoder(self, vfo_id: int, decoder_name: str, enabled: bool):
         vfo = self.vfo_manager.get_vfo(vfo_id)
         if vfo is None:
@@ -298,6 +307,18 @@ class DSPWorker:
             dec = self._make_decoder(decoder_name)
             if dec:
                 vfo.add_decoder(dec)
+            if decoder_name == 'TETRA' and vfo.settings.bandwidth < self._TETRA_MIN_BW:
+                old_bw = vfo.settings.bandwidth
+                vfo.set_bandwidth(self._TETRA_MIN_BW)
+                self._emit({
+                    'type': 'vfo_bandwidth_update',
+                    'vfo_id': vfo_id,
+                    'bandwidth_hz': self._TETRA_MIN_BW,
+                })
+                logger.info(
+                    "TETRA: auto-set VFO %d bandwidth to %.0f kHz (was %.1f kHz)",
+                    vfo_id, self._TETRA_MIN_BW / 1e3, old_bw / 1e3,
+                )
         else:
             vfo.remove_decoder(decoder_name)
 
@@ -438,9 +459,12 @@ class DSPWorker:
                                     tetra_pcm = pcm
 
                         if tetra_pcm is not None:
-                            self.audio_mixer.push_audio(vfo_id, _resample_8k_to_48k(tetra_pcm))
+                            out_audio = _resample_8k_to_48k(tetra_pcm)
+                            self.audio_mixer.push_audio(vfo_id, out_audio)
+                            self._emit_eye_samples(vfo_id, out_audio)
                         elif audio is not None and len(audio) > 0:
                             self.audio_mixer.push_audio(vfo_id, audio)
+                            self._emit_eye_samples(vfo_id, audio)
 
                         for result in dec_results:
                             formatted = str(result.data)
@@ -466,6 +490,27 @@ class DSPWorker:
                            for vfo in self.vfo_manager.get_all_vfos()}
                 if updates:
                     self._emit({'type': 'signal_strength', 'updates': updates})
+
+    def _emit_eye_samples(self, vfo_id: int, audio: np.ndarray):
+        if not self._eye_enabled:
+            return
+        if self._eye_vfo_id is not None and int(vfo_id) != int(self._eye_vfo_id):
+            return
+
+        now = time.monotonic()
+        if now - self._last_eye_t < 0.08:
+            return
+        self._last_eye_t = now
+
+        if audio is None or len(audio) == 0:
+            return
+        arr = np.asarray(audio, dtype=np.float32)
+        target_n = 512
+        if arr.size > target_n:
+            idx = np.linspace(0, arr.size - 1, target_n, dtype=np.int32)
+            arr = arr[idx]
+
+        self._emit({'type': 'eye_samples', 'vfo_id': int(vfo_id), 'samples': arr.tolist()})
 
     def _extract_vfo_iq(self, fft_shifted, vfo, sr, N, bin_hz, center_freq):
         if not vfo.settings.enabled:
