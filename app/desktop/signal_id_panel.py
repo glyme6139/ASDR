@@ -13,23 +13,25 @@ import sqlite3
 from contextlib import nullcontext
 from typing import Callable, Optional, Tuple
 
-from PySide6.QtCore import Qt, QTimer, QUrl
+from PySide6.QtCore import Qt, QPoint, QRect, QSize, QTimer, QUrl
 from PySide6.QtGui import QPixmap
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtWidgets import (
+    QButtonGroup,
     QCheckBox,
     QComboBox,
     QFileDialog,
     QGridLayout,
     QHBoxLayout,
     QLabel,
+    QLayout,
     QLineEdit,
     QMainWindow,
     QPushButton,
     QScrollArea,
     QSizePolicy,
     QSlider,
-    QTabWidget,
+    QStackedWidget,
     QTextEdit,
     QToolButton,
     QVBoxLayout,
@@ -39,6 +41,71 @@ from PySide6.QtWidgets import (
 from .timing import TimingConfig, TimingProfiler, profiler_from_config
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Flow layout — wraps child widgets left-to-right, then to the next row
+# ---------------------------------------------------------------------------
+
+class _FlowLayout(QLayout):
+    def __init__(self, parent=None, h_spacing: int = 4, v_spacing: int = 4):
+        super().__init__(parent)
+        self._h_spacing = h_spacing
+        self._v_spacing = v_spacing
+        self._items: list = []
+
+    def addItem(self, item):
+        self._items.append(item)
+
+    def count(self) -> int:
+        return len(self._items)
+
+    def itemAt(self, index: int):
+        return self._items[index] if 0 <= index < len(self._items) else None
+
+    def takeAt(self, index: int):
+        return self._items.pop(index) if 0 <= index < len(self._items) else None
+
+    def expandingDirections(self):
+        return Qt.Orientation(0)
+
+    def hasHeightForWidth(self) -> bool:
+        return True
+
+    def heightForWidth(self, width: int) -> int:
+        return self._do_layout(QRect(0, 0, width, 0), test_only=True)
+
+    def setGeometry(self, rect: QRect):
+        super().setGeometry(rect)
+        self._do_layout(rect, test_only=False)
+
+    def sizeHint(self) -> QSize:
+        return self.minimumSize()
+
+    def minimumSize(self) -> QSize:
+        size = QSize()
+        for item in self._items:
+            size = size.expandedTo(item.minimumSize())
+        m = self.contentsMargins()
+        return size + QSize(m.left() + m.right(), m.top() + m.bottom())
+
+    def _do_layout(self, rect: QRect, test_only: bool) -> int:
+        m = self.contentsMargins()
+        eff = rect.adjusted(m.left(), m.top(), -m.right(), -m.bottom())
+        x, y, row_h = eff.x(), eff.y(), 0
+        for item in self._items:
+            sz = item.sizeHint()
+            next_x = x + sz.width() + self._h_spacing
+            if next_x - self._h_spacing > eff.right() and row_h > 0:
+                x = eff.x()
+                y += row_h + self._v_spacing
+                next_x = x + sz.width() + self._h_spacing
+                row_h = 0
+            if not test_only:
+                item.setGeometry(QRect(QPoint(x, y), sz))
+            x = next_x
+            row_h = max(row_h, sz.height())
+        return y + row_h - rect.y() + m.bottom()
 
 
 # ---------------------------------------------------------------------------
@@ -417,15 +484,71 @@ class SignalIDPanel(QWidget):
         self._status_label.setStyleSheet("color: #888888; font-size: 10px;")
         layout.addWidget(self._status_label)
 
-        self._result_tabs = QTabWidget()
-        self._result_tabs.setMinimumHeight(220)
-        self._result_tabs.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        layout.addWidget(self._result_tabs)
+        # Flow button bar (wraps to new rows)
+        self._result_btn_group = QButtonGroup(self)
+        self._result_btn_group.setExclusive(True)
+        self._result_flow_widget = QWidget()
+        self._result_flow_widget.setLayout(_FlowLayout(h_spacing=4, v_spacing=4))
+        self._result_tab_bar = QScrollArea()
+        self._result_tab_bar.setWidgetResizable(True)
+        self._result_tab_bar.setWidget(self._result_flow_widget)
+        self._result_tab_bar.setMinimumHeight(30)
+        self._result_tab_bar.setMaximumHeight(120)
+        self._result_tab_bar.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._result_tab_bar.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._result_tab_bar.setStyleSheet("QScrollArea { border: none; background: transparent; }")
+        layout.addWidget(self._result_tab_bar)
+
+        # Content area
+        self._result_stack = QStackedWidget()
+        self._result_stack.setMinimumHeight(220)
+        self._result_stack.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        layout.addWidget(self._result_stack)
 
         try:
             self._load_db("ARTEMIS/data.sqlite")
         except Exception as exc:
             logger.info("Attempted to load Artemis database but failed: %s", exc)
+
+    # ------------------------------------------------------------------
+    # Result tab helpers
+    # ------------------------------------------------------------------
+
+    def _clear_results(self):
+        for btn in self._result_btn_group.buttons():
+            self._result_btn_group.removeButton(btn)
+        flow = self._result_flow_widget.layout()
+        while flow.count():
+            item = flow.takeAt(0)
+            if item and item.widget():
+                item.widget().deleteLater()
+        while self._result_stack.count():
+            w = self._result_stack.widget(0)
+            self._result_stack.removeWidget(w)
+            w.deleteLater()
+
+    def _add_result(self, widget: QWidget, name: str):
+        idx = self._result_stack.count()
+        self._result_stack.addWidget(widget)
+        btn = QPushButton(name[:22])
+        btn.setCheckable(True)
+        btn.setFixedHeight(24)
+        btn.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
+        btn.setStyleSheet("""
+            QPushButton {
+                background: #252525; color: #aaaaaa;
+                border: 1px solid #404040; border-radius: 3px;
+                padding: 2px 8px; font-size: 10px;
+            }
+            QPushButton:checked { background: #1a1a1a; color: #00ffff; border-color: #0066cc; }
+            QPushButton:hover   { background: #303030; }
+        """)
+        self._result_btn_group.addButton(btn, idx)
+        self._result_flow_widget.layout().addWidget(btn)
+        btn.toggled.connect(lambda checked, i=idx: self._result_stack.setCurrentIndex(i) if checked else None)
+        if idx == 0:
+            btn.setChecked(True)
+            self._result_stack.setCurrentIndex(0)
 
     # ------------------------------------------------------------------
     # Public API
@@ -478,7 +601,7 @@ class SignalIDPanel(QWidget):
                 return
 
             self._keyword_mode = True
-            self._result_tabs.clear()
+            self._clear_results()
             if self._db_conn is None:
                 return
 
@@ -513,7 +636,7 @@ class SignalIDPanel(QWidget):
                 result = self._build_signal_tab(sig_id)
                 if result is not None:
                     tab_name, widget = result
-                    self._result_tabs.addTab(widget, tab_name[:18])
+                    self._add_result(widget, tab_name)
 
     def search_with_filters(self, modulations: list, modes: list, locations: list,
                            categories: list, bandwidth_min_hz: Optional[float] = None,
@@ -665,7 +788,7 @@ class SignalIDPanel(QWidget):
 
     def _do_search(self):
         with self._timed("Signal ID / frequency search"):
-            self._result_tabs.clear()
+            self._clear_results()
             if self._db_conn is None:
                 return
 
@@ -693,7 +816,7 @@ class SignalIDPanel(QWidget):
                 result = self._build_signal_tab(sig_id)
                 if result is not None:
                     tab_name, widget = result
-                    self._result_tabs.addTab(widget, tab_name[:18])
+                    self._add_result(widget, tab_name)
 
     # ------------------------------------------------------------------
     # Data loading
@@ -891,11 +1014,7 @@ class SignalIDWindow(QMainWindow):
             QLineEdit, QDoubleSpinBox, QTextEdit {
                 background-color: #252525; color: #ffffff;
                 border: 1px solid #404040; border-radius: 3px; padding: 3px; }
-            QTabWidget::pane     { border: 1px solid #404040; }
-            QTabBar::tab         { background-color: #252525; color: #aaaaaa;
-                                   border: 1px solid #404040; padding: 4px 10px;
-                                   border-radius: 3px 3px 0 0; }
-            QTabBar::tab:selected { background-color: #1a1a1a; color: #00ffff; }
+
             QSlider::groove:horizontal { background: #252525; border: 1px solid #404040;
                                          height: 6px; border-radius: 3px; }
             QSlider::handle:horizontal { background: #0066cc; border: 1px solid #0052a3;
@@ -1096,7 +1215,7 @@ class SignalIDWindow(QMainWindow):
         if self._bw_max_combo.currentIndex() > 0:
             bw_max = self._bw_max_combo.currentData()
 
-        self.panel._result_tabs.clear()
+        self.panel._clear_results()
         if self.panel._db_conn is None:
             return
 
@@ -1122,7 +1241,7 @@ class SignalIDWindow(QMainWindow):
                 result = self.panel._build_signal_tab(sig_id)
                 if result is not None:
                     tab_name, widget = result
-                    self.panel._result_tabs.addTab(widget, tab_name[:18])
+                    self.panel._add_result(widget, tab_name)
         else:
             # No filters active, show frequency-based results
             self.panel._do_search()
