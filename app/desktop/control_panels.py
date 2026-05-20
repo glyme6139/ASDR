@@ -150,6 +150,7 @@ class SingleVFOTab(QWidget):
     squelch_changed = Signal(int, float)      # vfo_id, dBFS
     squelch_enabled_changed = Signal(int, bool) # vfo_id, enabled
     mute_changed = Signal(int, bool)          # vfo_id, muted
+    paused_changed = Signal(int, bool)        # vfo_id, paused
     decoder_toggled = Signal(int, str, bool)  # vfo_id, decoder_name, enabled
     open_window_requested = Signal(int, str)  # vfo_id, decoder_name
 
@@ -157,6 +158,7 @@ class SingleVFOTab(QWidget):
         super().__init__(parent)
         self.vfo_id = vfo_id
         self._muted = False
+        self._paused = False
         self._suppress_signals = False
         self._initUI()
 
@@ -228,6 +230,11 @@ class SingleVFOTab(QWidget):
         self.mute_btn.setCheckable(True)
         self.mute_btn.toggled.connect(self._on_mute_toggled)
         mute_row.addWidget(self.mute_btn)
+        self.pause_btn = QPushButton("Pause")
+        self.pause_btn.setCheckable(True)
+        self.pause_btn.setToolTip("Freeze signal capture (buffers stop updating)")
+        self.pause_btn.toggled.connect(self._on_pause_toggled)
+        mute_row.addWidget(self.pause_btn)
         mute_row.addStretch()
         audio_layout.addLayout(mute_row)
 
@@ -349,6 +356,17 @@ class SingleVFOTab(QWidget):
         self.mute_btn.setText("Unmute" if checked else "Mute")
         self.mute_changed.emit(self.vfo_id, checked)
 
+    def _on_pause_toggled(self, checked: bool):
+        self._paused = checked
+        self.pause_btn.setText("Resume" if checked else "Pause")
+        self.pause_btn.setStyleSheet(
+            "color: #f0a500; font-weight: 600;" if checked else ""
+        )
+        self.paused_changed.emit(self.vfo_id, checked)
+
+    def is_paused(self) -> bool:
+        return self._paused
+
     def _on_squelch_changed(self, value: int):
         self.squelch_label.setText(str(value))
         self.squelch_changed.emit(self.vfo_id, float(value))
@@ -400,6 +418,7 @@ class VFOTabPanel(QWidget):
     squelch_changed = Signal(int, float)
     squelch_enabled_changed = Signal(int, bool)
     mute_changed = Signal(int, bool)
+    paused_changed = Signal(int, bool)
     decoder_toggled = Signal(int, str, bool)
     open_window_requested = Signal(int, str)  # vfo_id, decoder_name
 
@@ -457,6 +476,7 @@ class VFOTabPanel(QWidget):
         tab.squelch_changed.connect(self.squelch_changed)
         tab.squelch_enabled_changed.connect(self.squelch_enabled_changed)
         tab.mute_changed.connect(self.mute_changed)
+        tab.paused_changed.connect(self.paused_changed)
         tab.decoder_toggled.connect(self.decoder_toggled)
         tab.open_window_requested.connect(self.open_window_requested)
 

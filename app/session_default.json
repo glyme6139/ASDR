@@ -4,7 +4,7 @@
     "sample_rate": 20000000,
     "lna": 24,
     "vga": 20,
-    "amp_enabled": false
+    "amp_enabled": true
   },
   "vfos": [
     {

@@ -24,6 +24,7 @@ from .control_panels import ControlPanel
 from .dsp_process import DSPProcess
 from .ipc_adapter import IPCAdapterThread
 from .eye_diagram_window import EyeDiagramWindow
+from .oscilloscope_window import OscilloscopeWindow
 from .timing import TimingConfig, profiler_from_config
 from .timing_window import TimingWindow
 
@@ -51,6 +52,7 @@ class ASURMainWindow(QMainWindow):
         # Shadow state: tracks per-VFO freq/bandwidth in the UI process
         # so spectrum markers can be updated without round-tripping the DSP process.
         self._vfo_state: dict = {}   # {vfo_id: {'freq_hz': float, 'bandwidth_hz': float}}
+        self._paused_vfos: set = set()  # VFO IDs whose capture is frozen
         # Optional decoder visualization windows: (vfo_id, decoder_name) → window
         self._decoder_windows: dict = {}
         self._center_hz   = DEFAULT_CENTER_HZ
@@ -62,6 +64,7 @@ class ASURMainWindow(QMainWindow):
 
         self.timing_window = TimingWindow()
         self.eye_window = EyeDiagramWindow(self)
+        self.osc_window = OscilloscopeWindow(self)
 
         self.dsp = DSPProcess(timing=self._timing)
         self.ipc = IPCAdapterThread(self.dsp.result_queue, profiler=self._profiler)
@@ -82,7 +85,7 @@ class ASURMainWindow(QMainWindow):
         # so bootstrap any pre-existing tabs now.
         for vfo_id in sorted(self.ctrl_panel.vfo_tab._tabs.keys()):
             self._on_vfo_added(vfo_id)
-        self._sync_eye_vfo_choices()
+        self._sync_vfo_choices()
 
         self.dsp.start()
         self.ipc.start()
@@ -90,25 +93,7 @@ class ASURMainWindow(QMainWindow):
         # Load session if available and apply settings
         try:
             from app import session
-            sess = session.load_session()
-            # Apply device settings
-            dev = sess.get('device', {})
-            if dev:
-                self.ctrl_panel.device_panel.apply_settings(dev)
-                # Update autosave menu state if present in session device settings
-                try:
-                    if hasattr(self, '_autosave_action') and 'autosave' in dev:
-                        self._autosave_action.setChecked(bool(dev.get('autosave', True)))
-                except Exception:
-                    pass
-
-            # Apply VFOs: clear existing VFOs and recreate from session
-            vfos = sess.get('vfos', [])
-            if vfos and isinstance(vfos, list):
-                try:
-                    self.ctrl_panel.vfo_tab.replace_all_vfos(vfos)
-                except Exception:
-                    pass
+            self._apply_session(session.load_session())
         except Exception:
             pass
 
@@ -163,6 +148,12 @@ class ASURMainWindow(QMainWindow):
             menubar = self.menuBar()
             session_menu = menubar.addMenu("Session")
 
+            self._new_session_action = QAction("New Session", self)
+            self._new_session_action.triggered.connect(self._on_new_session)
+            session_menu.addAction(self._new_session_action)
+
+            session_menu.addSeparator()
+
             self._load_session_action = QAction("Load Session...", self)
             self._load_session_action.triggered.connect(self._on_load_session)
             session_menu.addAction(self._load_session_action)
@@ -188,6 +179,8 @@ class ASURMainWindow(QMainWindow):
             self._timing_action.triggered.connect(self._show_timing_window)
             self._eye_action = view_menu.addAction("Eye Diagram")
             self._eye_action.triggered.connect(self._show_eye_window)
+            self._osc_action = view_menu.addAction("Oscilloscope")
+            self._osc_action.triggered.connect(self._show_osc_window)
         except Exception:
             pass
 
@@ -276,6 +269,7 @@ class ASURMainWindow(QMainWindow):
         self.ctrl_panel.vfo_tab.mute_changed.connect(
             lambda vid, m: self.dsp.set_vfo_muted(vid, m)
         )
+        self.ctrl_panel.vfo_tab.paused_changed.connect(self._on_vfo_paused_changed)
 
         # ---- Decoder toggles ----
         self.ctrl_panel.vfo_tab.decoder_toggled.connect(self._on_decoder_toggled)
@@ -313,6 +307,8 @@ class ASURMainWindow(QMainWindow):
         self.timing_window.sample_count_changed.connect(self._on_timing_sample_count_changed)
         self.eye_window.visibility_changed.connect(self._on_eye_window_visibility_changed)
         self.eye_window.vfo_changed.connect(self._on_eye_window_vfo_changed)
+        self.osc_window.visibility_changed.connect(self._on_osc_window_visibility_changed)
+        self.osc_window.vfo_changed.connect(self._on_osc_window_vfo_changed)
 
     # ------------------------------------------------------------------
     # VFO lifecycle
@@ -332,17 +328,18 @@ class ASURMainWindow(QMainWindow):
         self.ctrl_panel.vfo_tab.set_vfo_color(vfo_id, color)
         self.dsp.add_vfo(vfo_id, freq)
         self._check_vfo_ranges()
-        self._sync_eye_vfo_choices()
+        self._sync_vfo_choices()
 
     def _on_vfo_removed(self, vfo_id: int):
         self._vfo_state.pop(vfo_id, None)
+        self._paused_vfos.discard(vfo_id)
         self.vis_panel.remove_vfo_marker(vfo_id)
         self.dsp.remove_vfo(vfo_id)
         for key in list(self._decoder_windows.keys()):
             if key[0] == vfo_id:
                 win = self._decoder_windows.pop(key)
                 win.close()
-        self._sync_eye_vfo_choices()
+        self._sync_vfo_choices()
 
     # ------------------------------------------------------------------
     # VFO control handlers
@@ -424,6 +421,8 @@ class ASURMainWindow(QMainWindow):
     def _on_active_vfo_changed(self, vfo_id: int):
         if self.eye_window.isVisible() and self.eye_window._current_vfo is None:
             self.eye_window.set_active_vfo(vfo_id)
+        if self.osc_window.isVisible() and self.osc_window._current_vfo is None:
+            self.osc_window.set_active_vfo(vfo_id)
 
     def _on_signal_strength(self, updates: dict):
         for vfo_id, (db, is_active) in updates.items():
@@ -448,6 +447,8 @@ class ASURMainWindow(QMainWindow):
             self.timing_window.set_dsp_context(sample_rate=sample_rate)
         except Exception:
             pass
+        self.eye_window.set_sample_rate(sample_rate)
+        self.osc_window.set_sample_rate(sample_rate)
 
     # ------------------------------------------------------------------
     # VFO range enforcement
@@ -549,20 +550,37 @@ class ASURMainWindow(QMainWindow):
                     self.timing_window.set_dsp_context(sample_rate=sr)
                 except Exception:
                     pass
+            if 'sample_rate' in status:
+                self.eye_window.set_sample_rate(sr)
+                self.osc_window.set_sample_rate(sr)
 
     def _on_error(self, error_msg: str):
         logger.error(f"DSP Error: {error_msg}")
         self.status_label.setText(f"Error: {error_msg}")
 
+    def _on_vfo_paused_changed(self, vfo_id: int, paused: bool) -> None:
+        if paused:
+            self._paused_vfos.add(vfo_id)
+        else:
+            self._paused_vfos.discard(vfo_id)
+
     def _on_eye_samples(self, vfo_id: int, samples):
-        if self.eye_window.isVisible():
-            self.eye_window.push_samples(vfo_id, samples)
+        if vfo_id in self._paused_vfos:
+            return
+        self.eye_window.push_samples(vfo_id, samples)
+        self.osc_window.push_samples(vfo_id, samples)
 
     def _on_eye_window_vfo_changed(self, vfo_id: object):
         if vfo_id is None:
             self.dsp.set_eye_stream(False, None)
             return
         self.dsp.set_eye_stream(self.eye_window.isVisible(), int(vfo_id))
+
+    def _on_osc_window_vfo_changed(self, vfo_id: object):
+        if vfo_id is None:
+            self.dsp.set_eye_stream(False, None)
+            return
+        self.dsp.set_eye_stream(self.osc_window.isVisible(), int(vfo_id))
 
     def _on_timing_sample_count_changed(self, n: int):
         self._profiler.set_sample_count(n)
@@ -581,10 +599,17 @@ class ASURMainWindow(QMainWindow):
         self.timing_window.activateWindow()
 
     def _show_eye_window(self):
-        self._sync_eye_vfo_choices()
+        self._sync_vfo_choices()
         self.eye_window.show()
         self.eye_window.raise_()
         self.eye_window.activateWindow()
+
+    def _show_osc_window(self):
+        self._sync_vfo_choices()
+        self.osc_window.set_sample_rate(self._sample_rate)
+        self.osc_window.show()
+        self.osc_window.raise_()
+        self.osc_window.activateWindow()
 
     def _on_eye_window_visibility_changed(self, visible: bool):
         if visible:
@@ -595,9 +620,22 @@ class ASURMainWindow(QMainWindow):
                     return
             self.dsp.set_eye_stream(True, self.eye_window._current_vfo)
             return
-        self.dsp.set_eye_stream(False, None)
+        if not self.osc_window.isVisible():
+            self.dsp.set_eye_stream(False, None)
 
-    def _sync_eye_vfo_choices(self):
+    def _on_osc_window_visibility_changed(self, visible: bool):
+        if visible:
+            if self.osc_window._current_vfo is None:
+                vfo_id = self.ctrl_panel.vfo_tab.active_vfo_id()
+                if vfo_id is not None:
+                    self.osc_window.set_active_vfo(vfo_id)
+                    return
+            self.dsp.set_eye_stream(True, self.osc_window._current_vfo)
+            return
+        if not self.eye_window.isVisible():
+            self.dsp.set_eye_stream(False, None)
+
+    def _sync_vfo_choices(self):
         choices = []
         for vfo_id in sorted(self._vfo_state.keys()):
             name = self._vfo_state.get(vfo_id, {}).get('name', f'VFO {vfo_id + 1}')
@@ -605,7 +643,9 @@ class ASURMainWindow(QMainWindow):
             freq = self._vfo_state.get(vfo_id, {}).get('freq_hz', self._center_hz)
             label = f"{name}  |  {freq/1e6:.3f} MHz  |  {bw/1e3:.1f} kHz"
             choices.append((vfo_id, label))
-        self.eye_window.set_vfo_choices(choices, active_vfo_id=self.ctrl_panel.vfo_tab.active_vfo_id())
+        active = self.ctrl_panel.vfo_tab.active_vfo_id()
+        self.eye_window.set_vfo_choices(choices, active_vfo_id=active)
+        self.osc_window.set_vfo_choices(choices, active_vfo_id=active)
 
     # ------------------------------------------------------------------
     # Decoder logging
@@ -673,6 +713,7 @@ class ASURMainWindow(QMainWindow):
             win.close()
         self._decoder_windows.clear()
         self.eye_window.close()
+        self.osc_window.close()
 
         self.ipc.stop()
         self.dsp.stop()
@@ -695,30 +736,36 @@ class ASURMainWindow(QMainWindow):
         except Exception:
             logger.exception("Manual save session failed")
 
+    def _apply_session(self, sess: dict) -> None:
+        dev = sess.get('device', {})
+        if dev:
+            self.ctrl_panel.device_panel.apply_settings(dev)
+            try:
+                if hasattr(self, '_autosave_action') and 'autosave' in dev:
+                    self._autosave_action.setChecked(bool(dev.get('autosave', True)))
+            except Exception:
+                pass
+        vfos = sess.get('vfos', [])
+        if vfos and isinstance(vfos, list):
+            try:
+                self.ctrl_panel.vfo_tab.replace_all_vfos(vfos)
+            except Exception:
+                pass
+
+    def _on_new_session(self):
+        try:
+            from app import session
+            self._apply_session(session.default_session())
+        except Exception:
+            logger.exception("New session failed")
+
     def _on_load_session(self):
         try:
             fname, _ = QFileDialog.getOpenFileName(self, "Load session...", str(), "JSON Files (*.json);;All Files (*)")
             if not fname:
                 return
             from app import session
-            sess = session.load_session(fname)
-            # Apply device settings
-            dev = sess.get('device', {})
-            if dev:
-                self.ctrl_panel.device_panel.apply_settings(dev)
-                try:
-                    if hasattr(self, '_autosave_action') and 'autosave' in dev:
-                        self._autosave_action.setChecked(bool(dev.get('autosave', True)))
-                except Exception:
-                    pass
-
-            # Apply VFOs: clear existing VFOs and recreate from session
-            vfos = sess.get('vfos', [])
-            if vfos and isinstance(vfos, list):
-                try:
-                    self.ctrl_panel.vfo_tab.replace_all_vfos(vfos)
-                except Exception:
-                    pass
+            self._apply_session(session.load_session(fname))
         except Exception:
             logger.exception("Load session failed")
 

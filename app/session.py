@@ -7,24 +7,14 @@ DEFAULT_SESSION_FILENAME = Path.home() / '.asdr_session.json'
 DEFAULT_BUNDLED = Path(__file__).parent / 'session_default.json'
 
 
-def load_session(path: Optional[Path] = None) -> Dict[str, Any]:
-    target = Path(path) if path is not None else DEFAULT_SESSION_FILENAME
-    if target.exists():
-        try:
-            with open(target, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except Exception:
-            pass
-
-    # Fallback to bundled default
+def default_session() -> Dict[str, Any]:
+    """Return the bundled default session, falling back to hardcoded values."""
     if DEFAULT_BUNDLED.exists():
         try:
             with open(DEFAULT_BUNDLED, 'r', encoding='utf-8') as f:
                 return json.load(f)
         except Exception:
             pass
-
-    # If all else fails, return a minimal default
     return {
         'device': {
             'center_freq': 100e6,
@@ -47,6 +37,17 @@ def load_session(path: Optional[Path] = None) -> Dict[str, Any]:
             }
         ],
     }
+
+
+def load_session(path: Optional[Path] = None) -> Dict[str, Any]:
+    target = Path(path) if path is not None else DEFAULT_SESSION_FILENAME
+    if target.exists():
+        try:
+            with open(target, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return default_session()
 
 
 def save_session(session: Dict[str, Any], path: Optional[Path] = None) -> None:
