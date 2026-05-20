@@ -4,7 +4,7 @@ Standalone live view for profiling reports.
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, Signal, QTimer
 from PySide6.QtGui import QKeySequence, QShortcut, QColor
 from PySide6.QtWidgets import (
     QApplication, QHBoxLayout, QLabel, QPushButton, QSpinBox,
@@ -30,6 +30,7 @@ class TimingWindow(QMainWindow):
     sample_count_changed = Signal(int)
 
     _PLOT_WINDOW_S = 120  # rolling window width in seconds
+    _UI_INTERVAL_MS = 66  # ~15 fps refresh cap
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -109,7 +110,6 @@ class TimingWindow(QMainWindow):
         self._plot.showGrid(x=True, y=True, alpha=0.25)
         self._plot.setLabel('left', 'Latency', units='ms')
         self._plot.setLabel('bottom', 'Elapsed', units='s')
-        # Rolling window: pin the right edge at now (x=0), scroll left
         self._plot.setXRange(-self._PLOT_WINDOW_S, 0, padding=0.02)
         self._plot.enableAutoRange(axis='x', enable=False)
         self._plot.enableAutoRange(axis='y', enable=True)
@@ -139,6 +139,7 @@ class TimingWindow(QMainWindow):
         self.clear_btn.clicked.connect(self.clear_reports)
         self.report_received.connect(self.add_report)
 
+        # ── State ────────────────────────────────────────────────────────────
         self._reports: dict[tuple[str, str], dict] = {}
         # histories: (timestamp, mean_ms, min_ms, max_ms)
         self._histories: dict[str, collections.deque] = {}
@@ -148,8 +149,19 @@ class TimingWindow(QMainWindow):
         self._dsp_sample_rate_hz: float | None = None
         self._dsp_block_size: int = 4096
 
+        # Dirty flags — data changes here, UI flushes on timer
+        self._dirty_keys: set[str] = set()
+        self._dirty_plot: bool = False
+
+        self._ui_timer = QTimer(self)
+        self._ui_timer.setInterval(self._UI_INTERVAL_MS)
+        self._ui_timer.timeout.connect(self._flush_ui)
+        self._ui_timer.start()
+
         self.setCentralWidget(content)
         self.resize(1100, 700)
+
+    # ── Public API ───────────────────────────────────────────────────────────
 
     def clear_reports(self):
         self.table.setRowCount(0)
@@ -160,7 +172,113 @@ class TimingWindow(QMainWindow):
         self._key_colors.clear()
         self._key_labels.clear()
         self._visible_keys.clear()
+        self._dirty_keys.clear()
+        self._dirty_plot = False
         self._refresh_summary()
+
+    def set_dsp_context(self, sample_rate: float | None = None, block_size: int = 4096):
+        self._dsp_sample_rate_hz = sample_rate
+        self._dsp_block_size = int(block_size)
+        self._refresh_summary()
+
+    def add_report(self, report: object):
+        """Ingest a timing report. Cheap — only updates in-memory state; UI flushes on timer."""
+        if not isinstance(report, dict):
+            return
+
+        source = str(report.get("source", ""))
+        stage = str(report.get("stage", ""))
+        key = f"{source}||{stage}"
+
+        mean_ms = float(report.get('mean_ms', 0.0))
+        min_ms = float(report.get('min_ms', mean_ms))
+        max_ms = float(report.get('max_ms', mean_ms))
+
+        try:
+            ts = float(report.get('timestamp', 0.0))
+        except Exception:
+            ts = 0.0
+        if ts <= 0.0:
+            ts = time.time()
+
+        self._reports[(source, stage)] = report
+
+        if key not in self._histories:
+            self._histories[key] = collections.deque(maxlen=400)
+            self._key_labels[key] = (source, stage)
+            color = self._plot_colors[len(self._key_colors) % len(self._plot_colors)]
+            self._key_colors[key] = color
+            self._visible_keys.add(key)
+            # Row creation is rare (once per key) — do it immediately
+            self._create_table_row(source, stage, color)
+
+        self._histories[key].append((ts, mean_ms, min_ms, max_ms))
+        self._dirty_keys.add(key)
+        self._dirty_plot = True
+
+    # ── Timer-driven UI flush ─────────────────────────────────────────────────
+
+    def _flush_ui(self):
+        """Called at ~15 fps. Applies all pending data changes to the table and plot."""
+        if not self._dirty_keys and not self._dirty_plot:
+            return
+
+        if self._dirty_keys:
+            self.table.setSortingEnabled(False)
+            self.table.blockSignals(True)
+            for key in self._dirty_keys:
+                source, stage = self._key_labels[key]
+                report = self._reports.get((source, stage))
+                if not report:
+                    continue
+                row = self._find_row(source, stage)
+                if row is None:
+                    continue
+                mean_ms = float(report.get('mean_ms', 0.0))
+                min_ms = float(report.get('min_ms', mean_ms))
+                max_ms = float(report.get('max_ms', mean_ms))
+                vals = {
+                    3: f"{mean_ms:.3f}",
+                    4: f"{min_ms:.3f}",
+                    5: f"{max_ms:.3f}",
+                    6: str(int(report.get("samples", 0))),
+                    7: self._format_timestamp(float(report.get("timestamp", 0.0))),
+                }
+                for col, text in vals.items():
+                    item = _NumericItem(text) if col in (3, 4, 5, 6) else QTableWidgetItem(text)
+                    if col in (3, 4, 5, 6):
+                        item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                    self.table.setItem(row, col, item)
+            self.table.blockSignals(False)
+            self.table.setSortingEnabled(True)
+            self._dirty_keys.clear()
+
+        if self._dirty_plot:
+            self._update_plot()
+            self._dirty_plot = False
+
+        self._refresh_summary()
+
+    # ── Internal helpers ─────────────────────────────────────────────────────
+
+    def _create_table_row(self, source: str, stage: str, color: str):
+        """Insert a new table row for a (source, stage) pair. Called once per key."""
+        self.table.setSortingEnabled(False)
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+
+        cb = QTableWidgetItem()
+        cb.setFlags(cb.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
+        cb.setCheckState(Qt.Checked)
+        cb.setBackground(QColor(color))
+        cb.setToolTip(f"{source} — {stage}")
+
+        self.table.blockSignals(True)
+        self.table.setItem(row, 0, cb)
+        self.table.setItem(row, 1, QTableWidgetItem(source))
+        self.table.setItem(row, 2, QTableWidgetItem(stage))
+        self.table.blockSignals(False)
+        self.table.setSortingEnabled(True)
 
     def _remove_plot_key(self, key: str):
         for d in (self._plot_fills, self._plot_upper, self._plot_lower):
@@ -181,76 +299,6 @@ class TimingWindow(QMainWindow):
                 self._plot.removeItem(curve)
             except Exception:
                 pass
-
-    def set_dsp_context(self, sample_rate: float | None = None, block_size: int = 4096):
-        self._dsp_sample_rate_hz = sample_rate
-        self._dsp_block_size = int(block_size)
-        self._refresh_summary()
-
-    def add_report(self, report: object):
-        if not isinstance(report, dict):
-            return
-
-        source = str(report.get("source", ""))
-        stage = str(report.get("stage", ""))
-
-        self.table.setSortingEnabled(False)
-        row = self._find_row(source, stage)
-        if row is None:
-            row = self.table.rowCount()
-            self.table.insertRow(row)
-
-        mean_ms = float(report.get('mean_ms', 0.0))
-        min_ms = float(report.get('min_ms', mean_ms))
-        max_ms = float(report.get('max_ms', mean_ms))
-
-        texts = [
-            source,
-            stage,
-            f"{mean_ms:.3f}",
-            f"{min_ms:.3f}",
-            f"{max_ms:.3f}",
-            str(int(report.get("samples", 0))),
-            self._format_timestamp(float(report.get("timestamp", 0.0))),
-        ]
-
-        self.table.blockSignals(True)
-        for i, text in enumerate(texts):
-            col_idx = i + 1
-            item = _NumericItem(text) if col_idx in (3, 4, 5, 6) else QTableWidgetItem(text)
-            if col_idx in (3, 4, 5, 6):
-                item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            self.table.setItem(row, col_idx, item)
-        self.table.blockSignals(False)
-
-        self.table.setSortingEnabled(True)
-        self._reports[(source, stage)] = report
-
-        try:
-            ts = float(report.get('timestamp', 0.0))
-        except Exception:
-            ts = 0.0
-        if ts <= 0.0:
-            ts = time.time()
-
-        key = f"{source}||{stage}"
-        if key not in self._histories:
-            self._histories[key] = collections.deque(maxlen=400)
-            self._key_labels[key] = (source, stage)
-            color = self._plot_colors[len(self._key_colors) % len(self._plot_colors)]
-            self._key_colors[key] = color
-            cb = QTableWidgetItem()
-            cb.setFlags(cb.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
-            cb.setCheckState(Qt.Checked)
-            cb.setBackground(QColor(color))
-            cb.setToolTip(f"{source} — {stage}")
-            self.table.setItem(row, 0, cb)
-            self._visible_keys.add(key)
-
-        self._histories[key].append((ts, mean_ms, min_ms, max_ms))
-        if key in self._visible_keys:
-            self._update_plot()
-        self._refresh_summary()
 
     def _find_row(self, source: str, stage: str) -> int | None:
         for item in self.table.findItems(source, Qt.MatchExactly):
@@ -305,12 +353,10 @@ class TimingWindow(QMainWindow):
         now = time.time()
         window_start = now - self._PLOT_WINDOW_S
 
-        # Remove curves for hidden keys
         for key in list(self._plot_curves):
             if key not in self._visible_keys:
                 self._remove_plot_key(key)
 
-        # Add or update a curve per visible key
         for key in sorted(self._visible_keys):
             hist = list(self._histories.get(key, []))
             if not hist:
@@ -318,7 +364,7 @@ class TimingWindow(QMainWindow):
 
             hist_win = [(t, m, mn, mx) for t, m, mn, mx in hist if t >= window_start]
             if not hist_win:
-                hist_win = hist[-1:]  # always show at least the latest point
+                hist_win = hist[-1:]
 
             x = [t - now for t, _, _, _ in hist_win]
             ys_mean = [m for _, m, _, _ in hist_win]
@@ -327,15 +373,13 @@ class TimingWindow(QMainWindow):
 
             color = self._key_colors.get(key, '#ffffff')
             label = key.replace('||', ' — ')
-            fill_brush = pg.mkBrush(QColor(color).darker(100))
             fill_color = QColor(color)
             fill_color.setAlpha(35)
-            fill_brush = pg.mkBrush(fill_color)
 
             if key not in self._plot_curves:
                 upper = self._plot.plot(x, ys_max, pen=None)
                 lower = self._plot.plot(x, ys_min, pen=None)
-                fill = pg.FillBetweenItem(upper, lower, brush=fill_brush)
+                fill = pg.FillBetweenItem(upper, lower, brush=pg.mkBrush(fill_color))
                 self._plot.addItem(fill)
                 mean_curve = self._plot.plot(
                     x, ys_mean,
