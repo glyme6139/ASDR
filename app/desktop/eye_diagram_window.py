@@ -7,6 +7,7 @@ import numpy as np
 import pyqtgraph as pg
 from PySide6.QtCore import Qt, QRectF, Signal
 from PySide6.QtWidgets import (
+    QCheckBox,
     QHBoxLayout,
     QLabel,
     QMainWindow,
@@ -76,12 +77,21 @@ class EyeDiagramWindow(QMainWindow):
 
         header.addWidget(QLabel("Samp/sym:"))
         self._sps_spin = QSpinBox()
-        self._sps_spin.setRange(8, 256)
+        self._sps_spin.setRange(8, 8192*8)
         self._sps_spin.setSingleStep(2)
         self._sps_spin.setValue(32)
         self._sps_spin.setFixedWidth(70)
         self._sps_spin.valueChanged.connect(self._on_sps_changed)
         header.addWidget(self._sps_spin)
+
+        self._auto_sps_btn = QPushButton("Auto SPS")
+        self._auto_sps_btn.setFixedWidth(70)
+        self._auto_sps_btn.setToolTip(
+            "Estimate samples/symbol from the autocorrelation of the buffer.\n"
+            "Works best with signals that have a periodic preamble (e.g. POCSAG)."
+        )
+        self._auto_sps_btn.clicked.connect(self._auto_sps)
+        header.addWidget(self._auto_sps_btn)
 
         header.addSpacing(8)
         header.addWidget(QLabel("Phase:"))
@@ -111,6 +121,25 @@ class EyeDiagramWindow(QMainWindow):
         self._traces_spin.setFixedWidth(70)
         self._traces_spin.valueChanged.connect(lambda _: self._refresh_plot())
         header.addWidget(self._traces_spin)
+
+        header.addSpacing(8)
+        header.addWidget(QLabel("Smooth:"))
+        self._smooth_spin = QSpinBox()
+        self._smooth_spin.setRange(1, 99)
+        self._smooth_spin.setSingleStep(2)
+        self._smooth_spin.setValue(1)
+        self._smooth_spin.setFixedWidth(52)
+        self._smooth_spin.setToolTip("Moving-average kernel size (1 = off, higher = smoother)")
+        self._smooth_spin.valueChanged.connect(lambda _: self._refresh_plot())
+        header.addWidget(self._smooth_spin)
+
+        header.addSpacing(8)
+        self._filter_cb = QCheckBox("Filter silence")
+        self._filter_cb.setToolTip(
+            "Discard traces with low peak-to-peak amplitude (burst/intermittent signals like POCSAG)"
+        )
+        self._filter_cb.stateChanged.connect(lambda _: self._refresh_plot())
+        header.addWidget(self._filter_cb)
 
         layout.addLayout(header)
 
@@ -333,6 +362,39 @@ class EyeDiagramWindow(QMainWindow):
 
         self._phase_slider.setValue(best_phase)
 
+    def _auto_sps(self) -> None:
+        """Estimate samp/sym from sign-transition autocorrelation.
+
+        Using the transition signal (impulse at each sign change) instead of the
+        raw signal avoids the 2× harmonic trap: a 1010… preamble is a square wave
+        at period 2T, so raw-signal ACF peaks at 2T, but the transition signal
+        always peaks at T regardless of the bit pattern.
+        """
+        buffer = self._get_analysis_buffer()
+        if buffer.size < 500:
+            return
+
+        chunk = buffer[-min(buffer.size, 16384):].astype(np.float64)
+        chunk -= chunk.mean()
+
+        # Transition signal: 2 at each sign change, 0 elsewhere
+        transitions = np.abs(np.diff(np.sign(chunk)))
+
+        fft_len = 1 << (2 * len(transitions) - 1).bit_length()
+        F = np.fft.rfft(transitions, fft_len)
+        acf = np.fft.irfft(F * np.conj(F))
+        if acf[0] < 1e-12:
+            return
+        acf = acf / acf[0]
+
+        # First strong peak in [8, 500] is the symbol period
+        search = acf[8:501]
+        peak_rel = int(np.argmax(search))
+        if search[peak_rel] < 0.05:
+            return
+
+        self._sps_spin.setValue(peak_rel + 8)
+
     # ── Sample ingestion helpers ───────────────────────────────────────────────
 
     def _current_buffer(self) -> np.ndarray:
@@ -341,6 +403,16 @@ class EyeDiagramWindow(QMainWindow):
         return self._buffers.get(self._current_vfo, np.zeros(0, dtype=np.float32))
 
     # ── Rendering ─────────────────────────────────────────────────────────────
+
+    def _apply_smooth(self, buf: np.ndarray, n: int) -> np.ndarray:
+        if n <= 1 or buf.size < n:
+            return buf
+        kernel = np.ones(n, dtype=np.float32) / n
+        pad = n // 2
+        padded = np.concatenate([np.full(pad, buf[0], dtype=np.float32),
+                                  buf,
+                                  np.full(pad, buf[-1], dtype=np.float32)])
+        return np.convolve(padded, kernel, mode='valid')[:buf.size]
 
     def _refresh_plot(self):
         buffer = self._get_analysis_buffer()
@@ -355,7 +427,10 @@ class EyeDiagramWindow(QMainWindow):
             self._stats_label.setText("Waiting for samples…")
             return
 
-        usable = buffer[phase:]
+        smooth_n = int(self._smooth_spin.value())
+        display_buf = self._apply_smooth(buffer, smooth_n)
+
+        usable = display_buf[phase:]
         usable = usable[-(usable.size // sps) * sps:]
         seg = usable.reshape(-1, sps)
         if seg.shape[0] < 3:
@@ -365,11 +440,24 @@ class EyeDiagramWindow(QMainWindow):
         if traces.shape[0] > max_traces:
             traces = traces[-max_traces:]
 
+        # Filter low-energy traces (silence / noise between bursts)
+        if self._filter_cb.isChecked() and traces.shape[0] >= 6:
+            pp = np.ptp(traces, axis=1)
+            threshold = np.percentile(pp, 70) * 0.35
+            traces = traces[pp >= threshold]
+            if traces.shape[0] < 3:
+                self._plot.setTitle("No signal traces after filter — try unchecking Filter silence")
+                self._stats_label.setText("All traces filtered out")
+                return
+
+        # Robust normalization: use the 90th-percentile peak-to-peak so silent
+        # frames and outliers don't collapse the scale to near-zero.
+        pp_per_trace = np.ptp(traces, axis=1)
+        scale = float(np.percentile(pp_per_trace, 90)) / 2.0
+        if scale < 1e-6:
+            scale = float(np.max(np.abs(traces))) or 1.0
+        traces = traces / scale
         median_trace = np.median(traces, axis=0)
-        scale = float(np.max(np.abs(median_trace)))
-        if scale > 1e-6:
-            traces = traces / scale
-            median_trace = median_trace / scale
 
         np.clip(traces, -self._Y_RANGE, self._Y_RANGE, out=traces)
         np.clip(median_trace, -self._Y_RANGE, self._Y_RANGE, out=median_trace)
@@ -392,6 +480,11 @@ class EyeDiagramWindow(QMainWindow):
             H /= h_max
 
         self._image.setImage(H[:, ::-1], autoLevels=False, levels=(0.0, 1.0))
+        # Re-apply rect and axis ranges: setImage resets the item transform in
+        # some pyqtgraph versions and can trigger an autorange on the viewbox.
+        self._image.setRect(QRectF(0.0, -self._Y_RANGE, 2.0, 2.0 * self._Y_RANGE))
+        self._plot.setXRange(0.0, 2.0, padding=0)
+        self._plot.setYRange(-self._Y_RANGE, self._Y_RANGE, padding=0)
 
         x = np.linspace(0.0, 2.0, traces.shape[1], endpoint=False, dtype=np.float32)
         self._median_curve.setData(x, median_trace.astype(np.float32))

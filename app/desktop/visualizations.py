@@ -118,6 +118,7 @@ class SpectrumViewer(QObject):
         self._sample_rate  = sample_rate
         self._x_cache      = None   # invalidate cached x-axis
         self._x_cache_n    = 0
+        self.reset_peak()
         lo = (center_hz - sample_rate / 2) / 1e6
         hi = (center_hz + sample_rate / 2) / 1e6
         span = hi - lo
@@ -641,7 +642,7 @@ class VisualizationPanel(QWidget):
         self._display_buffers = display_buffers
 
         self._render_timer = QTimer(self)
-        self._render_timer.setInterval(100)  # 10 fps cap — halves GIL hold frequency
+        self._render_timer.setInterval(50)  # 20 fps — matches DISPLAY_HZ, no frames dropped
         self._render_timer.timeout.connect(self._flush_pending)
         self._render_timer.start()
 

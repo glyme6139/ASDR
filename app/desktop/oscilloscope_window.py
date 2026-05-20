@@ -80,10 +80,10 @@ class OscilloscopeWindow(QMainWindow):
 
         header.addWidget(QLabel("Window:"))
         self._window_spin = QSpinBox()
-        self._window_spin.setRange(64, 8192)
+        self._window_spin.setRange(64, 8192*8)
         self._window_spin.setSingleStep(64)
         self._window_spin.setValue(512)
-        self._window_spin.setFixedWidth(72)
+        self._window_spin.setFixedWidth(120)
         self._window_spin.setToolTip("Sweep length in samples")
         self._window_spin.valueChanged.connect(self._on_settings_changed)
         header.addWidget(self._window_spin)
@@ -131,12 +131,31 @@ class OscilloscopeWindow(QMainWindow):
         header.addWidget(self._mode_combo)
 
         header.addSpacing(8)
+        header.addWidget(QLabel("Smooth:"))
+        self._smooth_spin = QSpinBox()
+        self._smooth_spin.setRange(1, 99)
+        self._smooth_spin.setSingleStep(2)
+        self._smooth_spin.setValue(1)
+        self._smooth_spin.setFixedWidth(120)
+        self._smooth_spin.setToolTip("Moving-average kernel size (1 = off, higher = smoother)")
+        self._smooth_spin.valueChanged.connect(self._on_settings_changed)
+        header.addWidget(self._smooth_spin)
+
+        header.addSpacing(8)
         self._persist_btn = QPushButton("Persist Off")
         self._persist_btn.setFixedWidth(84)
         self._persist_btn.setCheckable(True)
         self._persist_btn.setToolTip("Toggle persistence (phosphor) mode")
         self._persist_btn.clicked.connect(self._on_persist_toggled)
         header.addWidget(self._persist_btn)
+
+        header.addSpacing(8)
+        self._markers_btn = QPushButton("Markers")
+        self._markers_btn.setFixedWidth(70)
+        self._markers_btn.setCheckable(True)
+        self._markers_btn.setToolTip("Toggle A/B measurement markers (drag to measure samples/symbol)")
+        self._markers_btn.clicked.connect(self._on_markers_toggled)
+        header.addWidget(self._markers_btn)
 
         layout.addLayout(header)
 
@@ -197,6 +216,27 @@ class OscilloscopeWindow(QMainWindow):
         )
         self._plot.addItem(self._pretrig_line)
 
+        # Measurement markers A and B — draggable vertical lines
+        self._marker_a = pg.InfiniteLine(
+            pos=-10.0, angle=90, movable=True,
+            pen=pg.mkPen(color="#ff44aa", width=1),
+            label="A  {value:.2f} ms",
+            labelOpts={"color": "#ff44aa", "position": 0.90, "fill": (11, 11, 11, 160)},
+        )
+        self._marker_a.sigPositionChanged.connect(self._on_marker_moved)
+        self._marker_a.setVisible(False)
+        self._plot.addItem(self._marker_a)
+
+        self._marker_b = pg.InfiniteLine(
+            pos=10.0, angle=90, movable=True,
+            pen=pg.mkPen(color="#44ffaa", width=1),
+            label="B  {value:.2f} ms",
+            labelOpts={"color": "#44ffaa", "position": 0.83, "fill": (11, 11, 11, 160)},
+        )
+        self._marker_b.sigPositionChanged.connect(self._on_marker_moved)
+        self._marker_b.setVisible(False)
+        self._plot.addItem(self._marker_b)
+
         layout.addWidget(self._plot)
 
         # ── Stats row ────────────────────────────────────────────────────────
@@ -206,6 +246,10 @@ class OscilloscopeWindow(QMainWindow):
         self._stats_label.setStyleSheet("color: #aaaaaa;")
         stats_row.addWidget(self._stats_label)
         stats_row.addStretch()
+        self._marker_label = QLabel("")
+        self._marker_label.setStyleSheet("color: #dddddd; font-weight: 600;")
+        self._marker_label.setVisible(False)
+        stats_row.addWidget(self._marker_label)
         layout.addLayout(stats_row)
 
         self.setCentralWidget(content)
@@ -312,6 +356,35 @@ class OscilloscopeWindow(QMainWindow):
         self._level_spin.blockSignals(False)
         self._refresh_plot()
 
+    def _on_markers_toggled(self, checked: bool):
+        if checked:
+            # Place markers at 25% and 75% of the current view
+            window = int(self._window_spin.value())
+            pretrig_frac = int(self._pretrig_spin.value()) / 100.0
+            ms_per_sample = 1000.0 / self._sample_rate
+            x_start = -pretrig_frac * window * ms_per_sample
+            x_end = (1.0 - pretrig_frac) * window * ms_per_sample
+            span = x_end - x_start
+            self._marker_a.setPos(x_start + span * 0.25)
+            self._marker_b.setPos(x_start + span * 0.75)
+        self._marker_a.setVisible(checked)
+        self._marker_b.setVisible(checked)
+        self._marker_label.setVisible(checked)
+        self._on_marker_moved()
+
+    def _on_marker_moved(self):
+        if not self._markers_btn.isChecked():
+            return
+        pos_a = float(self._marker_a.value())
+        pos_b = float(self._marker_b.value())
+        spl_per_ms = self._sample_rate / 1000.0
+        delta_ms = abs(pos_b - pos_a)
+        delta_spl = delta_ms * spl_per_ms
+        self._marker_label.setText(
+            f"A: {pos_a:.3f} ms   B: {pos_b:.3f} ms   "
+            f"ΔT: {delta_ms:.3f} ms = {delta_spl:.1f} spl/sym"
+        )
+
     def _on_persist_toggled(self, checked: bool):
         self._persist_mode = checked
         self._persist_btn.setText("Persist On" if checked else "Persist Off")
@@ -391,6 +464,17 @@ class OscilloscopeWindow(QMainWindow):
         rms = float(np.sqrt(np.mean(np.square(buf))))
         return buf / (rms * np.sqrt(2)) if rms > 1e-6 else buf.copy()
 
+    def _apply_smooth(self, buf: np.ndarray, n: int) -> np.ndarray:
+        """Moving-average with edge-padding so endpoints don't taper to zero."""
+        if n <= 1 or buf.size < n:
+            return buf
+        kernel = np.ones(n, dtype=np.float32) / n
+        pad = n // 2
+        padded = np.concatenate([np.full(pad, buf[0], dtype=np.float32),
+                                  buf,
+                                  np.full(pad, buf[-1], dtype=np.float32)])
+        return np.convolve(padded, kernel, mode='valid')[:buf.size]
+
     def _refresh_plot(self):
         buffer = self._get_analysis_buffer()
         window = int(self._window_spin.value())
@@ -424,14 +508,18 @@ class OscilloscopeWindow(QMainWindow):
                 )
                 return
 
+        # Smooth display buffer; triggers always detected on raw signal
+        smooth_n = int(self._smooth_spin.value())
+        buf_display = self._apply_smooth(buf_norm, smooth_n)
+
         # Time axis: x=0 at the trigger event
         x_ms = (np.arange(window, dtype=np.float32) - pretrig) * ms_per_sample
 
         if self._persist_mode:
-            self._render_persist(buf_norm, triggers, window, pretrig, x_ms)
+            self._render_persist(buf_display, triggers, window, pretrig, x_ms)
         else:
             t = int(triggers[-1])
-            sweep = buf_norm[t - pretrig: t + post]
+            sweep = buf_display[t - pretrig: t + post]
             self._curve.setData(x_ms, sweep)
 
         self._update_stats(buf_norm, triggers, window, pretrig, level, edge, ms_per_sample)

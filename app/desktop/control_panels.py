@@ -57,7 +57,7 @@ class AcceptCommaDoubleSpinBox(QDoubleSpinBox):
 # Use our subclass throughout this module wherever QDoubleSpinBox is used.
 QDoubleSpinBox = AcceptCommaDoubleSpinBox
 
-DECODER_NAMES = ['POCSAG', 'ADSB', 'TETRA', 'ACARS', 'DMR'] + list(MODULATION_DECODER_NAMES)
+DECODER_NAMES = ['POCSAG', 'ADSB', 'TETRA', 'ACARS', 'DMR', 'Manchester'] + list(MODULATION_DECODER_NAMES)
 
 _BOOKMARK_FILE = 'bookmarks.json'
 

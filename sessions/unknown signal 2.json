@@ -1,0 +1,23 @@
+{
+  "device": {
+    "center_freq": 73000000.0,
+    "sample_rate": 2000000,
+    "lna": 40,
+    "vga": 0,
+    "amp_enabled": true,
+    "autosave": true
+  },
+  "vfos": [
+    {
+      "name": "TETRA 1",
+      "frequency": 72749916.0,
+      "demod_mode": "AM",
+      "bandwidth": 8000.0,
+      "volume": 0.0,
+      "squelch_level": -120.0,
+      "squelch_enabled": true,
+      "enabled": true,
+      "decoders": []
+    }
+  ]
+}

@@ -64,6 +64,26 @@
       "squelch_level": 60.0,
       "volume": 0.03,
       "decoders": []
+    },
+    {
+      "name": "Animal Tracking ?",
+      "frequency": 161084179.0,
+      "demod_mode": "AM",
+      "bandwidth": 1000.0,
+      "squelch_level": -100.0,
+      "volume": 0.03,
+      "decoders": []
+    },
+    {
+      "name": "POCSAG 4",
+      "frequency": 169700046.0,
+      "demod_mode": "NFM",
+      "bandwidth": 12500.0,
+      "squelch_level": -120.0,
+      "volume": 0.01,
+      "decoders": [
+        "POCSAG"
+      ]
     }
   ]
 }

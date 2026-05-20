@@ -25,6 +25,7 @@ from .dsp_process import DSPProcess
 from .ipc_adapter import IPCAdapterThread
 from .eye_diagram_window import EyeDiagramWindow
 from .oscilloscope_window import OscilloscopeWindow
+from .signal_rate_window import SignalRateWindow
 from .timing import TimingConfig, profiler_from_config
 from .timing_window import TimingWindow
 
@@ -65,6 +66,7 @@ class ASURMainWindow(QMainWindow):
         self.timing_window = TimingWindow()
         self.eye_window = EyeDiagramWindow(self)
         self.osc_window = OscilloscopeWindow(self)
+        self.rate_window = SignalRateWindow(self)
 
         self.dsp = DSPProcess(timing=self._timing)
         self.ipc = IPCAdapterThread(self.dsp.result_queue, profiler=self._profiler)
@@ -181,6 +183,8 @@ class ASURMainWindow(QMainWindow):
             self._eye_action.triggered.connect(self._show_eye_window)
             self._osc_action = view_menu.addAction("Oscilloscope")
             self._osc_action.triggered.connect(self._show_osc_window)
+            self._rate_action = view_menu.addAction("Signal Rate")
+            self._rate_action.triggered.connect(self._show_rate_window)
         except Exception:
             pass
 
@@ -427,6 +431,7 @@ class ASURMainWindow(QMainWindow):
     def _on_signal_strength(self, updates: dict):
         for vfo_id, (db, is_active) in updates.items():
             self.ctrl_panel.vfo_tab.update_signal_strength(vfo_id, db, is_active)
+            self.rate_window.push_squelch_state(vfo_id, bool(is_active))
 
     # ------------------------------------------------------------------
     # Device control handlers
@@ -611,6 +616,12 @@ class ASURMainWindow(QMainWindow):
         self.osc_window.raise_()
         self.osc_window.activateWindow()
 
+    def _show_rate_window(self):
+        self._sync_vfo_choices()
+        self.rate_window.show()
+        self.rate_window.raise_()
+        self.rate_window.activateWindow()
+
     def _on_eye_window_visibility_changed(self, visible: bool):
         if visible:
             if self.eye_window._current_vfo is None:
@@ -646,6 +657,7 @@ class ASURMainWindow(QMainWindow):
         active = self.ctrl_panel.vfo_tab.active_vfo_id()
         self.eye_window.set_vfo_choices(choices, active_vfo_id=active)
         self.osc_window.set_vfo_choices(choices, active_vfo_id=active)
+        self.rate_window.set_vfo_choices(choices, active_vfo_id=active)
 
     # ------------------------------------------------------------------
     # Decoder logging
@@ -714,6 +726,7 @@ class ASURMainWindow(QMainWindow):
         self._decoder_windows.clear()
         self.eye_window.close()
         self.osc_window.close()
+        self.rate_window.close()
 
         self.ipc.stop()
         self.dsp.stop()

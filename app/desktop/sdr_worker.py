@@ -351,6 +351,9 @@ class DSPWorker:
             elif name == 'DMR':
                 from app.decoders.dmr import DMRDecoder
                 return DMRDecoder()
+            elif name == 'Manchester':
+                from app.decoders.manchester import ManchesterDecoder
+                return ManchesterDecoder()
             else:
                 from app.decoders.modulation import create_modulation_decoder
                 return create_modulation_decoder(name)
@@ -531,9 +534,18 @@ class DSPWorker:
         center_bin = N // 2 + round(offset_hz / bin_hz)
         lo         = center_bin - inter_bins // 2
         hi         = lo + inter_bins
-        if lo < 0 or hi > N:
-            return None, None
-        extracted  = fft_shifted[lo:hi]
+        pad_lo = max(0, -lo)
+        pad_hi = max(0, hi - N)
+        if pad_lo + pad_hi >= inter_bins:
+            return None, None   # VFO entirely outside captured band
+        if pad_lo > 0 or pad_hi > 0:
+            # Zero-pad at the edge: out-of-band bins are naturally rolled off by
+            # the hardware anti-aliasing filter, so zeros are correct there.
+            extracted = np.zeros(inter_bins, dtype=fft_shifted.dtype)
+            extracted[pad_lo : inter_bins - pad_hi if pad_hi else inter_bins] = \
+                fft_shifted[lo + pad_lo : hi - pad_hi if pad_hi else hi]
+        else:
+            extracted  = fft_shifted[lo:hi]
         narrowband = np.fft.ifft(np.fft.ifftshift(extracted))
         narrowband = (narrowband * (N / inter_bins)).astype(np.complex64)
         return narrowband, bin_hz * inter_bins

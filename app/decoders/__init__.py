@@ -22,6 +22,7 @@ from .adsb import ADSBDecoder
 from .tetra import TETRADecoder  # now a package: app/decoders/tetra/
 from .acars import ACARSDecoder
 from .dmr import DMRDecoder
+from .manchester import ManchesterDecoder
 
 __all__ = [
     'BaseDecoder',
@@ -39,4 +40,5 @@ __all__ = [
     'TETRADecoder',
     'ACARSDecoder',
     'DMRDecoder',
+    'ManchesterDecoder',
 ]
