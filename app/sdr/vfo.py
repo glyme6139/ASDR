@@ -339,8 +339,12 @@ class VFO:
         if not self.audio_enabled:
             return None, []
 
-        # Signal strength + squelch with hysteresis
-        self.signal_strength = float(np.mean(np.abs(iq) ** 2))
+        # Signal strength + squelch with hysteresis.
+        # The FFT channelizer scales IQ amplitude by sr/nb_sr (= N/inter_bins),
+        # so power is inflated by (sr/nb_sr)^2. Multiply by (nb_sr/sr)^2 to recover
+        # the original signal power, making dBFS independent of sample rate.
+        _norm = (nb_sr / max(self.sample_rate, 1.0)) ** 2
+        self.signal_strength = float(np.mean(np.abs(iq) ** 2)) * _norm
         signal_db = 10.0 * np.log10(max(self.signal_strength, 1e-10))
         self.signal_db = signal_db
 
