@@ -339,11 +339,30 @@ class VFO:
         if not self.audio_enabled:
             return None, []
 
-        # Signal strength + squelch with hysteresis.
-        # The FFT channelizer scales IQ amplitude by sr/nb_sr (= N/inter_bins),
-        # so power is inflated by (sr/nb_sr)^2. Multiply by (nb_sr/sr)^2 to recover
-        # the original signal power, making dBFS independent of sample rate.
-        _norm = (nb_sr / max(self.sample_rate, 1.0)) ** 2
+        # Stage 1 — channel filter + decimation.
+        # Run unconditionally (before squelch) so filter state stays continuous
+        # even when squelch is closed, preventing transients on re-open.
+        # The FFT channelizer extracts a wide intermediate slice (~200 kHz) for
+        # good spectral resolution; decimate to ~2× bandwidth here.
+        intermediate_nb_sr = nb_sr
+        bw_changed = abs(self.settings.bandwidth - self._nb_ch_bw) / (self._nb_ch_bw + 1.0) > 0.02
+        sr_changed = abs(nb_sr - self._nb_ch_nb_sr) / (self._nb_ch_nb_sr + 1.0) > 0.02
+        if bw_changed or sr_changed:
+            self._rebuild_nb_channel_filter(nb_sr)
+        if self._nb_ch_taps is not None and self._nb_ch_decim > 1:
+            i_filt, self._nb_ch_zi_i = lfilter(
+                self._nb_ch_taps, 1.0, np.real(iq), zi=self._nb_ch_zi_i)
+            q_filt, self._nb_ch_zi_q = lfilter(
+                self._nb_ch_taps, 1.0, np.imag(iq), zi=self._nb_ch_zi_q)
+            iq    = (i_filt[::self._nb_ch_decim] + 1j * q_filt[::self._nb_ch_decim]).astype(np.complex64)
+            nb_sr = nb_sr / self._nb_ch_decim
+
+        # Signal strength + squelch — measured on the band-limited IQ so only
+        # in-channel energy counts, not adjacent interference or wideband noise.
+        # Normalization by (intermediate_nb_sr / sample_rate)^2 compensates for
+        # the FFT channelizer's amplitude inflation (N/inter_bins = sr/nb_sr),
+        # making the dBFS reading sample-rate independent.
+        _norm = (intermediate_nb_sr / max(self.sample_rate, 1.0)) ** 2
         self.signal_strength = float(np.mean(np.abs(iq) ** 2)) * _norm
         signal_db = 10.0 * np.log10(max(self.signal_strength, 1e-10))
         self.signal_db = signal_db
@@ -366,22 +385,6 @@ class VFO:
             was_open = self._sq_state
             self._sq_state = True
             self.is_active = True
-
-        # Stage 1 — channel filter + decimation.
-        # The FFT channelizer extracts a wide intermediate slice (~200 kHz) for
-        # good spectral resolution. Decimate down to ~2× bandwidth here using a
-        # linear-phase FIR LPF so the FM discriminator sees a clean, narrow signal.
-        bw_changed = abs(self.settings.bandwidth - self._nb_ch_bw) / (self._nb_ch_bw + 1.0) > 0.02
-        sr_changed = abs(nb_sr - self._nb_ch_nb_sr) / (self._nb_ch_nb_sr + 1.0) > 0.02
-        if bw_changed or sr_changed:
-            self._rebuild_nb_channel_filter(nb_sr)
-        if self._nb_ch_taps is not None and self._nb_ch_decim > 1:
-            i_filt, self._nb_ch_zi_i = lfilter(
-                self._nb_ch_taps, 1.0, np.real(iq), zi=self._nb_ch_zi_i)
-            q_filt, self._nb_ch_zi_q = lfilter(
-                self._nb_ch_taps, 1.0, np.imag(iq), zi=self._nb_ch_zi_q)
-            iq    = (i_filt[::self._nb_ch_decim] + 1j * q_filt[::self._nb_ch_decim]).astype(np.complex64)
-            nb_sr = nb_sr / self._nb_ch_decim
 
         # Update proc_rate used by demodulators for normalisation.
         # Rebuild de-emphasis filter only when rate changes significantly.
