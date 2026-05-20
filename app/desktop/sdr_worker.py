@@ -29,6 +29,12 @@ DISPLAY_FFT_SIZE = 32768
 DISPLAY_HZ       = 20
 MIN_BINS         = 4
 
+# Minimum intermediate sample rate for the FFT channelizer.
+# Ensures enough spectral bins to resolve the channel (e.g. FSK tones) even
+# at high HackRF sample rates where bin_hz would otherwise exceed tone spacing.
+# Matches vfo.TARGET_PROC_RATE so the channel filter stage sees a consistent rate.
+_MIN_INTERMEDIATE_SR = 200_000
+
 # Imported lazily inside DSPWorker to keep this module importable without audio deps
 _AUDIO_RATE = 48_000
 _CHUNK      = 2048
@@ -516,16 +522,21 @@ class DSPWorker:
         if not vfo.settings.enabled:
             return None, None
         offset_hz  = vfo.settings.frequency - center_freq
-        n_bins     = max(MIN_BINS, round(vfo.settings.bandwidth / bin_hz))
+        bw_bins    = max(MIN_BINS, round(vfo.settings.bandwidth / bin_hz))
+        # Use at least _MIN_INTERMEDIATE_SR worth of bins so the FFT has enough
+        # spectral resolution to resolve in-channel features (e.g. FSK tones).
+        # The VFO channel filter will decimate down to actual bandwidth afterwards.
+        inter_bins = max(bw_bins, round(_MIN_INTERMEDIATE_SR / bin_hz))
+        inter_bins = min(inter_bins, N // 2)  # can't exceed half the FFT
         center_bin = N // 2 + round(offset_hz / bin_hz)
-        lo         = center_bin - n_bins // 2
-        hi         = lo + n_bins
+        lo         = center_bin - inter_bins // 2
+        hi         = lo + inter_bins
         if lo < 0 or hi > N:
             return None, None
         extracted  = fft_shifted[lo:hi]
         narrowband = np.fft.ifft(np.fft.ifftshift(extracted))
-        narrowband = (narrowband * (N / n_bins)).astype(np.complex64)
-        return narrowband, bin_hz * n_bins
+        narrowband = (narrowband * (N / inter_bins)).astype(np.complex64)
+        return narrowband, bin_hz * inter_bins
 
     def _make_waterfall_row(self, spectrum: np.ndarray) -> np.ndarray:
         if len(spectrum) == 0:

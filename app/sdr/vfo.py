@@ -84,6 +84,15 @@ class VFO:
         self._resample_up: int   = 1
         self._resample_down: int = 1
 
+        # Channel filter for the FFT-channelizer path (process_narrowband_iq).
+        # Decimates the intermediate IQ (at ~200 kHz) down to ~2× bandwidth.
+        self._nb_ch_taps:  Optional[np.ndarray] = None
+        self._nb_ch_decim: int   = 1
+        self._nb_ch_zi_i:  Optional[np.ndarray] = None
+        self._nb_ch_zi_q:  Optional[np.ndarray] = None
+        self._nb_ch_nb_sr: float = 0.0
+        self._nb_ch_bw:    float = 0.0
+
         self._build_filters()
         logger.info(f"VFO {vfo_id} initialized at {center_freq/1e6:.2f} MHz  "
                     f"decim={self._iq_decim}  proc_rate={self._proc_rate/1e3:.0f} kHz")
@@ -144,6 +153,35 @@ class VFO:
             f"VFO {self.id}: SR={sr/1e6:.2f}MHz  decim=÷{d}  "
             f"proc={self._proc_rate/1e3:.0f}kHz  "
             f"resample({self._resample_up},{self._resample_down})"
+        )
+
+    def _rebuild_nb_channel_filter(self, nb_sr: float) -> None:
+        """Design FIR LPF + decimation for the FFT-channelizer (process_narrowband_iq) path.
+
+        Decimates from the intermediate rate (~200 kHz) down to ~2× bandwidth,
+        matching what _build_filters does for the time-domain path.
+        """
+        bw = self.settings.bandwidth
+        self._nb_ch_nb_sr = nb_sr
+        self._nb_ch_bw    = bw
+        # Determine decimation: bring nb_sr down to ~2× BW, but never below AUDIO_RATE
+        decim = max(1, int(nb_sr / max(bw * 2.0, AUDIO_RATE)))
+        if decim <= 1:
+            self._nb_ch_taps  = None
+            self._nb_ch_decim = 1
+            return
+        nyq    = nb_sr / 2.0
+        cutoff = min(0.95, (bw / 2.0) / nyq)
+        n_taps = min(255, max(31, 6 * decim) | 1)  # odd-length linear-phase FIR
+        self._nb_ch_taps  = firwin(n_taps, cutoff, window='hamming')
+        self._nb_ch_decim = decim
+        zi_len = len(self._nb_ch_taps) - 1
+        self._nb_ch_zi_i  = np.zeros(zi_len)
+        self._nb_ch_zi_q  = np.zeros(zi_len)
+        logger.debug(
+            "VFO %s nb-filter: nb_sr=%.0f Hz  bw=%.0f Hz  decim=÷%d  taps=%d  "
+            "final=%.0f Hz",
+            self.id, nb_sr, bw, decim, n_taps, nb_sr / decim,
         )
 
     # ------------------------------------------------------------------
@@ -325,6 +363,22 @@ class VFO:
             self._sq_state = True
             self.is_active = True
 
+        # Stage 1 — channel filter + decimation.
+        # The FFT channelizer extracts a wide intermediate slice (~200 kHz) for
+        # good spectral resolution. Decimate down to ~2× bandwidth here using a
+        # linear-phase FIR LPF so the FM discriminator sees a clean, narrow signal.
+        bw_changed = abs(self.settings.bandwidth - self._nb_ch_bw) / (self._nb_ch_bw + 1.0) > 0.02
+        sr_changed = abs(nb_sr - self._nb_ch_nb_sr) / (self._nb_ch_nb_sr + 1.0) > 0.02
+        if bw_changed or sr_changed:
+            self._rebuild_nb_channel_filter(nb_sr)
+        if self._nb_ch_taps is not None and self._nb_ch_decim > 1:
+            i_filt, self._nb_ch_zi_i = lfilter(
+                self._nb_ch_taps, 1.0, np.real(iq), zi=self._nb_ch_zi_i)
+            q_filt, self._nb_ch_zi_q = lfilter(
+                self._nb_ch_taps, 1.0, np.imag(iq), zi=self._nb_ch_zi_q)
+            iq    = (i_filt[::self._nb_ch_decim] + 1j * q_filt[::self._nb_ch_decim]).astype(np.complex64)
+            nb_sr = nb_sr / self._nb_ch_decim
+
         # Update proc_rate used by demodulators for normalisation.
         # Rebuild de-emphasis filter only when rate changes significantly.
         if abs(nb_sr - self._proc_rate) / (self._proc_rate + 1.0) > 0.02:
@@ -353,11 +407,13 @@ class VFO:
         audio = np.clip(audio, -1.0, 1.0).astype(np.float32)
         self._update_spectrum(audio)
 
-        # Run registered decoders on the audio (and optionally IQ)
+        # Run registered decoders on the audio (and optionally IQ).
+        # The audio has been resampled to audio_target samples, which the mixer
+        # plays at AUDIO_RATE — so decoders must be told AUDIO_RATE, not nb_sr.
         decoder_results = []
         for decoder in self.decoders:
             try:
-                decoder.set_sample_rate(int(self._proc_rate))
+                decoder.set_sample_rate(AUDIO_RATE)
                 if profiler is not None:
                     with profiler.measure(f"decoder / {decoder.name}"):
                         result = decoder.process(iq, audio=audio)
