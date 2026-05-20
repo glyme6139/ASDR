@@ -15,7 +15,7 @@ from typing import Callable, Iterator, Optional
 @dataclass(frozen=True)
 class TimingConfig:
     enabled: bool = True
-    sample_count: int = 100
+    sample_count: int = 10
 
 
 @dataclass(frozen=True)

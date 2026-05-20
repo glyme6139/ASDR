@@ -43,7 +43,6 @@ class IPCAdapterThread(QThread):
                     if   t == 'device_status':
                         self.device_status_changed.emit(msg['data'])
                     elif t == 'decoder_result':
-                        print(msg)
                         self.decoder_result.emit(msg['vfo_id'], msg['name'], msg['text'])
                         if msg.get('data'):
                             self.decoder_data.emit(msg['vfo_id'], msg['name'], msg['data'])

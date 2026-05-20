@@ -41,6 +41,15 @@ INACTIVE_LINE_WIDTH = 1
 _FILL_DB            = -140.0   # fillLevel for spectrum curve
 
 
+class ClickableRegion(pg.LinearRegionItem):
+    """LinearRegionItem that emits sigClicked on mouse click."""
+    sigClicked = Signal(object, object)
+
+    def mouseClickEvent(self, ev):
+        super().mouseClickEvent(ev)
+        self.sigClicked.emit(self, ev)
+
+
 @dataclass
 class VFOMarker:
     region:     pg.LinearRegionItem
@@ -58,7 +67,11 @@ class SpectrumViewer(QObject):
     Emits frequency_clicked (Hz) when the plot is left-clicked.
     """
 
-    frequency_clicked = Signal(float)   # Hz
+    frequency_clicked   = Signal(float)             # Hz — raw spectrum click
+    vfo_marker_changed  = Signal(int, float, float) # vfo_id, freq_hz, bw_hz — drag finished
+    vfo_selected        = Signal(int)               # vfo_id — marker clicked/dragged
+    vfo_drag_active     = Signal(int, float, float) # vfo_id, freq_hz, bw_hz — live drag
+    vfo_drag_done       = Signal(int)               # vfo_id
 
     def __init__(self, plot: pg.PlotItem, profiler: TimingProfiler | None = None):
         super().__init__()
@@ -183,7 +196,7 @@ class SpectrumViewer(QObject):
         center_mhz  = freq_hz / 1e6
         half_bw_mhz = bandwidth_hz / 2e6
 
-        region = pg.LinearRegionItem(
+        region = ClickableRegion(
             values=[center_mhz - half_bw_mhz, center_mhz + half_bw_mhz],
             movable=True,
             brush=pg.mkBrush(pg.mkColor(color + '33')),
@@ -196,8 +209,6 @@ class SpectrumViewer(QObject):
             angle=90,
             movable=True,
             pen=pg.mkPen(color=color, width=INACTIVE_LINE_WIDTH),
-            label=label,
-            labelOpts={'color': color, 'position': 0.95, 'movable': True},
         )
         center_line.setZValue(11)
 
@@ -218,8 +229,20 @@ class SpectrumViewer(QObject):
         center_line.sigPositionChangeFinished.connect(
             lambda line, vid=vfo_id: self._on_marker_dragged(vid, line)
         )
+        center_line.sigPositionChanged.connect(
+            lambda line, vid=vfo_id: self._on_marker_drag_live(vid, line)
+        )
+        center_line.sigClicked.connect(
+            lambda line, ev, vid=vfo_id: self.vfo_selected.emit(vid)
+        )
+        region.sigClicked.connect(
+            lambda reg, ev, vid=vfo_id: self.vfo_selected.emit(vid)
+        )
         region.sigRegionChangeFinished.connect(
             lambda reg, vid=vfo_id: self._on_region_dragged(vid, reg)
+        )
+        region.sigRegionChanged.connect(
+            lambda reg, vid=vfo_id: self._on_region_drag_live(vid, reg)
         )
 
     def update_vfo_marker(self, vfo_id: int, freq_hz: float,
@@ -236,15 +259,7 @@ class SpectrumViewer(QObject):
         marker = self._vfo_markers.get(vfo_id)
         if marker is None:
             return
-        try:
-            # Update the center line label and the floating text item
-            marker.center.setLabel(label)
-        except Exception:
-            pass
-        try:
-            marker.label.setText(label)
-        except Exception:
-            pass
+        marker.label.setText(label)
 
     def remove_vfo_marker(self, vfo_id: int):
         marker = self._vfo_markers.pop(vfo_id, None)
@@ -300,22 +315,40 @@ class SpectrumViewer(QObject):
             yr = self._plot.getViewBox().viewRange()[1]
             marker.label.setPos(line.value(), yr[1])
             marker.region.blockSignals(False)
-        self.frequency_clicked.emit(freq_hz)
+        bw_hz = marker.bandwidth_hz if marker else 0.0
+        self.vfo_selected.emit(vfo_id)
+        self.vfo_marker_changed.emit(vfo_id, freq_hz, bw_hz)
+        self.vfo_drag_done.emit(vfo_id)
+
+    def _on_marker_drag_live(self, vfo_id: int, line: pg.InfiniteLine):
+        marker = self._vfo_markers.get(vfo_id)
+        if marker:
+            freq_hz = line.value() * 1e6
+            self.vfo_drag_active.emit(vfo_id, freq_hz, marker.bandwidth_hz)
 
     def _on_region_dragged(self, vfo_id: int, region: pg.LinearRegionItem):
-        lo, hi     = region.getRegion()
-        center_mhz = (lo + hi) / 2
-        freq_hz    = center_mhz * 1e6
-        marker     = self._vfo_markers.get(vfo_id)
+        lo, hi      = region.getRegion()
+        center_mhz  = (lo + hi) / 2
+        freq_hz     = center_mhz * 1e6
+        bw_hz       = (hi - lo) * 1e6
+        marker      = self._vfo_markers.get(vfo_id)
         if marker:
-            marker.freq_hz     = freq_hz
-            marker.bandwidth_hz = (hi - lo) * 1e6
+            marker.freq_hz      = freq_hz
+            marker.bandwidth_hz = bw_hz
             marker.center.blockSignals(True)
             marker.center.setValue(center_mhz)
             yr = self._plot.getViewBox().viewRange()[1]
             marker.label.setPos(center_mhz, yr[1])
             marker.center.blockSignals(False)
-        self.frequency_clicked.emit(freq_hz)
+        self.vfo_selected.emit(vfo_id)
+        self.vfo_marker_changed.emit(vfo_id, freq_hz, bw_hz)
+        self.vfo_drag_done.emit(vfo_id)
+
+    def _on_region_drag_live(self, vfo_id: int, region: pg.LinearRegionItem):
+        lo, hi = region.getRegion()
+        freq_hz = (lo + hi) / 2 * 1e6
+        bw_hz   = (hi - lo) * 1e6
+        self.vfo_drag_active.emit(vfo_id, freq_hz, bw_hz)
 
 
 class WaterfallViewer:
@@ -363,8 +396,9 @@ class WaterfallViewer:
         self._sample_rate: float = 20e6
         self._update_image_rect()
 
-        self._wf_markers: Dict[int, pg.InfiniteLine] = {}
-        self._wf_labels:  Dict[int, pg.TextItem]     = {}
+        self._wf_markers:  Dict[int, pg.InfiniteLine]       = {}
+        self._wf_labels:   Dict[int, pg.TextItem]           = {}
+        self._wf_regions:  Dict[int, pg.LinearRegionItem]   = {}
 
     def _update_image_rect(self):
         lo_mhz = (self._center_hz - self._sample_rate / 2) / 1e6
@@ -410,11 +444,23 @@ class WaterfallViewer:
         text = pg.TextItem(text=label, color=color, anchor=(0.0, 1.0))
         text.setPos(mhz, self.history_size * 0.97)
         text.setZValue(16)
+
+        region = pg.LinearRegionItem(
+            values=[mhz, mhz],
+            movable=False,
+            brush=pg.mkBrush(pg.mkColor(color + '44')),
+            pen=pg.mkPen(color=color, width=1, style=pg.QtCore.Qt.DashLine),
+        )
+        region.setZValue(14)
+        region.hide()
+
+        self._plot.addItem(region)
         self._plot.addItem(line)
         self._plot.addItem(text)
 
-        self._wf_markers[vfo_id] = line
-        self._wf_labels[vfo_id]  = text
+        self._wf_markers[vfo_id]  = line
+        self._wf_labels[vfo_id]   = text
+        self._wf_regions[vfo_id]  = region
 
     def update_vfo_marker(self, vfo_id: int, freq_hz: float):
         line = self._wf_markers.get(vfo_id)
@@ -434,11 +480,29 @@ class WaterfallViewer:
             except Exception:
                 pass
 
+    def show_vfo_region(self, vfo_id: int, freq_hz: float, bw_hz: float):
+        region = self._wf_regions.get(vfo_id)
+        if region is None:
+            return
+        center_mhz  = freq_hz / 1e6
+        half_bw_mhz = bw_hz / 2e6
+        region.blockSignals(True)
+        region.setRegion([center_mhz - half_bw_mhz, center_mhz + half_bw_mhz])
+        region.blockSignals(False)
+        region.show()
+
+    def hide_vfo_region(self, vfo_id: int):
+        region = self._wf_regions.get(vfo_id)
+        if region is not None:
+            region.hide()
+
     def remove_vfo_marker(self, vfo_id: int):
-        line = self._wf_markers.pop(vfo_id, None)
-        text = self._wf_labels.pop(vfo_id, None)
-        if line: self._plot.removeItem(line)
-        if text: self._plot.removeItem(text)
+        line   = self._wf_markers.pop(vfo_id, None)
+        text   = self._wf_labels.pop(vfo_id, None)
+        region = self._wf_regions.pop(vfo_id, None)
+        if line:   self._plot.removeItem(line)
+        if text:   self._plot.removeItem(text)
+        if region: self._plot.removeItem(region)
 
     # ------------------------------------------------------------------
     # Waterfall update — writes column into ring buffer; render_pending() displays it
@@ -565,6 +629,11 @@ class VisualizationPanel(QWidget):
 
         self.spectrum  = SpectrumViewer(spec_plot, profiler=self._profiler)
         self.waterfall = WaterfallViewer(wf_plot, freq_bins=32768, profiler=self._profiler)
+
+        self.spectrum.vfo_drag_active.connect(
+            lambda vid, f, bw: self.waterfall.show_vfo_region(vid, f, bw)
+        )
+        self.spectrum.vfo_drag_done.connect(self.waterfall.hide_vfo_region)
 
         self._pending_spectrum:  Optional[np.ndarray] = None
         self._pending_waterfall: Optional[np.ndarray] = None

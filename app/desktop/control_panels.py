@@ -504,8 +504,7 @@ class VFOTabPanel(QWidget):
             name = name.strip()
             if not name:
                 name = current
-            # Truncate to fit tab space
-            self._tab_widget.setTabText(idx, name[:12])
+            self._tab_widget.setTabText(idx, name)
             try:
                 self.vfo_renamed.emit(vfo_id, name)
             except Exception:
@@ -520,6 +519,11 @@ class VFOTabPanel(QWidget):
     def active_vfo_id(self) -> Optional[int]:
         widget = self._tab_widget.currentWidget()
         return self._widget_to_vfo_id(widget)
+
+    def set_active_vfo(self, vfo_id: int):
+        tab = self._tabs.get(vfo_id)
+        if tab is not None:
+            self._tab_widget.setCurrentWidget(tab)
 
     def set_frequency(self, vfo_id: int, freq_hz: float):
         """Update the spinbox for a VFO without re-emitting frequency_changed."""
@@ -626,7 +630,11 @@ class VFOTabPanel(QWidget):
         if name:
             idx = self._vfo_id_to_tab_index(vfo_id)
             if idx >= 0:
-                self._tab_widget.setTabText(idx, name[:12])
+                self._tab_widget.setTabText(idx, name)
+            try:
+                self.vfo_renamed.emit(vfo_id, name)
+            except Exception:
+                pass
 
         decoder_names = set(settings.get('decoders', []) or [])
         for i in range(tab.decoder_list.count()):

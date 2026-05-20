@@ -144,3 +144,5 @@ logs/
 config/local_settings.py
 ARTEMIS/
 .claude/
+
+decoder_log_*.txt

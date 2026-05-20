@@ -15,8 +15,9 @@ from PySide6.QtWidgets import (
     QLabel,
     QTextBrowser,
     QFileDialog,
+    QCheckBox,
 )
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 
 from .visualizations import VisualizationPanel, VFO_COLORS
 from .control_panels import ControlPanel
@@ -54,6 +55,10 @@ class ASURMainWindow(QMainWindow):
         self._decoder_windows: dict = {}
         self._center_hz   = DEFAULT_CENTER_HZ
         self._sample_rate = DEFAULT_SAMPLE_RATE
+        # Decoder output logging
+        self._log_decoder_enabled: bool = False
+        self._log_decoder_file_path: str | None = None
+        self._log_decoder_file = None
 
         self.timing_window = TimingWindow()
         self.eye_window = EyeDiagramWindow(self)
@@ -136,6 +141,7 @@ class ASURMainWindow(QMainWindow):
         top_widget.setLayout(top_layout)
 
         self.decoder_panel = self._create_decoder_panel()
+        self.decoder_panel.log_toggled.connect(self._on_decoder_log_toggled)
 
         vlayout = QVBoxLayout()
         vlayout.setContentsMargins(4, 4, 4, 4)
@@ -187,6 +193,8 @@ class ASURMainWindow(QMainWindow):
 
     def _create_decoder_panel(self):
         class DecoderAggregator(QWidget):
+            log_toggled = Signal(bool)
+
             def __init__(self, parent=None):
                 super().__init__(parent)
                 layout = QVBoxLayout(self)
@@ -199,6 +207,10 @@ class ASURMainWindow(QMainWindow):
                 header.setAlignment(Qt.AlignLeft)
                 header_row.addWidget(header)
                 header_row.addStretch()
+                self.log_check = QCheckBox("Log")
+                self.log_check.setToolTip("Log decoder output to file")
+                self.log_check.stateChanged.connect(lambda: self.log_toggled.emit(self.log_check.isChecked()))
+                header_row.addWidget(self.log_check)
                 self.clear_btn = QPushButton("Clear")
                 self.clear_btn.setToolTip("Clear aggregated decoder output")
                 header_row.addWidget(self.clear_btn)
@@ -212,13 +224,12 @@ class ASURMainWindow(QMainWindow):
                 # Wire clear button after output exists
                 self.clear_btn.clicked.connect(self.output.clear)
 
-            def append(self, vfo_id: int, decoder_name: str, text: str, vfo_color: str):
+            def append(self, vfo_name: str, decoder_name: str, text: str, vfo_color: str):
                 import time
-                ts        = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
-                vfo_label = escape(f"VFO{vfo_id}")
+                ts = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
                 line = (
                     f'<span style="color:#9aa0a6">[{escape(ts)}]</span> '
-                    f'<span style="color:{vfo_color}; font-weight:600">{vfo_label}</span> '
+                    f'<span style="color:{vfo_color}; font-weight:600">{escape(vfo_name)}</span> '
                     f'<span style="color:#7dd3fc">[{escape(decoder_name)}]</span> '
                     f'<span style="color:#ffffff">{escape(text)}</span>'
                 )
@@ -290,6 +301,9 @@ class ASURMainWindow(QMainWindow):
 
         # ---- Spectrum click → tune active VFO ----
         self.vis_panel.spectrum.frequency_clicked.connect(self._on_spectrum_clicked)
+        # ---- Spectrum VFO marker drag/click → target that specific VFO ----
+        self.vis_panel.spectrum.vfo_selected.connect(self._on_vfo_selected_from_spectrum)
+        self.vis_panel.spectrum.vfo_marker_changed.connect(self._on_vfo_marker_changed)
 
         # ---- Signal ID panel — track active VFO frequency ----
         self.ctrl_panel.vfo_tab.frequency_changed.connect(self._on_vfo_freq_for_signal_id)
@@ -380,6 +394,25 @@ class ASURMainWindow(QMainWindow):
         self._check_vfo_ranges()
         self.ctrl_panel.signal_id_panel.set_frequency(freq_hz)
 
+    def _on_vfo_selected_from_spectrum(self, vfo_id: int):
+        self.ctrl_panel.vfo_tab.set_active_vfo(vfo_id)
+
+    def _on_vfo_marker_changed(self, vfo_id: int, freq_hz: float, bw_hz: float):
+        """Apply freq/bw from a spectrum marker drag to the correct VFO."""
+        self.ctrl_panel.vfo_tab.set_frequency(vfo_id, freq_hz)
+        self.dsp.set_vfo_frequency(vfo_id, freq_hz)
+        if vfo_id in self._vfo_state:
+            self._vfo_state[vfo_id]['freq_hz'] = freq_hz
+        current_bw = self._vfo_state.get(vfo_id, {}).get('bandwidth_hz', 12_500)
+        if abs(bw_hz - current_bw) > 1.0:
+            self.ctrl_panel.vfo_tab.set_vfo_bandwidth(vfo_id, bw_hz)
+            self.dsp.set_vfo_bandwidth(vfo_id, bw_hz)
+            if vfo_id in self._vfo_state:
+                self._vfo_state[vfo_id]['bandwidth_hz'] = bw_hz
+        self.vis_panel.waterfall.update_vfo_marker(vfo_id, freq_hz)
+        self._check_vfo_ranges()
+        self.ctrl_panel.signal_id_panel.set_frequency(freq_hz)
+
     def _on_vfo_freq_for_signal_id(self, vfo_id: int, freq_hz: float):
         if vfo_id == self.ctrl_panel.vfo_tab.active_vfo_id():
             self.ctrl_panel.signal_id_panel.set_frequency(freq_hz)
@@ -464,13 +497,25 @@ class ASURMainWindow(QMainWindow):
 
     def _on_decoder_result(self, vfo_id: int, decoder_name: str, text: str):
         with self._profiler.measure("UI / decoder result"):
-            self.ctrl_panel.vfo_tab.add_decoder_output(vfo_id, self._vfo_state[vfo_id]['name'], text)
+            self.ctrl_panel.vfo_tab.add_decoder_output(vfo_id, decoder_name, text)
             try:
                 if self.decoder_panel is not None:
                     vfo_color = VFO_COLORS[vfo_id % len(VFO_COLORS)]
-                    self.decoder_panel.append(vfo_id, self._vfo_state[vfo_id]['name'], text, vfo_color)
+                    vfo_name = self._vfo_state.get(vfo_id, {}).get('name', f'VFO {vfo_id + 1}')
+                    self.decoder_panel.append(vfo_name, decoder_name, text, vfo_color)
             except Exception:
                 logger.exception("Failed to append to global decoder panel")
+            # Write to log file if logging is enabled
+            if self._log_decoder_enabled and self._log_decoder_file:
+                try:
+                    import time
+                    ts = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
+                    vfo_name = self._vfo_state[vfo_id]['name']
+                    log_line = f"[{ts}] {vfo_name} [{decoder_name}] {text}\n"
+                    self._log_decoder_file.write(log_line)
+                    self._log_decoder_file.flush()
+                except Exception as e:
+                    logger.exception(f"Failed to write to decoder log: {e}")
 
     # ------------------------------------------------------------------
     # Device status
@@ -563,11 +608,49 @@ class ASURMainWindow(QMainWindow):
         self.eye_window.set_vfo_choices(choices, active_vfo_id=self.ctrl_panel.vfo_tab.active_vfo_id())
 
     # ------------------------------------------------------------------
+    # Decoder logging
+    # ------------------------------------------------------------------
+
+    def _on_decoder_log_toggled(self, checked: bool):
+        if checked:
+            # Auto-generate timestamped filename
+            import time
+            ts = time.strftime('%Y-%m-%d_%H-%M-%S', time.localtime())
+            fname = f"decoder_log_{ts}.txt"
+            try:
+                self._log_decoder_file = open(fname, 'w', encoding='utf-8')
+                self._log_decoder_file_path = fname
+                self._log_decoder_enabled = True
+                logger.info(f"Decoder logging started: {fname}")
+            except Exception as e:
+                logger.error(f"Failed to open decoder log file: {e}")
+                self.decoder_panel.log_check.setChecked(False)
+                self._log_decoder_enabled = False
+        else:
+            # Close the file
+            if self._log_decoder_file:
+                try:
+                    self._log_decoder_file.close()
+                    logger.info(f"Decoder logging stopped: {self._log_decoder_file_path}")
+                except Exception:
+                    pass
+                self._log_decoder_file = None
+            self._log_decoder_enabled = False
+            self._log_decoder_file_path = None
+
+    # ------------------------------------------------------------------
     # Shutdown
     # ------------------------------------------------------------------
 
     def closeEvent(self, event):
         logger.info("Closing ASDR…")
+        # Close decoder log file if open
+        if self._log_decoder_file:
+            try:
+                self._log_decoder_file.close()
+            except Exception:
+                pass
+            self._log_decoder_file = None
         # Save session
         try:
             # only autosave if enabled
