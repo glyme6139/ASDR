@@ -1,9 +1,9 @@
 {
   "device": {
     "center_freq": 466000000.0,
-    "sample_rate": 20000000,
-    "lna": 32,
-    "vga": 22,
+    "sample_rate": 1000000,
+    "lna": 40,
+    "vga": 62,
     "amp_enabled": true,
     "autosave": true
   },
@@ -14,7 +14,7 @@
       "demod_mode": "NFM",
       "bandwidth": 14000.0,
       "volume": 0.01,
-      "squelch_level": 70.0,
+      "squelch_level": 0.0,
       "squelch_enabled": true,
       "enabled": true,
       "decoders": [
@@ -25,9 +25,9 @@
       "name": "POCSAG 2",
       "frequency": 466175000.0,
       "demod_mode": "NFM",
-      "bandwidth": 13000.0,
+      "bandwidth": 14000.0,
       "volume": 0.01,
-      "squelch_level": 70.0,
+      "squelch_level": 0.0,
       "squelch_enabled": true,
       "enabled": true,
       "decoders": [
@@ -36,11 +36,11 @@
     },
     {
       "name": "POCSAG 3",
-      "frequency": 466204000.0,
+      "frequency": 466206048.0,
       "demod_mode": "NFM",
-      "bandwidth": 13000.0,
+      "bandwidth": 14000.0,
       "volume": 0.01,
-      "squelch_level": 70.0,
+      "squelch_level": 0.0,
       "squelch_enabled": true,
       "enabled": true,
       "decoders": [

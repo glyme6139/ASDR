@@ -25,6 +25,7 @@ from .dsp_process import DSPProcess
 from .ipc_adapter import IPCAdapterThread
 from .eye_diagram_window import EyeDiagramWindow
 from .oscilloscope_window import OscilloscopeWindow
+from .signal_decoder_window import SignalDecoderWindow
 from .signal_rate_window import SignalRateWindow
 from .timing import TimingConfig, profiler_from_config
 from .timing_window import TimingWindow
@@ -66,6 +67,7 @@ class ASURMainWindow(QMainWindow):
         self.timing_window = TimingWindow()
         self.eye_window = EyeDiagramWindow(self)
         self.osc_window = OscilloscopeWindow(self)
+        self.decoder_win = SignalDecoderWindow(self)
         self.rate_window = SignalRateWindow(self)
 
         self.dsp = DSPProcess(timing=self._timing)
@@ -185,6 +187,8 @@ class ASURMainWindow(QMainWindow):
             self._osc_action.triggered.connect(self._show_osc_window)
             self._rate_action = view_menu.addAction("Signal Rate")
             self._rate_action.triggered.connect(self._show_rate_window)
+            self._decoder_win_action = view_menu.addAction("Signal Decoder")
+            self._decoder_win_action.triggered.connect(self._show_decoder_win)
         except Exception:
             pass
 
@@ -286,16 +290,36 @@ class ASURMainWindow(QMainWindow):
             self._on_bookmark_add_requested
         )
 
-        # ---- Device panel ----
-        self.ctrl_panel.device_panel.center_freq_changed.connect(self._on_center_freq_changed)
-        self.ctrl_panel.device_panel.sample_rate_changed.connect(self._on_sample_rate_changed)
-        self.ctrl_panel.device_panel.lna_gain_changed.connect(
-            lambda v: self.dsp.set_lna_gain(float(v))
+        # ---- Source panel (HackRF controls) ----
+        sp = self.ctrl_panel.source_panel
+        sp.center_freq_changed.connect(self._on_center_freq_changed)
+        sp.sample_rate_changed.connect(self._on_sample_rate_changed)
+        sp.lna_gain_changed.connect(lambda v: self.dsp.set_lna_gain(float(v)))
+        sp.vga_gain_changed.connect(lambda v: self.dsp.set_vga_gain(float(v)))
+        sp.amp_enabled_changed.connect(self.dsp.set_amp_enable)
+
+        # ---- Source panel (new: connect/disconnect, file source, recording, playback) ----
+        sp.connect_requested.connect(self._on_hackrf_connect)
+        sp.disconnect_requested.connect(self.dsp.disconnect_hackrf)
+        sp.sweep_connect_requested.connect(self._on_sweep_connect)
+        sp.sweep_disconnect_requested.connect(self.dsp.disconnect_hackrf)
+        sp.file_source_opened.connect(
+            lambda path, cf, sr: self.dsp.set_source('file', path, cf, sr)
         )
-        self.ctrl_panel.device_panel.vga_gain_changed.connect(
-            lambda v: self.dsp.set_vga_gain(float(v))
+        sp.record_start_requested.connect(
+            lambda path, fmt, dur: self.dsp.start_recording(path, fmt, dur)
         )
-        self.ctrl_panel.device_panel.amp_enabled_changed.connect(self.dsp.set_amp_enable)
+        sp.record_stop_requested.connect(self.dsp.stop_recording)
+        sp.playback_play_requested.connect(self.dsp.playback_resume)
+        sp.playback_pause_requested.connect(self.dsp.playback_pause)
+        sp.playback_stop_requested.connect(self.dsp.playback_stop)
+        sp.playback_speed_changed.connect(self.dsp.set_playback_speed)
+        sp.playback_seek_requested.connect(self.dsp.playback_seek)
+        sp.playback_loop_changed.connect(self.dsp.set_playback_loop)
+
+        # ---- IPC → source panel (playback position + recording status) ----
+        self.ipc.playback_position.connect(sp.update_playback_position, Q)
+        self.ipc.recording_status.connect(sp.update_recording_status, Q)
 
         # ---- Spectrum click → tune active VFO ----
         self.vis_panel.spectrum.frequency_clicked.connect(self._on_spectrum_clicked)
@@ -313,6 +337,8 @@ class ASURMainWindow(QMainWindow):
         self.eye_window.vfo_changed.connect(self._on_eye_window_vfo_changed)
         self.osc_window.visibility_changed.connect(self._on_osc_window_visibility_changed)
         self.osc_window.vfo_changed.connect(self._on_osc_window_vfo_changed)
+        self.decoder_win.visibility_changed.connect(self._on_decoder_win_visibility_changed)
+        self.decoder_win.vfo_changed.connect(self._on_decoder_win_vfo_changed)
 
     # ------------------------------------------------------------------
     # VFO lifecycle
@@ -427,6 +453,8 @@ class ASURMainWindow(QMainWindow):
             self.eye_window.set_active_vfo(vfo_id)
         if self.osc_window.isVisible() and self.osc_window._current_vfo is None:
             self.osc_window.set_active_vfo(vfo_id)
+        if self.decoder_win.isVisible() and self.decoder_win._current_vfo is None:
+            self.decoder_win.set_active_vfo(vfo_id)
 
     def _on_signal_strength(self, updates: dict):
         for vfo_id, (db, is_active) in updates.items():
@@ -436,6 +464,27 @@ class ASURMainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # Device control handlers
     # ------------------------------------------------------------------
+
+    def _on_hackrf_connect(self):
+        s = self.ctrl_panel.source_panel.get_settings()
+        self.dsp.connect_hackrf(
+            center_freq=s['center_freq'],
+            sample_rate=s['sample_rate'],
+            lna=s['lna'],
+            vga=s['vga'],
+            amp=s['amp_enabled'],
+        )
+
+    def _on_sweep_connect(self):
+        s = self.ctrl_panel.source_panel.get_sweep_settings()
+        self.dsp.connect_sweep(
+            start_freq=s['start_freq'],
+            stop_freq=s['stop_freq'],
+            sample_rate=s['sample_rate'],
+            lna=s['lna'],
+            vga=s['vga'],
+            amp=s['amp'],
+        )
 
     def _on_center_freq_changed(self, freq_hz: float):
         self._center_hz = freq_hz
@@ -454,6 +503,7 @@ class ASURMainWindow(QMainWindow):
             pass
         self.eye_window.set_sample_rate(sample_rate)
         self.osc_window.set_sample_rate(sample_rate)
+        self.decoder_win.set_sample_rate(sample_rate)
 
     # ------------------------------------------------------------------
     # VFO range enforcement
@@ -530,7 +580,7 @@ class ASURMainWindow(QMainWindow):
     def _on_device_status(self, status: dict):
         with self._profiler.measure("UI / device status"):
             if 'connected' in status:
-                self.ctrl_panel.device_panel.set_connected(status['connected'])
+                self.ctrl_panel.source_panel.set_connected(status['connected'])
 
             connected = status.get('connected', True)
             center    = status.get('frequency', self._center_hz)
@@ -558,6 +608,7 @@ class ASURMainWindow(QMainWindow):
             if 'sample_rate' in status:
                 self.eye_window.set_sample_rate(sr)
                 self.osc_window.set_sample_rate(sr)
+                self.decoder_win.set_sample_rate(sr)
 
     def _on_error(self, error_msg: str):
         logger.error(f"DSP Error: {error_msg}")
@@ -574,6 +625,7 @@ class ASURMainWindow(QMainWindow):
             return
         self.eye_window.push_samples(vfo_id, samples)
         self.osc_window.push_samples(vfo_id, samples)
+        self.decoder_win.push_samples(vfo_id, samples)
 
     def _on_eye_window_vfo_changed(self, vfo_id: object):
         if vfo_id is None:
@@ -586,6 +638,24 @@ class ASURMainWindow(QMainWindow):
             self.dsp.set_eye_stream(False, None)
             return
         self.dsp.set_eye_stream(self.osc_window.isVisible(), int(vfo_id))
+
+    def _on_decoder_win_vfo_changed(self, vfo_id: object):
+        if vfo_id is None:
+            return
+        self.dsp.set_eye_stream(self.decoder_win.isVisible(), int(vfo_id))
+
+    def _on_decoder_win_visibility_changed(self, visible: bool):
+        if visible:
+            if self.decoder_win._current_vfo is None:
+                vfo_id = self.ctrl_panel.vfo_tab.active_vfo_id()
+                if vfo_id is not None:
+                    self.decoder_win.set_active_vfo(vfo_id)
+                    return
+            self.dsp.set_eye_stream(True, self.decoder_win._current_vfo)
+            return
+        # Only stop the stream if no other consumer is visible
+        if not self.eye_window.isVisible() and not self.osc_window.isVisible():
+            self.dsp.set_eye_stream(False, None)
 
     def _on_timing_sample_count_changed(self, n: int):
         self._profiler.set_sample_count(n)
@@ -622,6 +692,13 @@ class ASURMainWindow(QMainWindow):
         self.rate_window.raise_()
         self.rate_window.activateWindow()
 
+    def _show_decoder_win(self):
+        self._sync_vfo_choices()
+        self.decoder_win.set_sample_rate(self._sample_rate)
+        self.decoder_win.show()
+        self.decoder_win.raise_()
+        self.decoder_win.activateWindow()
+
     def _on_eye_window_visibility_changed(self, visible: bool):
         if visible:
             if self.eye_window._current_vfo is None:
@@ -657,6 +734,7 @@ class ASURMainWindow(QMainWindow):
         active = self.ctrl_panel.vfo_tab.active_vfo_id()
         self.eye_window.set_vfo_choices(choices, active_vfo_id=active)
         self.osc_window.set_vfo_choices(choices, active_vfo_id=active)
+        self.decoder_win.set_vfo_choices(choices, active_vfo_id=active)
         self.rate_window.set_vfo_choices(choices, active_vfo_id=active)
 
     # ------------------------------------------------------------------
@@ -714,7 +792,7 @@ class ASURMainWindow(QMainWindow):
             if autosave:
                 from app import session
                 sess = {
-                    'device': self.ctrl_panel.device_panel.get_settings(),
+                    'device': self.ctrl_panel.source_panel.get_settings(),
                     'vfos': list(self.ctrl_panel.vfo_tab.get_all_vfo_settings().values()),
                 }
                 session.save_session(sess)
@@ -726,6 +804,7 @@ class ASURMainWindow(QMainWindow):
         self._decoder_windows.clear()
         self.eye_window.close()
         self.osc_window.close()
+        self.decoder_win.close()
         self.rate_window.close()
 
         self.ipc.stop()
@@ -742,7 +821,7 @@ class ASURMainWindow(QMainWindow):
                 return
             from app import session
             sess = {
-                'device': self.ctrl_panel.device_panel.get_settings(),
+                'device': self.ctrl_panel.source_panel.get_settings(),
                 'vfos': list(self.ctrl_panel.vfo_tab.get_all_vfo_settings().values()),
             }
             session.save_session(sess, fname)
@@ -752,7 +831,7 @@ class ASURMainWindow(QMainWindow):
     def _apply_session(self, sess: dict) -> None:
         dev = sess.get('device', {})
         if dev:
-            self.ctrl_panel.device_panel.apply_settings(dev)
+            self.ctrl_panel.source_panel.apply_settings(dev)
             try:
                 if hasattr(self, '_autosave_action') and 'autosave' in dev:
                     self._autosave_action.setChecked(bool(dev.get('autosave', True)))

@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QSlider,
     QPushButton, QComboBox, QGroupBox,
     QListWidget, QListWidgetItem, QTextEdit, QTabWidget, QSizePolicy,
-    QCheckBox, QFileDialog, QInputDialog, QToolButton,
+    QCheckBox, QFileDialog, QInputDialog, QToolButton, QFrame,
 )
 from PySide6.QtWidgets import QScrollArea
 from .widgets import AcceptCommaDoubleSpinBox
@@ -966,31 +966,109 @@ class BookmarkPanel(QWidget):
 
 
 # ---------------------------------------------------------------------------
-# Device panel (unchanged from original, lightly cleaned up)
+# Source panel  (replaces the old DevicePanel; supports HackRF + IQ file)
 # ---------------------------------------------------------------------------
 
-class DevicePanel(QWidget):
-    """Device settings and status panel."""
+class SourcePanel(QWidget):
+    """Source selection panel: HackRF live capture, HackRF sweep, or IQ file playback.
 
-    center_freq_changed = Signal(float)  # Hz
-    sample_rate_changed = Signal(float)  # Hz
-    lna_gain_changed = Signal(int)
-    vga_gain_changed = Signal(int)
-    amp_enabled_changed = Signal(bool)
+    Keeps the same external signal/method names as the old DevicePanel so
+    the rest of the codebase needs only minimal changes.
+    """
+
+    # ---- Existing DevicePanel signals (backward-compat) ----
+    center_freq_changed  = Signal(float)   # Hz
+    sample_rate_changed  = Signal(float)   # Hz
+    lna_gain_changed     = Signal(int)
+    vga_gain_changed     = Signal(int)
+    amp_enabled_changed  = Signal(bool)
+
+    # ---- New signals ----
+    connect_requested        = Signal()
+    disconnect_requested     = Signal()
+    sweep_connect_requested  = Signal()
+    sweep_disconnect_requested = Signal()
+    file_source_opened       = Signal(str, float, float)   # path, center_freq, sample_rate
+    record_start_requested   = Signal(str, str, float)     # file_path, fmt, max_duration_s
+    record_stop_requested    = Signal()
+    playback_play_requested  = Signal()
+    playback_pause_requested = Signal()
+    playback_stop_requested  = Signal()
+    playback_speed_changed   = Signal(float)
+    playback_seek_requested  = Signal(int)     # sample position
+    playback_loop_changed    = Signal(bool)
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        # Playback scrubber state
+        self._file_total_samples: int = 0
+        self._file_sample_rate: float = 20e6
+        self._scrubber_seeking: bool = False
+        self._recording_path: str = ''
         self._initUI()
+
+    # ------------------------------------------------------------------
+    # UI construction
+    # ------------------------------------------------------------------
 
     def _initUI(self):
         layout = QVBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
 
+        # Source type selector
+        src_row = QHBoxLayout()
+        src_row.addWidget(QLabel("Source:"))
+        self.source_combo = QComboBox()
+        self.source_combo.addItems(["HackRF", "HackRF Sweep", "IQ File"])
+        src_row.addWidget(self.source_combo)
+        src_row.addStretch()
+        layout.addLayout(src_row)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.HLine)
+        sep.setStyleSheet("color: #404040;")
+        layout.addWidget(sep)
+
+        # HackRF panel
+        self._hackrf_panel = self._make_hackrf_panel()
+        layout.addWidget(self._hackrf_panel)
+
+        # HackRF Sweep panel (hidden by default)
+        self._sweep_panel = self._make_sweep_panel()
+        layout.addWidget(self._sweep_panel)
+        self._sweep_panel.setVisible(False)
+
+        # IQ File panel (hidden by default)
+        self._file_panel = self._make_file_panel()
+        layout.addWidget(self._file_panel)
+        self._file_panel.setVisible(False)
+
+        self.source_combo.currentTextChanged.connect(self._on_source_changed)
+        self.setLayout(layout)
+
+    def _make_hackrf_panel(self) -> QWidget:
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(4)
+
+        # Status + connect/disconnect buttons
         status_row = QHBoxLayout()
         status_row.addWidget(QLabel("Status:"))
         self.status_label = QLabel("Disconnected")
         self.status_label.setStyleSheet("color: red;")
         status_row.addWidget(self.status_label)
-        layout.addLayout(status_row)
+        status_row.addStretch()
+        self.connect_btn = QPushButton("Connect")
+        self.connect_btn.setToolTip("(Re)connect to HackRF")
+        self.connect_btn.clicked.connect(self.connect_requested.emit)
+        self.disconnect_btn = QPushButton("Disconnect")
+        self.disconnect_btn.setToolTip("Disconnect HackRF (switches to demo mode)")
+        self.disconnect_btn.clicked.connect(self.disconnect_requested.emit)
+        status_row.addWidget(self.connect_btn)
+        status_row.addWidget(self.disconnect_btn)
+        lay.addLayout(status_row)
 
         # Center frequency
         cf_row = QHBoxLayout()
@@ -1000,11 +1078,9 @@ class DevicePanel(QWidget):
         self.cf_spin.setValue(100.0)
         self.cf_spin.setDecimals(3)
         self.cf_spin.setSingleStep(1.0)
-        self.cf_spin.valueChanged.connect(
-            lambda v: self.center_freq_changed.emit(v * 1e6)
-        )
+        self.cf_spin.valueChanged.connect(lambda v: self.center_freq_changed.emit(v * 1e6))
         cf_row.addWidget(self.cf_spin)
-        layout.addLayout(cf_row)
+        lay.addLayout(cf_row)
 
         # Sample rate
         sr_row = QHBoxLayout()
@@ -1016,9 +1092,9 @@ class DevicePanel(QWidget):
             lambda v: self.sample_rate_changed.emit(int(float(v) * 1e6))
         )
         sr_row.addWidget(self.sr_combo)
-        layout.addLayout(sr_row)
+        lay.addLayout(sr_row)
 
-        # LNA
+        # LNA gain
         lna_row = QHBoxLayout()
         lna_row.addWidget(QLabel("LNA (dB):"))
         self.lna_slider = QSlider(Qt.Horizontal)
@@ -1032,9 +1108,9 @@ class DevicePanel(QWidget):
         self.lna_label.setFixedWidth(28)
         lna_row.addWidget(self.lna_label)
         self.lna_slider.valueChanged.connect(lambda v: self.lna_label.setText(str(v)))
-        layout.addLayout(lna_row)
+        lay.addLayout(lna_row)
 
-        # VGA
+        # VGA gain
         vga_row = QHBoxLayout()
         vga_row.addWidget(QLabel("VGA (dB):"))
         self.vga_slider = QSlider(Qt.Horizontal)
@@ -1048,67 +1124,406 @@ class DevicePanel(QWidget):
         self.vga_label.setFixedWidth(28)
         vga_row.addWidget(self.vga_label)
         self.vga_slider.valueChanged.connect(lambda v: self.vga_label.setText(str(v)))
-        layout.addLayout(vga_row)
+        lay.addLayout(vga_row)
 
-        # RF Amp
+        # RF amp
         amp_row = QHBoxLayout()
         self.amp_check = QCheckBox("RF Amp (~11 dB)")
         self.amp_check.setChecked(False)
         self.amp_check.toggled.connect(self.amp_enabled_changed.emit)
         amp_row.addWidget(self.amp_check)
         amp_row.addStretch()
-        layout.addLayout(amp_row)
+        lay.addLayout(amp_row)
 
-        # Session controls moved to the main window menu
+        # ---- Recording group ----
+        rec_group = QGroupBox("Recording")
+        rec_lay = QVBoxLayout(rec_group)
+        rec_lay.setSpacing(4)
 
-        self.setLayout(layout)
+        rec_ctrl = QHBoxLayout()
+        self.record_btn = QPushButton("● Record")
+        self.record_btn.setCheckable(True)
+        self.record_btn.setToolTip("Start/stop IQ recording")
+        self.record_btn.clicked.connect(self._on_record_clicked)
+        rec_ctrl.addWidget(self.record_btn)
+
+        rec_ctrl.addWidget(QLabel("Fmt:"))
+        self.record_fmt_combo = QComboBox()
+        self.record_fmt_combo.addItems(["IQ", "RAW", "WAV"])
+        self.record_fmt_combo.setToolTip("IQ=complex64, RAW=int8, WAV=16-bit stereo")
+        rec_ctrl.addWidget(self.record_fmt_combo)
+
+        rec_ctrl.addWidget(QLabel("Max:"))
+        self.record_max_spin = QDoubleSpinBox()
+        self.record_max_spin.setRange(0, 3600)
+        self.record_max_spin.setValue(0)
+        self.record_max_spin.setDecimals(0)
+        self.record_max_spin.setSuffix(" s")
+        self.record_max_spin.setToolTip("Maximum recording duration in seconds (0 = unlimited)")
+        self.record_max_spin.setFixedWidth(72)
+        rec_ctrl.addWidget(self.record_max_spin)
+        rec_lay.addLayout(rec_ctrl)
+
+        self.record_status_label = QLabel("Idle")
+        self.record_status_label.setStyleSheet("color: #888888; font-size: 11px;")
+        rec_lay.addWidget(self.record_status_label)
+        lay.addWidget(rec_group)
+
+        return w
+
+    def _make_sweep_panel(self) -> QWidget:
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(4)
+
+        # Status + connect/disconnect
+        sw_status_row = QHBoxLayout()
+        sw_status_row.addWidget(QLabel("Status:"))
+        self.sweep_status_label = QLabel("Disconnected")
+        self.sweep_status_label.setStyleSheet("color: red;")
+        sw_status_row.addWidget(self.sweep_status_label)
+        sw_status_row.addStretch()
+        self.sweep_connect_btn = QPushButton("Connect")
+        self.sweep_connect_btn.setToolTip("Start sweep")
+        self.sweep_connect_btn.clicked.connect(self.sweep_connect_requested.emit)
+        self.sweep_disconnect_btn = QPushButton("Disconnect")
+        self.sweep_disconnect_btn.setToolTip("Stop sweep")
+        self.sweep_disconnect_btn.clicked.connect(self.sweep_disconnect_requested.emit)
+        sw_status_row.addWidget(self.sweep_connect_btn)
+        sw_status_row.addWidget(self.sweep_disconnect_btn)
+        lay.addLayout(sw_status_row)
+
+        # Start / stop frequency
+        freq_row = QHBoxLayout()
+        freq_row.addWidget(QLabel("Start (MHz):"))
+        self.sweep_start_spin = QDoubleSpinBox()
+        self.sweep_start_spin.setRange(1.0, 6000.0)
+        self.sweep_start_spin.setValue(80.0)
+        self.sweep_start_spin.setDecimals(1)
+        self.sweep_start_spin.setSingleStep(10.0)
+        freq_row.addWidget(self.sweep_start_spin)
+        freq_row.addWidget(QLabel("Stop (MHz):"))
+        self.sweep_stop_spin = QDoubleSpinBox()
+        self.sweep_stop_spin.setRange(1.0, 6000.0)
+        self.sweep_stop_spin.setValue(108.0)
+        self.sweep_stop_spin.setDecimals(1)
+        self.sweep_stop_spin.setSingleStep(10.0)
+        freq_row.addWidget(self.sweep_stop_spin)
+        lay.addLayout(freq_row)
+
+        # Step width (= sample rate per step)
+        step_row = QHBoxLayout()
+        step_row.addWidget(QLabel("Step (MHz):"))
+        self.sweep_step_combo = QComboBox()
+        self.sweep_step_combo.addItems(['1', '2', '4', '8', '16', '20'])
+        self.sweep_step_combo.setCurrentText('20')
+        self.sweep_step_combo.setToolTip("Bandwidth captured per step (= HackRF sample rate)")
+        step_row.addWidget(self.sweep_step_combo)
+        step_row.addStretch()
+        lay.addLayout(step_row)
+
+        # LNA gain
+        sw_lna_row = QHBoxLayout()
+        sw_lna_row.addWidget(QLabel("LNA (dB):"))
+        self.sweep_lna_slider = QSlider(Qt.Horizontal)
+        self.sweep_lna_slider.setRange(0, 40)
+        self.sweep_lna_slider.setValue(24)
+        self.sweep_lna_slider.setTickPosition(QSlider.TicksBelow)
+        self.sweep_lna_slider.setTickInterval(8)
+        sw_lna_row.addWidget(self.sweep_lna_slider)
+        self.sweep_lna_label = QLabel("24")
+        self.sweep_lna_label.setFixedWidth(28)
+        sw_lna_row.addWidget(self.sweep_lna_label)
+        self.sweep_lna_slider.valueChanged.connect(
+            lambda v: self.sweep_lna_label.setText(str(v))
+        )
+        lay.addLayout(sw_lna_row)
+
+        # VGA gain
+        sw_vga_row = QHBoxLayout()
+        sw_vga_row.addWidget(QLabel("VGA (dB):"))
+        self.sweep_vga_slider = QSlider(Qt.Horizontal)
+        self.sweep_vga_slider.setRange(0, 62)
+        self.sweep_vga_slider.setValue(20)
+        self.sweep_vga_slider.setTickPosition(QSlider.TicksBelow)
+        self.sweep_vga_slider.setTickInterval(10)
+        sw_vga_row.addWidget(self.sweep_vga_slider)
+        self.sweep_vga_label = QLabel("20")
+        self.sweep_vga_label.setFixedWidth(28)
+        sw_vga_row.addWidget(self.sweep_vga_label)
+        self.sweep_vga_slider.valueChanged.connect(
+            lambda v: self.sweep_vga_label.setText(str(v))
+        )
+        lay.addLayout(sw_vga_row)
+
+        # RF amp
+        sw_amp_row = QHBoxLayout()
+        self.sweep_amp_check = QCheckBox("RF Amp (~11 dB)")
+        self.sweep_amp_check.setChecked(False)
+        sw_amp_row.addWidget(self.sweep_amp_check)
+        sw_amp_row.addStretch()
+        lay.addLayout(sw_amp_row)
+
+        return w
+
+    def _make_file_panel(self) -> QWidget:
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(4)
+
+        # File browser
+        browse_row = QHBoxLayout()
+        self.file_browse_btn = QPushButton("Browse…")
+        self.file_browse_btn.clicked.connect(self._on_browse_file)
+        browse_row.addWidget(self.file_browse_btn)
+        self.file_path_label = QLabel("No file loaded")
+        self.file_path_label.setStyleSheet("color: #888888; font-size: 11px;")
+        self.file_path_label.setWordWrap(True)
+        browse_row.addWidget(self.file_path_label, stretch=1)
+        lay.addLayout(browse_row)
+
+        # Metadata line
+        self.file_info_label = QLabel("")
+        self.file_info_label.setStyleSheet("color: #aaaaaa; font-size: 11px;")
+        lay.addWidget(self.file_info_label)
+
+        # Playback buttons + speed + loop
+        pb_row = QHBoxLayout()
+        self.play_btn  = QPushButton("▶")
+        self.pause_btn = QPushButton("⏸")
+        self.stop_btn  = QPushButton("⏹")
+        for btn, tip in ((self.play_btn, "Play"), (self.pause_btn, "Pause"),
+                         (self.stop_btn, "Stop / Rewind")):
+            btn.setFixedWidth(32)
+            btn.setToolTip(tip)
+        self.play_btn.clicked.connect(self.playback_play_requested.emit)
+        self.pause_btn.clicked.connect(self.playback_pause_requested.emit)
+        self.stop_btn.clicked.connect(self.playback_stop_requested.emit)
+        pb_row.addWidget(self.play_btn)
+        pb_row.addWidget(self.pause_btn)
+        pb_row.addWidget(self.stop_btn)
+
+        pb_row.addWidget(QLabel("Speed:"))
+        self.speed_combo = QComboBox()
+        self.speed_combo.addItems(["0.25x", "0.5x", "1x", "2x", "4x"])
+        self.speed_combo.setCurrentText("1x")
+        self.speed_combo.currentTextChanged.connect(self._on_speed_changed)
+        pb_row.addWidget(self.speed_combo)
+
+        self.loop_check = QCheckBox("Loop")
+        self.loop_check.toggled.connect(self.playback_loop_changed.emit)
+        pb_row.addWidget(self.loop_check)
+        pb_row.addStretch()
+        lay.addLayout(pb_row)
+
+        # Scrubber
+        self.scrubber = QSlider(Qt.Horizontal)
+        self.scrubber.setRange(0, 1000)
+        self.scrubber.setValue(0)
+        self.scrubber.setToolTip("Drag to seek")
+        self.scrubber.sliderMoved.connect(self._on_scrubber_moved)
+        self.scrubber.sliderReleased.connect(self._on_scrubber_released)
+        lay.addWidget(self.scrubber)
+
+        self.position_label = QLabel("0:00 / 0:00")
+        self.position_label.setAlignment(Qt.AlignCenter)
+        self.position_label.setStyleSheet("color: #aaaaaa; font-size: 11px;")
+        lay.addWidget(self.position_label)
+
+        return w
+
+    # ------------------------------------------------------------------
+    # Source switching
+    # ------------------------------------------------------------------
+
+    def _on_source_changed(self, source: str):
+        self._hackrf_panel.setVisible(source == "HackRF")
+        self._sweep_panel.setVisible(source == "HackRF Sweep")
+        self._file_panel.setVisible(source == "IQ File")
+
+    # ------------------------------------------------------------------
+    # HackRF recording
+    # ------------------------------------------------------------------
+
+    def _on_record_clicked(self):
+        import time as _time
+        if self.record_btn.isChecked():
+            fmt = self.record_fmt_combo.currentText()
+            ext_map = {'IQ': '.iq', 'RAW': '.raw', 'WAV': '.wav'}
+            ext = ext_map.get(fmt, '.iq')
+            ts  = _time.strftime('%Y%m%d_%H%M%S')
+            default = f"recording_{ts}{ext}"
+            path, _ = QFileDialog.getSaveFileName(
+                self, "Save IQ Recording", default,
+                f"{fmt} Files (*{ext});;All Files (*)"
+            )
+            if not path:
+                self.record_btn.setChecked(False)
+                return
+            self._recording_path = path
+            max_dur = float(self.record_max_spin.value())
+            self.record_start_requested.emit(path, fmt, max_dur)
+            self.record_btn.setText("⏹ Stop")
+            self.record_status_label.setText(f"Recording: {os.path.basename(path)}")
+            self.record_status_label.setStyleSheet("color: #ff5555; font-size: 11px;")
+        else:
+            self.record_stop_requested.emit()
+            self.record_btn.setText("● Record")
+            self.record_status_label.setText("Idle")
+            self.record_status_label.setStyleSheet("color: #888888; font-size: 11px;")
+
+    # ------------------------------------------------------------------
+    # IQ file browsing and playback controls
+    # ------------------------------------------------------------------
+
+    def _on_browse_file(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open IQ File", "",
+            "IQ Files (*.iq *.raw *.wav);;All Files (*)"
+        )
+        if not path:
+            return
+
+        # Try companion metadata
+        center_freq = self.cf_spin.value() * 1e6
+        sample_rate = int(float(self.sr_combo.currentText()) * 1e6)
+        meta_path = path + '.json'
+        if os.path.exists(meta_path):
+            try:
+                with open(meta_path, encoding='utf-8') as f:
+                    meta = json.load(f)
+                center_freq = float(meta.get('center_freq', center_freq))
+                sample_rate = float(meta.get('sample_rate', sample_rate))
+            except Exception:
+                pass
+
+        name = os.path.basename(path)
+        self.file_path_label.setText(name)
+        self.file_path_label.setToolTip(path)
+        self.file_path_label.setStyleSheet("color: #cccccc; font-size: 11px;")
+        self.file_info_label.setText(
+            f"{center_freq / 1e6:.3f} MHz  |  {sample_rate / 1e6:.1f} MHz SR"
+        )
+
+        self._file_total_samples = 0
+        self._file_sample_rate = sample_rate
+        self.scrubber.setValue(0)
+        self.position_label.setText("0:00 / 0:00")
+
+        self.file_source_opened.emit(path, center_freq, sample_rate)
+
+    def _on_speed_changed(self, text: str):
+        speed_map = {'0.25x': 0.25, '0.5x': 0.5, '1x': 1.0, '2x': 2.0, '4x': 4.0}
+        self.playback_speed_changed.emit(speed_map.get(text, 1.0))
+
+    def _on_scrubber_moved(self, value: int):
+        self._scrubber_seeking = True
+        if self._file_total_samples > 0 and self._file_sample_rate > 0:
+            pos = int(value * self._file_total_samples / 1000)
+            t = pos / self._file_sample_rate
+            total_t = self._file_total_samples / self._file_sample_rate
+            self.position_label.setText(f"{self._fmt_time(t)} / {self._fmt_time(total_t)}")
+
+    def _on_scrubber_released(self):
+        self._scrubber_seeking = False
+        if self._file_total_samples > 0:
+            pos = int(self.scrubber.value() * self._file_total_samples / 1000)
+            self.playback_seek_requested.emit(pos)
+
+    # ------------------------------------------------------------------
+    # Public update API (called from main_window via IPC signals)
+    # ------------------------------------------------------------------
+
+    def update_playback_position(self, current: int, total: int, sample_rate: float):
+        self._file_total_samples = total
+        self._file_sample_rate   = sample_rate
+        if not self._scrubber_seeking and total > 0:
+            slider_val = int(current * 1000 / total)
+            self.scrubber.blockSignals(True)
+            self.scrubber.setValue(slider_val)
+            self.scrubber.blockSignals(False)
+        if sample_rate > 0 and total > 0:
+            t       = current / sample_rate
+            total_t = total   / sample_rate
+            self.position_label.setText(f"{self._fmt_time(t)} / {self._fmt_time(total_t)}")
+
+    def update_recording_status(self, recording: bool, file_path: str, bytes_written: int):
+        if recording:
+            mb = bytes_written / (1024 * 1024)
+            self.record_status_label.setText(
+                f"Recording: {os.path.basename(file_path)} ({mb:.1f} MB)"
+            )
+            self.record_status_label.setStyleSheet("color: #ff5555; font-size: 11px;")
+        else:
+            self.record_btn.setChecked(False)
+            self.record_btn.setText("● Record")
+            self.record_status_label.setText("Idle")
+            self.record_status_label.setStyleSheet("color: #888888; font-size: 11px;")
+
+    # ------------------------------------------------------------------
+    # DevicePanel-compatible API (called from main_window / session code)
+    # ------------------------------------------------------------------
 
     def set_connected(self, connected: bool):
-        if connected:
-            self.status_label.setText("Connected")
-            self.status_label.setStyleSheet("color: green;")
-        else:
-            self.status_label.setText("Disconnected")
-            self.status_label.setStyleSheet("color: red;")
+        text  = "Connected" if connected else "Disconnected"
+        style = "color: green;" if connected else "color: red;"
+        self.status_label.setText(text)
+        self.status_label.setStyleSheet(style)
+        self.sweep_status_label.setText(text)
+        self.sweep_status_label.setStyleSheet(style)
 
     def get_settings(self) -> dict:
         return {
-            'center_freq': float(self.cf_spin.value()) * 1e6,
-            'sample_rate': int(float(self.sr_combo.currentText()) * 1e6),
-            'lna': int(self.lna_slider.value()),
-            'vga': int(self.vga_slider.value()),
-            'amp_enabled': bool(self.amp_check.isChecked()),
-            'autosave': True,
+            'center_freq':  float(self.cf_spin.value()) * 1e6,
+            'sample_rate':  int(float(self.sr_combo.currentText()) * 1e6),
+            'lna':          int(self.lna_slider.value()),
+            'vga':          int(self.vga_slider.value()),
+            'amp_enabled':  bool(self.amp_check.isChecked()),
+            'autosave':     True,
+        }
+
+    def get_sweep_settings(self) -> dict:
+        return {
+            'start_freq':  float(self.sweep_start_spin.value()) * 1e6,
+            'stop_freq':   float(self.sweep_stop_spin.value()) * 1e6,
+            'sample_rate': int(float(self.sweep_step_combo.currentText()) * 1e6),
+            'lna':         int(self.sweep_lna_slider.value()),
+            'vga':         int(self.sweep_vga_slider.value()),
+            'amp':         bool(self.sweep_amp_check.isChecked()),
         }
 
     def apply_settings(self, settings: dict) -> None:
         try:
             if 'center_freq' in settings:
-                self.cf_spin.setValue(settings.get('center_freq', 100e6) / 1e6)
+                self.cf_spin.setValue(settings['center_freq'] / 1e6)
             if 'sample_rate' in settings:
-                sr_mhz = int(settings.get('sample_rate', 20_000_000) / 1e6)
-                self.sr_combo.setCurrentText(str(sr_mhz))
+                self.sr_combo.setCurrentText(str(int(settings['sample_rate'] / 1e6)))
             if 'lna' in settings:
-                self.lna_slider.setValue(int(settings.get('lna', 24)))
+                self.lna_slider.setValue(int(settings['lna']))
             if 'vga' in settings:
-                self.vga_slider.setValue(int(settings.get('vga', 20)))
+                self.vga_slider.setValue(int(settings['vga']))
             if 'amp_enabled' in settings:
-                self.amp_check.setChecked(bool(settings.get('amp_enabled', False)))
-            # autosave moved to main menu; ignore here
+                self.amp_check.setChecked(bool(settings['amp_enabled']))
         except Exception:
             pass
 
     def get_autosave_enabled(self) -> bool:
-        # Session autosave is controlled from the main window Session menu.
         return True
 
     def connect_session_signals(self, save_callback, autosave_callback=None):
-        # Deprecated: session controls moved to main window menu. Keep for compatibility.
-        try:
-            # Provide a no-op connection to preserve callers' expectations.
-            return
-        except Exception:
-            return
+        return   # no-op: session controls are in the main window menu
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _fmt_time(seconds: float) -> str:
+        m = int(seconds // 60)
+        s = int(seconds % 60)
+        return f"{m}:{s:02d}"
 
 
 # ---------------------------------------------------------------------------
@@ -1137,14 +1552,14 @@ class ControlPanel(QWidget):
         content_layout.setContentsMargins(6, 6, 6, 6)
         content_layout.setSpacing(8)
 
-        self.device_panel = DevicePanel()
+        self.source_panel = SourcePanel()
         self.vfo_tab = VFOTabPanel()
         self.bookmark_panel = BookmarkPanel(
             get_vfo_snapshot=self.vfo_tab.get_active_vfo_snapshot
         )
         self.signal_id_panel = SignalIDPanel()
 
-        device_group   = CollapsibleSection("Device",    self.device_panel)
+        device_group   = CollapsibleSection("Source",    self.source_panel)
         vfo_group      = CollapsibleSection("VFOs",      self.vfo_tab)
         bookmark_group = CollapsibleSection("Bookmarks", self.bookmark_panel)
         signal_id_group = CollapsibleSection(

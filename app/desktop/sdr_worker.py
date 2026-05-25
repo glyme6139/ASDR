@@ -78,8 +78,13 @@ class DSPWorker:
         self.vfo_manager = VFOManager(center_freq=100e6, sample_rate=20e6, max_vfos=10)
         self.audio_mixer = AudioMixer()
 
-        self.receiver  = None
-        self.running   = False
+        self.receiver     = None
+        self.recorder     = None    # IQRecorder instance when recording
+        self._source_mode = 'demo'  # 'hackrf' | 'file' | 'sweep' | 'demo'
+        self.running      = False
+
+        self._sweep_start = 80e6
+        self._sweep_stop  = 108e6
 
         self._iq_buf  = np.zeros(FFT_SIZE, dtype=np.complex64)
         self._buf_idx = 0
@@ -111,17 +116,18 @@ class DSPWorker:
             self.running = True
             self.audio_mixer.start()
 
-            sr = self.receiver.config.sample_rate if use_hackrf else self.DEMO_SAMPLE_RATE
-            self._update_rate_params(sr)
+            if use_hackrf:
+                self._source_mode = 'hackrf'
+                sr = self.receiver.config.sample_rate
+            else:
+                self._source_mode = 'demo'
+                sr = self.DEMO_SAMPLE_RATE
+                self.vfo_manager.update_sample_rate(sr)
 
+            self._update_rate_params(sr)
             self._emit({'type': 'device_status',
                         'data': {'connected': True, 'frequency': 100e6, 'sample_rate': sr}})
-
-            if use_hackrf:
-                self._real_hw_loop()
-            else:
-                logger.info("DSPWorker: demo mode")
-                self._demo_loop()
+            self._main_loop()
 
         except Exception as e:
             logger.error(f"DSPWorker error: {e}", exc_info=True)
@@ -156,37 +162,43 @@ class DSPWorker:
         return True
 
     # ------------------------------------------------------------------
-    # Main loops
+    # Unified main loop
     # ------------------------------------------------------------------
 
-    def _real_hw_loop(self):
-        while self.running:
-            self._drain_commands()
-            time.sleep(0.02)
+    def _main_loop(self):
+        """Single loop handling all source modes.
 
-    def _demo_loop(self):
-        sr         = self.DEMO_SAMPLE_RATE
-        dt         = self.DEMO_TICK
-        chunk_size = int(sr * dt)
-        self.vfo_manager.update_sample_rate(sr)
+        HackRF / file: IQ arrives via callbacks — just drain commands and sleep.
+        Demo: generate synthetic IQ inline at DEMO_SAMPLE_RATE.
+        Source switches (set_source / connect_hackrf / disconnect_hackrf) happen
+        inside _drain_commands() and update self._source_mode atomically.
+        """
+        demo_sr    = self.DEMO_SAMPLE_RATE
+        demo_dt    = self.DEMO_TICK
+        demo_chunk = int(demo_sr * demo_dt)
         next_tick  = time.monotonic()
 
         while self.running:
             self._drain_commands()
-            now = time.monotonic()
-            if now >= next_tick:
-                t   = np.arange(chunk_size) / sr
-                f1  = sr * 0.05
-                f2  = sr * 0.15
-                mod = np.sin(2 * np.pi * 300 * t)
-                sig = (
-                    0.6 * np.exp(2j * np.pi * (f1 * t + 0.3 * mod)) +
-                    0.3 * np.exp(2j * np.pi * (f2 * t + 0.2 * np.sin(2 * np.pi * 440 * t)))
-                )
-                noise = 0.05 * (np.random.randn(chunk_size) + 1j * np.random.randn(chunk_size))
-                self._process_iq((sig + noise).astype(np.complex64))
-                next_tick += dt
-            time.sleep(max(0.001, min(next_tick - time.monotonic(), 0.02)))
+
+            if self._source_mode == 'demo':
+                now = time.monotonic()
+                if now >= next_tick:
+                    t   = np.arange(demo_chunk) / demo_sr
+                    f1  = demo_sr * 0.05
+                    f2  = demo_sr * 0.15
+                    mod = np.sin(2 * np.pi * 300 * t)
+                    sig = (
+                        0.6 * np.exp(2j * np.pi * (f1 * t + 0.3 * mod)) +
+                        0.3 * np.exp(2j * np.pi * (f2 * t + 0.2 * np.sin(2 * np.pi * 440 * t)))
+                    )
+                    noise = 0.05 * (np.random.randn(demo_chunk) + 1j * np.random.randn(demo_chunk))
+                    self._process_iq((sig + noise).astype(np.complex64))
+                    next_tick += demo_dt
+                time.sleep(max(0.001, min(next_tick - time.monotonic(), 0.02)))
+            else:
+                # hackrf or file: callbacks drive _process_iq
+                time.sleep(0.02)
 
     # ------------------------------------------------------------------
     # Command dispatch
@@ -256,6 +268,47 @@ class DSPWorker:
             self._eye_enabled = bool(msg.get('enabled', False))
             vfo_id = msg.get('vfo_id')
             self._eye_vfo_id = int(vfo_id) if vfo_id is not None else None
+        # ---- source switching ----
+        elif cmd == 'set_source':
+            self._do_set_source(
+                msg.get('source_type', 'demo'),
+                msg.get('file_path', ''),
+                msg.get('center_freq', 100e6),
+                msg.get('sample_rate', 20e6),
+            )
+        elif cmd == 'connect_hackrf':
+            self._do_connect_hackrf(msg)
+        elif cmd == 'connect_sweep':
+            self._do_connect_sweep(msg)
+        elif cmd == 'disconnect_hackrf':
+            self._do_disconnect()
+        # ---- recording ----
+        elif cmd == 'start_recording':
+            self._do_start_recording(
+                msg['file_path'], msg['format'], msg.get('max_duration', 0.0)
+            )
+        elif cmd == 'stop_recording':
+            self._do_stop_recording()
+        # ---- file playback controls ----
+        elif cmd == 'playback_pause':
+            if self.receiver and hasattr(self.receiver, 'pause_streaming'):
+                self.receiver.pause_streaming()
+        elif cmd == 'playback_resume':
+            if self.receiver and hasattr(self.receiver, 'resume_streaming'):
+                self.receiver.resume_streaming()
+        elif cmd == 'playback_stop':
+            if self.receiver and hasattr(self.receiver, 'stop_receiver'):
+                self.receiver.stop_receiver()
+                self._source_mode = 'demo'
+        elif cmd == 'playback_speed':
+            if self.receiver and hasattr(self.receiver, 'set_speed'):
+                self.receiver.set_speed(float(msg.get('speed', 1.0)))
+        elif cmd == 'playback_seek':
+            if self.receiver and hasattr(self.receiver, 'seek'):
+                self.receiver.seek(int(msg.get('pos', 0)))
+        elif cmd == 'playback_loop':
+            if self.receiver and hasattr(self.receiver, 'set_loop'):
+                self.receiver.set_loop(bool(msg.get('loop', False)))
 
     # ------------------------------------------------------------------
     # Hardware commands
@@ -302,6 +355,205 @@ class DSPWorker:
                     self.receiver.start_receiver()
             except Exception as e:
                 logger.error(f"Amp enable: {e}")
+
+    # ------------------------------------------------------------------
+    # Source switching helpers
+    # ------------------------------------------------------------------
+
+    def _do_set_source(self, source_type: str, file_path: str = '',
+                       center_freq: float = 100e6, sample_rate: float = 20e6):
+        # Stop current receiver
+        if self.receiver:
+            try:
+                self.receiver.stop_receiver()
+            except Exception as e:
+                logger.warning("set_source: stop error: %s", e)
+        self.receiver = None
+
+        if source_type == 'file' and file_path:
+            from app.sdr.iq_file_source import IQFileSource, IQFileConfig
+            config = IQFileConfig(file_path=file_path, center_freq=center_freq,
+                                  sample_rate=sample_rate)
+            src = IQFileSource(config)
+            src.on_iq_data         = self._process_iq
+            src.on_position_update = self._on_file_position
+            if src.connect():
+                self.receiver = src
+                cf = src.config.center_freq
+                sr = src.config.sample_rate
+                self.vfo_manager.update_center_freq(cf)
+                self.vfo_manager.update_sample_rate(sr)
+                self._update_rate_params(sr)
+                self._source_mode = 'file'
+                src.start_receiver()
+                self._emit({'type': 'device_status',
+                            'data': {'connected': True, 'frequency': cf, 'sample_rate': sr}})
+                self._emit({'type': 'playback_position',
+                            'current': 0, 'total': src._total, 'sample_rate': sr})
+                return
+            self._emit({'type': 'error', 'message': f'Failed to load IQ file: {file_path}'})
+
+        elif source_type == 'hackrf':
+            if self._try_init_hackrf():
+                self._source_mode = 'hackrf'
+                sr = self.receiver.config.sample_rate
+                self.vfo_manager.update_sample_rate(sr)
+                self._update_rate_params(sr)
+                self._emit({'type': 'device_status',
+                            'data': {'connected': True,
+                                     'frequency': self.receiver.config.center_freq,
+                                     'sample_rate': sr}})
+                return
+
+        # Fallback: demo mode
+        self._to_demo_mode()
+
+    def _do_connect_hackrf(self, msg: dict):
+        if self.receiver:
+            try:
+                self.receiver.stop_receiver()
+            except Exception as e:
+                logger.warning("connect_hackrf: stop error: %s", e)
+        self.receiver = None
+
+        from app.sdr.hackrf_receiver import HackRFReceiver, HackRFConfig
+        config = HackRFConfig(
+            center_freq=msg.get('center_freq', 100e6),
+            sample_rate=msg.get('sample_rate', 20e6),
+            lna_gain=int(msg.get('lna', 24)),
+            rx_vga_gain=int(msg.get('vga', 20)),
+            amp_enabled=bool(msg.get('amp', False)),
+        )
+        self.receiver = HackRFReceiver(config=config)
+        self.receiver.on_iq_data = self._process_iq
+        if not self.receiver.connect() or self.receiver.device is None:
+            self.receiver = None
+            self._to_demo_mode()
+            return
+        self.receiver.start_receiver()
+        self._source_mode = 'hackrf'
+        cf = config.center_freq
+        sr = config.sample_rate
+        self.vfo_manager.update_center_freq(cf)
+        self.vfo_manager.update_sample_rate(sr)
+        self._update_rate_params(sr)
+        self._emit({'type': 'device_status',
+                    'data': {'connected': True, 'frequency': cf, 'sample_rate': sr}})
+
+    def _do_connect_sweep(self, msg: dict):
+        if self.receiver:
+            try:
+                self.receiver.stop_receiver()
+            except Exception as e:
+                logger.warning("connect_sweep: stop error: %s", e)
+        self.receiver = None
+
+        from app.sdr.hackrf_sweep_source import HackRFSweepSource, HackRFSweepConfig
+        cfg = HackRFSweepConfig(
+            start_freq  = msg.get('start_freq',  80e6),
+            stop_freq   = msg.get('stop_freq',  108e6),
+            sample_rate = msg.get('sample_rate', 20e6),
+            lna_gain    = int(msg.get('lna', 24)),
+            vga_gain    = int(msg.get('vga', 20)),
+            amp_enabled = bool(msg.get('amp', False)),
+        )
+        src = HackRFSweepSource(cfg)
+        src.on_sweep_fft = self._on_sweep_fft
+
+        if not src.connect() or src._device is None:
+            self._to_demo_mode()
+            return
+
+        self.receiver        = src
+        self._sweep_start    = cfg.start_freq
+        self._sweep_stop     = cfg.stop_freq
+        self._source_mode    = 'sweep'
+
+        center = (cfg.start_freq + cfg.stop_freq) / 2
+        bw     = cfg.stop_freq - cfg.start_freq
+        self.vfo_manager.update_center_freq(center)
+        self.vfo_manager.update_sample_rate(bw)
+        self._update_rate_params(bw)
+
+        src.start_receiver()
+        self._emit({'type': 'device_status',
+                    'data': {'connected': True, 'frequency': center, 'sample_rate': bw}})
+
+    def _on_sweep_fft(self, bins_db: np.ndarray, center_hz: float, bw_hz: float):
+        """Compositor: map one step's FFT into the shared spec_arr/wf_arr."""
+        total_bw = self._sweep_stop - self._sweep_start
+        if total_bw <= 0:
+            return
+
+        step_lo = center_hz - bw_hz / 2
+        step_hi = center_hz + bw_hz / 2
+
+        bin_lo = int((step_lo - self._sweep_start) / total_bw * DISPLAY_FFT_SIZE)
+        bin_hi = int((step_hi - self._sweep_start) / total_bw * DISPLAY_FFT_SIZE)
+        bin_lo = max(0, bin_lo)
+        bin_hi = min(DISPLAY_FFT_SIZE, bin_hi)
+        if bin_lo >= bin_hi:
+            return
+
+        n_out = bin_hi - bin_lo
+        n_in  = len(bins_db)
+        if n_in != n_out:
+            x         = np.linspace(0, n_in - 1, n_out)
+            resampled = np.interp(x, np.arange(n_in), bins_db).astype(np.float32)
+        else:
+            resampled = bins_db
+
+        np.copyto(self._spec_arr[bin_lo:bin_hi], resampled)
+
+        # Regenerate waterfall slice using the floor from the current full spectrum
+        wf_full = self._make_waterfall_row(self._spec_arr)
+        np.copyto(self._wf_arr, wf_full)
+        self._disp_gen.value += 1
+
+    def _do_disconnect(self):
+        if self.receiver:
+            try:
+                self.receiver.stop_receiver()
+            except Exception as e:
+                logger.warning("disconnect: stop error: %s", e)
+        self.receiver = None
+        self._to_demo_mode()
+
+    def _to_demo_mode(self):
+        self._source_mode = 'demo'
+        self.vfo_manager.update_sample_rate(self.DEMO_SAMPLE_RATE)
+        self._update_rate_params(self.DEMO_SAMPLE_RATE)
+        self._emit({'type': 'device_status',
+                    'data': {'connected': False, 'sample_rate': self.DEMO_SAMPLE_RATE}})
+
+    def _on_file_position(self, current: int, total: int, sample_rate: float):
+        self._emit({'type': 'playback_position',
+                    'current': current, 'total': total, 'sample_rate': sample_rate})
+
+    # ------------------------------------------------------------------
+    # Recording helpers
+    # ------------------------------------------------------------------
+
+    def _do_start_recording(self, file_path: str, fmt: str, max_duration: float):
+        if self.recorder:
+            self.recorder.stop()
+        from app.sdr.iq_recorder import IQRecorder
+        self.recorder = IQRecorder()
+        self.recorder.on_status = self._on_recorder_status
+        self.recorder.start(file_path, fmt, self.vfo_manager.center_freq,
+                            self._sample_rate, max_duration)
+
+    def _do_stop_recording(self):
+        if self.recorder:
+            self.recorder.stop()
+            self.recorder = None
+
+    def _on_recorder_status(self, recording: bool, file_path: str, bytes_written: int):
+        self._emit({'type': 'recording_status',
+                    'recording': recording, 'file_path': file_path,
+                    'bytes_written': bytes_written})
+        if not recording:
+            self.recorder = None
 
     _TETRA_MIN_BW = 50_000  # Hz — TETRA needs ≥2× the 18 kbaud symbol rate
 
@@ -368,6 +620,8 @@ class DSPWorker:
     def _process_iq(self, iq_data: np.ndarray):
         if not self.running:
             return
+        if self.recorder:
+            self.recorder.write(iq_data)
         try:
             with self._profiler.measure("DSP / iq callback total"):
                 # Fill rolling display buffer (circular)
@@ -565,6 +819,9 @@ class DSPWorker:
     # ------------------------------------------------------------------
 
     def _cleanup(self):
+        if self.recorder:
+            try: self.recorder.stop()
+            except Exception: pass
         if self.receiver:
             try: self.receiver.stop_receiver()
             except Exception: pass

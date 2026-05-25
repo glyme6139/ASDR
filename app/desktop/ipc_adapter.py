@@ -26,6 +26,8 @@ class IPCAdapterThread(QThread):
     timing_report         = Signal(object)
     vfo_bandwidth_update  = Signal(int, float)      # vfo_id, bandwidth_hz
     eye_samples           = Signal(int, object)     # vfo_id, list[float]
+    playback_position     = Signal(int, int, float) # current_sample, total_samples, sample_rate
+    recording_status      = Signal(bool, str, int)  # recording, file_path, bytes_written
 
     def __init__(self, result_queue, parent=None, profiler: TimingProfiler | None = None):
         super().__init__(parent)
@@ -56,6 +58,14 @@ class IPCAdapterThread(QThread):
                         self.vfo_bandwidth_update.emit(msg['vfo_id'], msg['bandwidth_hz'])
                     elif t == 'eye_samples':
                         self.eye_samples.emit(msg['vfo_id'], msg['samples'])
+                    elif t == 'playback_position':
+                        self.playback_position.emit(
+                            msg['current'], msg['total'], msg['sample_rate']
+                        )
+                    elif t == 'recording_status':
+                        self.recording_status.emit(
+                            msg['recording'], msg['file_path'], msg['bytes_written']
+                        )
             except queue.Empty:
                 pass
             except Exception as e:

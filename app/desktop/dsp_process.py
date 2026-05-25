@@ -197,3 +197,63 @@ class DSPProcess:
 
     def set_timing_sample_count(self, n: int):
         self._send({'cmd': 'set_timing_sample_count', 'n': int(n)})
+
+    # ------------------------------------------------------------------
+    # Source switching
+    # ------------------------------------------------------------------
+
+    def set_source(self, source_type: str, file_path: str = '',
+                   center_freq: float = 100e6, sample_rate: float = 20e6):
+        self._send({'cmd': 'set_source', 'source_type': source_type,
+                    'file_path': file_path, 'center_freq': float(center_freq),
+                    'sample_rate': float(sample_rate)})
+
+    def connect_hackrf(self, center_freq: float = 100e6, sample_rate: float = 20e6,
+                       lna: int = 24, vga: int = 20, amp: bool = False):
+        self._send({'cmd': 'connect_hackrf',
+                    'center_freq': float(center_freq), 'sample_rate': float(sample_rate),
+                    'lna': int(lna), 'vga': int(vga), 'amp': bool(amp)})
+
+    def connect_sweep(self, start_freq: float = 80e6, stop_freq: float = 108e6,
+                      sample_rate: float = 20e6, lna: int = 24, vga: int = 20,
+                      amp: bool = False):
+        self._send({'cmd': 'connect_sweep',
+                    'start_freq': float(start_freq), 'stop_freq': float(stop_freq),
+                    'sample_rate': float(sample_rate),
+                    'lna': int(lna), 'vga': int(vga), 'amp': bool(amp)})
+
+    def disconnect_hackrf(self):
+        self._send({'cmd': 'disconnect_hackrf'})
+
+    # ------------------------------------------------------------------
+    # IQ recording
+    # ------------------------------------------------------------------
+
+    def start_recording(self, file_path: str, fmt: str, max_duration: float = 0.0):
+        self._send({'cmd': 'start_recording', 'file_path': file_path,
+                    'format': fmt, 'max_duration': float(max_duration)})
+
+    def stop_recording(self):
+        self._send({'cmd': 'stop_recording'})
+
+    # ------------------------------------------------------------------
+    # File playback controls
+    # ------------------------------------------------------------------
+
+    def playback_pause(self):
+        self._send({'cmd': 'playback_pause'})
+
+    def playback_resume(self):
+        self._send({'cmd': 'playback_resume'})
+
+    def playback_stop(self):
+        self._send({'cmd': 'playback_stop'})
+
+    def set_playback_speed(self, speed: float):
+        self._send({'cmd': 'playback_speed', 'speed': float(speed)})
+
+    def playback_seek(self, pos_samples: int):
+        self._send({'cmd': 'playback_seek', 'pos': int(pos_samples)})
+
+    def set_playback_loop(self, loop: bool):
+        self._send({'cmd': 'playback_loop', 'loop': bool(loop)})

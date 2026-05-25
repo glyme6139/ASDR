@@ -50,27 +50,6 @@ You can filter by category — a few highlights worth noting for your mountain c
 - Zigbee (#16) pushes the HackRF to its upper frequency limit (2.4 GHz) — works but marginal.
 
 
-## Phase 2: Recording & Replay
-
-### IQ Recording
-- [ ] Record raw IQ data to disk
-- [ ] Support multiple file formats (WAV, RAW, IQ)
-- [ ] Configurable recording length/size limits
-- [ ] Metadata logging (frequency, gain, timestamp)
-- [ ] File browser in UI
-
-### Playback
-- [ ] Playback recorded IQ files
-- [ ] Frame-by-frame stepping
-- [ ] Speed control
-- [ ] Time scrubber
-
-### Use Cases
-- [ ] Offline signal analysis
-- [ ] Replay for testing decoders
-- [ ] Signal archival and sharing
-
----
 
 ## Phase 3: Signal Classification & ML
 
@@ -130,7 +109,6 @@ You can filter by category — a few highlights worth noting for your mountain c
 ### Data Visualization
 - [ ] Heatmap display
 - [ ] Signal constellation diagram
-- [ ] Eye diagram
 - [ ] Spectrogram with zoom
 
 ### Controls
