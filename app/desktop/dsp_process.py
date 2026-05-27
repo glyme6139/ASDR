@@ -216,11 +216,12 @@ class DSPProcess:
 
     def connect_sweep(self, start_freq: float = 80e6, stop_freq: float = 108e6,
                       sample_rate: float = 20e6, lna: int = 24, vga: int = 20,
-                      amp: bool = False):
+                      amp: bool = False, bin_width: int = 100_000):
         self._send({'cmd': 'connect_sweep',
                     'start_freq': float(start_freq), 'stop_freq': float(stop_freq),
                     'sample_rate': float(sample_rate),
-                    'lna': int(lna), 'vga': int(vga), 'amp': bool(amp)})
+                    'lna': int(lna), 'vga': int(vga), 'amp': bool(amp),
+                    'bin_width': int(bin_width)})
 
     def disconnect_hackrf(self):
         self._send({'cmd': 'disconnect_hackrf'})

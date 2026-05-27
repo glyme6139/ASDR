@@ -18,7 +18,7 @@ from PySide6.QtWidgets import QScrollArea
 from .widgets import AcceptCommaDoubleSpinBox
 from app.decoders.modulation import MODULATION_DECODER_NAMES
 QDoubleSpinBox = AcceptCommaDoubleSpinBox
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, Signal, QTimer
 import logging
 
 logger = logging.getLogger(__name__)
@@ -188,7 +188,7 @@ class SingleVFOTab(QWidget):
         mode_row = QHBoxLayout()
         mode_row.addWidget(QLabel("Mode:"))
         self.demod_combo = QComboBox()
-        self.demod_combo.addItems(['NFM', 'WFM', 'AM', 'USB', 'LSB', 'DSB', 'CW', 'IQ'])
+        self.demod_combo.addItems(['NFM', 'WFM', 'AM', 'USB', 'LSB', 'DSB', 'CW', 'IQ', 'Raw IQ'])
         self.demod_combo.currentTextChanged.connect(
             lambda mode: self.demod_changed.emit(self.vfo_id, mode)
         )
@@ -986,8 +986,6 @@ class SourcePanel(QWidget):
     # ---- New signals ----
     connect_requested        = Signal()
     disconnect_requested     = Signal()
-    sweep_connect_requested  = Signal()
-    sweep_disconnect_requested = Signal()
     file_source_opened       = Signal(str, float, float)   # path, center_freq, sample_rate
     record_start_requested   = Signal(str, str, float)     # file_path, fmt, max_duration_s
     record_stop_requested    = Signal()
@@ -1005,6 +1003,14 @@ class SourcePanel(QWidget):
         self._file_sample_rate: float = 20e6
         self._scrubber_seeking: bool = False
         self._recording_path: str = ''
+        self._is_connected: bool = False
+
+        # Debounce timer — fires connect_requested 500 ms after last sweep param change
+        self._sweep_reconnect_timer = QTimer(self)
+        self._sweep_reconnect_timer.setSingleShot(True)
+        self._sweep_reconnect_timer.setInterval(500)
+        self._sweep_reconnect_timer.timeout.connect(self._apply_sweep_params)
+
         self._initUI()
 
     # ------------------------------------------------------------------
@@ -1020,7 +1026,7 @@ class SourcePanel(QWidget):
         src_row = QHBoxLayout()
         src_row.addWidget(QLabel("Source:"))
         self.source_combo = QComboBox()
-        self.source_combo.addItems(["HackRF", "HackRF Sweep", "IQ File"])
+        self.source_combo.addItems(["HackRF", "IQ File"])
         src_row.addWidget(self.source_combo)
         src_row.addStretch()
         layout.addLayout(src_row)
@@ -1030,14 +1036,9 @@ class SourcePanel(QWidget):
         sep.setStyleSheet("color: #404040;")
         layout.addWidget(sep)
 
-        # HackRF panel
+        # HackRF panel (includes sweep mode toggle)
         self._hackrf_panel = self._make_hackrf_panel()
         layout.addWidget(self._hackrf_panel)
-
-        # HackRF Sweep panel (hidden by default)
-        self._sweep_panel = self._make_sweep_panel()
-        layout.addWidget(self._sweep_panel)
-        self._sweep_panel.setVisible(False)
 
         # IQ File panel (hidden by default)
         self._file_panel = self._make_file_panel()
@@ -1061,7 +1062,7 @@ class SourcePanel(QWidget):
         status_row.addWidget(self.status_label)
         status_row.addStretch()
         self.connect_btn = QPushButton("Connect")
-        self.connect_btn.setToolTip("(Re)connect to HackRF")
+        self.connect_btn.setToolTip("Connect / restart with current settings")
         self.connect_btn.clicked.connect(self.connect_requested.emit)
         self.disconnect_btn = QPushButton("Disconnect")
         self.disconnect_btn.setToolTip("Disconnect HackRF (switches to demo mode)")
@@ -1070,7 +1071,23 @@ class SourcePanel(QWidget):
         status_row.addWidget(self.disconnect_btn)
         lay.addLayout(status_row)
 
-        # Center frequency
+        # Sweep mode toggle
+        sweep_toggle_row = QHBoxLayout()
+        self.sweep_mode_check = QCheckBox("Sweep Mode")
+        self.sweep_mode_check.setToolTip(
+            "Sweep across a frequency range instead of fixed capture"
+        )
+        self.sweep_mode_check.toggled.connect(self._on_sweep_mode_toggled)
+        sweep_toggle_row.addWidget(self.sweep_mode_check)
+        sweep_toggle_row.addStretch()
+        lay.addLayout(sweep_toggle_row)
+
+        # ---- Normal-mode controls (hidden in sweep mode) ----
+        self._hackrf_normal_controls = QWidget()
+        nc = QVBoxLayout(self._hackrf_normal_controls)
+        nc.setContentsMargins(0, 0, 0, 0)
+        nc.setSpacing(4)
+
         cf_row = QHBoxLayout()
         cf_row.addWidget(QLabel("Center Freq (MHz):"))
         self.cf_spin = QDoubleSpinBox()
@@ -1080,9 +1097,8 @@ class SourcePanel(QWidget):
         self.cf_spin.setSingleStep(1.0)
         self.cf_spin.valueChanged.connect(lambda v: self.center_freq_changed.emit(v * 1e6))
         cf_row.addWidget(self.cf_spin)
-        lay.addLayout(cf_row)
+        nc.addLayout(cf_row)
 
-        # Sample rate
         sr_row = QHBoxLayout()
         sr_row.addWidget(QLabel("Sample Rate (MHz):"))
         self.sr_combo = QComboBox()
@@ -1092,9 +1108,59 @@ class SourcePanel(QWidget):
             lambda v: self.sample_rate_changed.emit(int(float(v) * 1e6))
         )
         sr_row.addWidget(self.sr_combo)
-        lay.addLayout(sr_row)
+        nc.addLayout(sr_row)
 
-        # LNA gain
+        lay.addWidget(self._hackrf_normal_controls)
+
+        # ---- Sweep-mode controls (hidden by default) ----
+        self._hackrf_sweep_controls = QWidget()
+        sc = QVBoxLayout(self._hackrf_sweep_controls)
+        sc.setContentsMargins(0, 0, 0, 0)
+        sc.setSpacing(4)
+
+        freq_row = QHBoxLayout()
+        freq_row.addWidget(QLabel("Start (MHz):"))
+        self.sweep_start_spin = QDoubleSpinBox()
+        self.sweep_start_spin.setRange(1.0, 7250.0)
+        self.sweep_start_spin.setValue(80.0)
+        self.sweep_start_spin.setDecimals(1)
+        self.sweep_start_spin.setSingleStep(10.0)
+        freq_row.addWidget(self.sweep_start_spin)
+        freq_row.addWidget(QLabel("Stop (MHz):"))
+        self.sweep_stop_spin = QDoubleSpinBox()
+        self.sweep_stop_spin.setRange(1.0, 7250.0)
+        self.sweep_stop_spin.setValue(1000.0)
+        self.sweep_stop_spin.setDecimals(1)
+        self.sweep_stop_spin.setSingleStep(10.0)
+        freq_row.addWidget(self.sweep_stop_spin)
+        sc.addLayout(freq_row)
+
+        step_row = QHBoxLayout()
+        step_row.addWidget(QLabel("Step (MHz):"))
+        self.sweep_step_combo = QComboBox()
+        self.sweep_step_combo.addItems(['2', '4', '8', '10', '12', '14', '16', '18', '20'])
+        self.sweep_step_combo.setCurrentText('20')
+        self.sweep_step_combo.setToolTip("Bandwidth captured per step (= HackRF sample rate)")
+        step_row.addWidget(self.sweep_step_combo)
+        step_row.addWidget(QLabel("Bin (kHz):"))
+        self.sweep_bin_combo = QComboBox()
+        self.sweep_bin_combo.addItems(['25', '50', '100', '200', '500'])
+        self.sweep_bin_combo.setCurrentText('100')
+        self.sweep_bin_combo.setToolTip("FFT bin width — narrower = better frequency resolution")
+        step_row.addWidget(self.sweep_bin_combo)
+        step_row.addStretch()
+        sc.addLayout(step_row)
+
+        self._hackrf_sweep_controls.setVisible(False)
+        lay.addWidget(self._hackrf_sweep_controls)
+
+        # Auto-restart sweep when any sweep-specific parameter changes
+        for widget in (self.sweep_start_spin, self.sweep_stop_spin):
+            widget.valueChanged.connect(self._schedule_sweep_reconnect)
+        for widget in (self.sweep_step_combo, self.sweep_bin_combo):
+            widget.currentTextChanged.connect(self._schedule_sweep_reconnect)
+
+        # ---- Gain controls (always visible) ----
         lna_row = QHBoxLayout()
         lna_row.addWidget(QLabel("LNA (dB):"))
         self.lna_slider = QSlider(Qt.Horizontal)
@@ -1110,7 +1176,6 @@ class SourcePanel(QWidget):
         self.lna_slider.valueChanged.connect(lambda v: self.lna_label.setText(str(v)))
         lay.addLayout(lna_row)
 
-        # VGA gain
         vga_row = QHBoxLayout()
         vga_row.addWidget(QLabel("VGA (dB):"))
         self.vga_slider = QSlider(Qt.Horizontal)
@@ -1126,7 +1191,6 @@ class SourcePanel(QWidget):
         self.vga_slider.valueChanged.connect(lambda v: self.vga_label.setText(str(v)))
         lay.addLayout(vga_row)
 
-        # RF amp
         amp_row = QHBoxLayout()
         self.amp_check = QCheckBox("RF Amp (~11 dB)")
         self.amp_check.setChecked(False)
@@ -1135,9 +1199,9 @@ class SourcePanel(QWidget):
         amp_row.addStretch()
         lay.addLayout(amp_row)
 
-        # ---- Recording group ----
-        rec_group = QGroupBox("Recording")
-        rec_lay = QVBoxLayout(rec_group)
+        # ---- Recording group (hidden in sweep mode) ----
+        self._rec_group = QGroupBox("Recording")
+        rec_lay = QVBoxLayout(self._rec_group)
         rec_lay.setSpacing(4)
 
         rec_ctrl = QHBoxLayout()
@@ -1167,105 +1231,17 @@ class SourcePanel(QWidget):
         self.record_status_label = QLabel("Idle")
         self.record_status_label.setStyleSheet("color: #888888; font-size: 11px;")
         rec_lay.addWidget(self.record_status_label)
-        lay.addWidget(rec_group)
+        lay.addWidget(self._rec_group)
 
         return w
 
-    def _make_sweep_panel(self) -> QWidget:
-        w = QWidget()
-        lay = QVBoxLayout(w)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(4)
+    def _on_sweep_mode_toggled(self, checked: bool):
+        self._hackrf_normal_controls.setVisible(not checked)
+        self._hackrf_sweep_controls.setVisible(checked)
+        self._rec_group.setVisible(not checked)
 
-        # Status + connect/disconnect
-        sw_status_row = QHBoxLayout()
-        sw_status_row.addWidget(QLabel("Status:"))
-        self.sweep_status_label = QLabel("Disconnected")
-        self.sweep_status_label.setStyleSheet("color: red;")
-        sw_status_row.addWidget(self.sweep_status_label)
-        sw_status_row.addStretch()
-        self.sweep_connect_btn = QPushButton("Connect")
-        self.sweep_connect_btn.setToolTip("Start sweep")
-        self.sweep_connect_btn.clicked.connect(self.sweep_connect_requested.emit)
-        self.sweep_disconnect_btn = QPushButton("Disconnect")
-        self.sweep_disconnect_btn.setToolTip("Stop sweep")
-        self.sweep_disconnect_btn.clicked.connect(self.sweep_disconnect_requested.emit)
-        sw_status_row.addWidget(self.sweep_connect_btn)
-        sw_status_row.addWidget(self.sweep_disconnect_btn)
-        lay.addLayout(sw_status_row)
-
-        # Start / stop frequency
-        freq_row = QHBoxLayout()
-        freq_row.addWidget(QLabel("Start (MHz):"))
-        self.sweep_start_spin = QDoubleSpinBox()
-        self.sweep_start_spin.setRange(1.0, 6000.0)
-        self.sweep_start_spin.setValue(80.0)
-        self.sweep_start_spin.setDecimals(1)
-        self.sweep_start_spin.setSingleStep(10.0)
-        freq_row.addWidget(self.sweep_start_spin)
-        freq_row.addWidget(QLabel("Stop (MHz):"))
-        self.sweep_stop_spin = QDoubleSpinBox()
-        self.sweep_stop_spin.setRange(1.0, 6000.0)
-        self.sweep_stop_spin.setValue(108.0)
-        self.sweep_stop_spin.setDecimals(1)
-        self.sweep_stop_spin.setSingleStep(10.0)
-        freq_row.addWidget(self.sweep_stop_spin)
-        lay.addLayout(freq_row)
-
-        # Step width (= sample rate per step)
-        step_row = QHBoxLayout()
-        step_row.addWidget(QLabel("Step (MHz):"))
-        self.sweep_step_combo = QComboBox()
-        self.sweep_step_combo.addItems(['1', '2', '4', '8', '16', '20'])
-        self.sweep_step_combo.setCurrentText('20')
-        self.sweep_step_combo.setToolTip("Bandwidth captured per step (= HackRF sample rate)")
-        step_row.addWidget(self.sweep_step_combo)
-        step_row.addStretch()
-        lay.addLayout(step_row)
-
-        # LNA gain
-        sw_lna_row = QHBoxLayout()
-        sw_lna_row.addWidget(QLabel("LNA (dB):"))
-        self.sweep_lna_slider = QSlider(Qt.Horizontal)
-        self.sweep_lna_slider.setRange(0, 40)
-        self.sweep_lna_slider.setValue(24)
-        self.sweep_lna_slider.setTickPosition(QSlider.TicksBelow)
-        self.sweep_lna_slider.setTickInterval(8)
-        sw_lna_row.addWidget(self.sweep_lna_slider)
-        self.sweep_lna_label = QLabel("24")
-        self.sweep_lna_label.setFixedWidth(28)
-        sw_lna_row.addWidget(self.sweep_lna_label)
-        self.sweep_lna_slider.valueChanged.connect(
-            lambda v: self.sweep_lna_label.setText(str(v))
-        )
-        lay.addLayout(sw_lna_row)
-
-        # VGA gain
-        sw_vga_row = QHBoxLayout()
-        sw_vga_row.addWidget(QLabel("VGA (dB):"))
-        self.sweep_vga_slider = QSlider(Qt.Horizontal)
-        self.sweep_vga_slider.setRange(0, 62)
-        self.sweep_vga_slider.setValue(20)
-        self.sweep_vga_slider.setTickPosition(QSlider.TicksBelow)
-        self.sweep_vga_slider.setTickInterval(10)
-        sw_vga_row.addWidget(self.sweep_vga_slider)
-        self.sweep_vga_label = QLabel("20")
-        self.sweep_vga_label.setFixedWidth(28)
-        sw_vga_row.addWidget(self.sweep_vga_label)
-        self.sweep_vga_slider.valueChanged.connect(
-            lambda v: self.sweep_vga_label.setText(str(v))
-        )
-        lay.addLayout(sw_vga_row)
-
-        # RF amp
-        sw_amp_row = QHBoxLayout()
-        self.sweep_amp_check = QCheckBox("RF Amp (~11 dB)")
-        self.sweep_amp_check.setChecked(False)
-        sw_amp_row.addWidget(self.sweep_amp_check)
-        sw_amp_row.addStretch()
-        lay.addLayout(sw_amp_row)
-
-        return w
+    def is_sweep_mode(self) -> bool:
+        return self.sweep_mode_check.isChecked()
 
     def _make_file_panel(self) -> QWidget:
         w = QWidget()
@@ -1340,7 +1316,6 @@ class SourcePanel(QWidget):
 
     def _on_source_changed(self, source: str):
         self._hackrf_panel.setVisible(source == "HackRF")
-        self._sweep_panel.setVisible(source == "HackRF Sweep")
         self._file_panel.setVisible(source == "IQ File")
 
     # ------------------------------------------------------------------
@@ -1467,12 +1442,19 @@ class SourcePanel(QWidget):
     # ------------------------------------------------------------------
 
     def set_connected(self, connected: bool):
+        self._is_connected = connected
         text  = "Connected" if connected else "Disconnected"
         style = "color: green;" if connected else "color: red;"
         self.status_label.setText(text)
         self.status_label.setStyleSheet(style)
-        self.sweep_status_label.setText(text)
-        self.sweep_status_label.setStyleSheet(style)
+
+    def _schedule_sweep_reconnect(self):
+        if self._is_connected and self.is_sweep_mode():
+            self._sweep_reconnect_timer.start()
+
+    def _apply_sweep_params(self):
+        if self._is_connected and self.is_sweep_mode():
+            self.connect_requested.emit()
 
     def get_settings(self) -> dict:
         return {
@@ -1489,9 +1471,10 @@ class SourcePanel(QWidget):
             'start_freq':  float(self.sweep_start_spin.value()) * 1e6,
             'stop_freq':   float(self.sweep_stop_spin.value()) * 1e6,
             'sample_rate': int(float(self.sweep_step_combo.currentText()) * 1e6),
-            'lna':         int(self.sweep_lna_slider.value()),
-            'vga':         int(self.sweep_vga_slider.value()),
-            'amp':         bool(self.sweep_amp_check.isChecked()),
+            'lna':         int(self.lna_slider.value()),
+            'vga':         int(self.vga_slider.value()),
+            'amp':         bool(self.amp_check.isChecked()),
+            'bin_width':   int(float(self.sweep_bin_combo.currentText()) * 1e3),
         }
 
     def apply_settings(self, settings: dict) -> None:

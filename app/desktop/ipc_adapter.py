@@ -26,6 +26,7 @@ class IPCAdapterThread(QThread):
     timing_report         = Signal(object)
     vfo_bandwidth_update  = Signal(int, float)      # vfo_id, bandwidth_hz
     eye_samples           = Signal(int, object)     # vfo_id, list[float]
+    iq_samples            = Signal(int, object)     # vfo_id, list[complex]
     playback_position     = Signal(int, int, float) # current_sample, total_samples, sample_rate
     recording_status      = Signal(bool, str, int)  # recording, file_path, bytes_written
 
@@ -58,6 +59,8 @@ class IPCAdapterThread(QThread):
                         self.vfo_bandwidth_update.emit(msg['vfo_id'], msg['bandwidth_hz'])
                     elif t == 'eye_samples':
                         self.eye_samples.emit(msg['vfo_id'], msg['samples'])
+                    elif t == 'iq_samples':
+                        self.iq_samples.emit(msg['vfo_id'], msg['samples'])
                     elif t == 'playback_position':
                         self.playback_position.emit(
                             msg['current'], msg['total'], msg['sample_rate']

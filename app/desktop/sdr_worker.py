@@ -446,16 +446,20 @@ class DSPWorker:
                 self.receiver.stop_receiver()
             except Exception as e:
                 logger.warning("connect_sweep: stop error: %s", e)
+            # Give the HackRF USB device time to fully close before reopening.
+            # Without this, the new pyhackrf_sweep call races the device teardown.
+            time.sleep(0.3)
         self.receiver = None
 
         from app.sdr.hackrf_sweep_source import HackRFSweepSource, HackRFSweepConfig
         cfg = HackRFSweepConfig(
             start_freq  = msg.get('start_freq',  80e6),
             stop_freq   = msg.get('stop_freq',  108e6),
-            sample_rate = msg.get('sample_rate', 20e6),
+            sample_rate = int(msg.get('sample_rate', 20_000_000)),
             lna_gain    = int(msg.get('lna', 24)),
             vga_gain    = int(msg.get('vga', 20)),
             amp_enabled = bool(msg.get('amp', False)),
+            bin_width   = int(msg.get('bin_width', 100_000)),
         )
         src = HackRFSweepSource(cfg)
         src.on_sweep_fft = self._on_sweep_fft
@@ -479,17 +483,14 @@ class DSPWorker:
         self._emit({'type': 'device_status',
                     'data': {'connected': True, 'frequency': center, 'sample_rate': bw}})
 
-    def _on_sweep_fft(self, bins_db: np.ndarray, center_hz: float, bw_hz: float):
-        """Compositor: map one step's FFT into the shared spec_arr/wf_arr."""
+    def _on_sweep_fft(self, bins_db: np.ndarray, start_hz: float, stop_hz: float):
+        """Compositor: map one step's FFT slice into the shared spec_arr/wf_arr."""
         total_bw = self._sweep_stop - self._sweep_start
         if total_bw <= 0:
             return
 
-        step_lo = center_hz - bw_hz / 2
-        step_hi = center_hz + bw_hz / 2
-
-        bin_lo = int((step_lo - self._sweep_start) / total_bw * DISPLAY_FFT_SIZE)
-        bin_hi = int((step_hi - self._sweep_start) / total_bw * DISPLAY_FFT_SIZE)
+        bin_lo = int((start_hz - self._sweep_start) / total_bw * DISPLAY_FFT_SIZE)
+        bin_hi = int((stop_hz  - self._sweep_start) / total_bw * DISPLAY_FFT_SIZE)
         bin_lo = max(0, bin_lo)
         bin_hi = min(DISPLAY_FFT_SIZE, bin_hi)
         if bin_lo >= bin_hi:
@@ -726,8 +727,11 @@ class DSPWorker:
                             self.audio_mixer.push_audio(vfo_id, out_audio)
                             self._emit_eye_samples(vfo_id, out_audio)
                         elif audio is not None and len(audio) > 0:
-                            self.audio_mixer.push_audio(vfo_id, audio)
-                            self._emit_eye_samples(vfo_id, audio)
+                            if np.iscomplexobj(audio):
+                                self._emit_iq_samples(vfo_id, audio)
+                            else:
+                                self.audio_mixer.push_audio(vfo_id, audio)
+                                self._emit_eye_samples(vfo_id, audio)
 
                         for result in dec_results:
                             formatted = str(result.data)
@@ -774,6 +778,27 @@ class DSPWorker:
             arr = arr[idx]
 
         self._emit({'type': 'eye_samples', 'vfo_id': int(vfo_id), 'samples': arr.tolist()})
+
+    def _emit_iq_samples(self, vfo_id: int, iq: np.ndarray):
+        if not self._eye_enabled:
+            return
+        if self._eye_vfo_id is not None and int(vfo_id) != int(self._eye_vfo_id):
+            return
+
+        now = time.monotonic()
+        if now - self._last_eye_t < 0.08:
+            return
+        self._last_eye_t = now
+
+        if iq is None or len(iq) == 0:
+            return
+        arr = np.asarray(iq, dtype=np.complex64)
+        target_n = 512
+        if arr.size > target_n:
+            idx = np.linspace(0, arr.size - 1, target_n, dtype=np.int32)
+            arr = arr[idx]
+
+        self._emit({'type': 'iq_samples', 'vfo_id': int(vfo_id), 'samples': arr.tolist()})
 
     def _extract_vfo_iq(self, fft_shifted, vfo, sr, N, bin_hz, center_freq):
         if not vfo.settings.enabled:

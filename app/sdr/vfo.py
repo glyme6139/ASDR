@@ -396,6 +396,10 @@ class VFO:
             self._deemph_a  = np.array([1.0, -(1.0 - alpha)], dtype=np.float64)
             self._deemph_zi = np.zeros(1, dtype=np.float64)
 
+        # Raw IQ passthrough — return complex baseband directly, skip demodulation
+        if self.settings.demod_mode == 'Raw IQ':
+            return iq, []
+
         audio = self._demodulate(iq)
         if audio is None:
             return None, []

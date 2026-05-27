@@ -311,7 +311,7 @@ class OscilloscopeWindow(QMainWindow):
         buf = self._buffers.get(vfo_id, np.zeros(0, dtype=np.float32))
         buf = np.concatenate((buf, chunk))
         if buf.size > self._max_buffer:
-            buf = buf[-self._max_buffer:]
+            buf = buf[-self._max_buffer:].copy()
         self._buffers[vfo_id] = buf
 
         if self._current_vfo is None:
@@ -462,7 +462,7 @@ class OscilloscopeWindow(QMainWindow):
     def _normalize(self, buf: np.ndarray) -> np.ndarray:
         """RMS-normalize so a typical signal sits comfortably in ±1."""
         rms = float(np.sqrt(np.mean(np.square(buf))))
-        return buf / (rms * np.sqrt(2)) if rms > 1e-6 else buf.copy()
+        return (buf / np.float32(rms * np.sqrt(2))).astype(np.float32) if rms > 1e-6 else buf.copy()
 
     def _apply_smooth(self, buf: np.ndarray, n: int) -> np.ndarray:
         """Moving-average with edge-padding so endpoints don't taper to zero."""

@@ -23,6 +23,7 @@ from .visualizations import VisualizationPanel, VFO_COLORS
 from .control_panels import ControlPanel
 from .dsp_process import DSPProcess
 from .ipc_adapter import IPCAdapterThread
+from .constellation_window import ConstellationWindow
 from .eye_diagram_window import EyeDiagramWindow
 from .oscilloscope_window import OscilloscopeWindow
 from .signal_decoder_window import SignalDecoderWindow
@@ -67,6 +68,7 @@ class ASURMainWindow(QMainWindow):
         self.timing_window = TimingWindow()
         self.eye_window = EyeDiagramWindow(self)
         self.osc_window = OscilloscopeWindow(self)
+        self.constellation_window = ConstellationWindow(self)
         self.decoder_win = SignalDecoderWindow(self)
         self.rate_window = SignalRateWindow(self)
 
@@ -185,6 +187,8 @@ class ASURMainWindow(QMainWindow):
             self._eye_action.triggered.connect(self._show_eye_window)
             self._osc_action = view_menu.addAction("Oscilloscope")
             self._osc_action.triggered.connect(self._show_osc_window)
+            self._constellation_action = view_menu.addAction("Constellation")
+            self._constellation_action.triggered.connect(self._show_constellation_window)
             self._rate_action = view_menu.addAction("Signal Rate")
             self._rate_action.triggered.connect(self._show_rate_window)
             self._decoder_win_action = view_menu.addAction("Signal Decoder")
@@ -250,6 +254,7 @@ class ASURMainWindow(QMainWindow):
         self.ipc.timing_report.connect(self._handle_timing_report, Q)
         self.ipc.vfo_bandwidth_update.connect(self._on_vfo_bandwidth_update, Q)
         self.ipc.eye_samples.connect(self._on_eye_samples, Q)
+        self.ipc.iq_samples.connect(self._on_iq_samples, Q)
 
         # ---- VFO tab lifecycle ----
         self.ctrl_panel.vfo_tab.vfo_added.connect(self._on_vfo_added)
@@ -301,8 +306,6 @@ class ASURMainWindow(QMainWindow):
         # ---- Source panel (new: connect/disconnect, file source, recording, playback) ----
         sp.connect_requested.connect(self._on_hackrf_connect)
         sp.disconnect_requested.connect(self.dsp.disconnect_hackrf)
-        sp.sweep_connect_requested.connect(self._on_sweep_connect)
-        sp.sweep_disconnect_requested.connect(self.dsp.disconnect_hackrf)
         sp.file_source_opened.connect(
             lambda path, cf, sr: self.dsp.set_source('file', path, cf, sr)
         )
@@ -337,6 +340,8 @@ class ASURMainWindow(QMainWindow):
         self.eye_window.vfo_changed.connect(self._on_eye_window_vfo_changed)
         self.osc_window.visibility_changed.connect(self._on_osc_window_visibility_changed)
         self.osc_window.vfo_changed.connect(self._on_osc_window_vfo_changed)
+        self.constellation_window.visibility_changed.connect(self._on_constellation_visibility_changed)
+        self.constellation_window.vfo_changed.connect(self._on_constellation_vfo_changed)
         self.decoder_win.visibility_changed.connect(self._on_decoder_win_visibility_changed)
         self.decoder_win.vfo_changed.connect(self._on_decoder_win_vfo_changed)
 
@@ -453,6 +458,8 @@ class ASURMainWindow(QMainWindow):
             self.eye_window.set_active_vfo(vfo_id)
         if self.osc_window.isVisible() and self.osc_window._current_vfo is None:
             self.osc_window.set_active_vfo(vfo_id)
+        if self.constellation_window.isVisible() and self.constellation_window._current_vfo is None:
+            self.constellation_window.set_active_vfo(vfo_id)
         if self.decoder_win.isVisible() and self.decoder_win._current_vfo is None:
             self.decoder_win.set_active_vfo(vfo_id)
 
@@ -466,25 +473,27 @@ class ASURMainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _on_hackrf_connect(self):
-        s = self.ctrl_panel.source_panel.get_settings()
-        self.dsp.connect_hackrf(
-            center_freq=s['center_freq'],
-            sample_rate=s['sample_rate'],
-            lna=s['lna'],
-            vga=s['vga'],
-            amp=s['amp_enabled'],
-        )
-
-    def _on_sweep_connect(self):
-        s = self.ctrl_panel.source_panel.get_sweep_settings()
-        self.dsp.connect_sweep(
-            start_freq=s['start_freq'],
-            stop_freq=s['stop_freq'],
-            sample_rate=s['sample_rate'],
-            lna=s['lna'],
-            vga=s['vga'],
-            amp=s['amp'],
-        )
+        sp = self.ctrl_panel.source_panel
+        if sp.is_sweep_mode():
+            s = sp.get_sweep_settings()
+            self.dsp.connect_sweep(
+                start_freq=s['start_freq'],
+                stop_freq=s['stop_freq'],
+                sample_rate=s['sample_rate'],
+                lna=s['lna'],
+                vga=s['vga'],
+                amp=s['amp'],
+                bin_width=s['bin_width'],
+            )
+        else:
+            s = sp.get_settings()
+            self.dsp.connect_hackrf(
+                center_freq=s['center_freq'],
+                sample_rate=s['sample_rate'],
+                lna=s['lna'],
+                vga=s['vga'],
+                amp=s['amp_enabled'],
+            )
 
     def _on_center_freq_changed(self, freq_hz: float):
         self._center_hz = freq_hz
@@ -503,6 +512,7 @@ class ASURMainWindow(QMainWindow):
             pass
         self.eye_window.set_sample_rate(sample_rate)
         self.osc_window.set_sample_rate(sample_rate)
+        self.constellation_window.set_sample_rate(sample_rate)
         self.decoder_win.set_sample_rate(sample_rate)
 
     # ------------------------------------------------------------------
@@ -608,6 +618,7 @@ class ASURMainWindow(QMainWindow):
             if 'sample_rate' in status:
                 self.eye_window.set_sample_rate(sr)
                 self.osc_window.set_sample_rate(sr)
+                self.constellation_window.set_sample_rate(sr)
                 self.decoder_win.set_sample_rate(sr)
 
     def _on_error(self, error_msg: str):
@@ -625,7 +636,13 @@ class ASURMainWindow(QMainWindow):
             return
         self.eye_window.push_samples(vfo_id, samples)
         self.osc_window.push_samples(vfo_id, samples)
+        self.constellation_window.push_samples(vfo_id, samples)
         self.decoder_win.push_samples(vfo_id, samples)
+
+    def _on_iq_samples(self, vfo_id: int, samples):
+        if vfo_id in self._paused_vfos:
+            return
+        self.constellation_window.push_iq_samples(vfo_id, samples)
 
     def _on_eye_window_vfo_changed(self, vfo_id: object):
         if vfo_id is None:
@@ -686,6 +703,13 @@ class ASURMainWindow(QMainWindow):
         self.osc_window.raise_()
         self.osc_window.activateWindow()
 
+    def _show_constellation_window(self):
+        self._sync_vfo_choices()
+        self.constellation_window.set_sample_rate(self._sample_rate)
+        self.constellation_window.show()
+        self.constellation_window.raise_()
+        self.constellation_window.activateWindow()
+
     def _show_rate_window(self):
         self._sync_vfo_choices()
         self.rate_window.show()
@@ -708,7 +732,7 @@ class ASURMainWindow(QMainWindow):
                     return
             self.dsp.set_eye_stream(True, self.eye_window._current_vfo)
             return
-        if not self.osc_window.isVisible():
+        if not self.osc_window.isVisible() and not self.constellation_window.isVisible():
             self.dsp.set_eye_stream(False, None)
 
     def _on_osc_window_visibility_changed(self, visible: bool):
@@ -720,8 +744,25 @@ class ASURMainWindow(QMainWindow):
                     return
             self.dsp.set_eye_stream(True, self.osc_window._current_vfo)
             return
-        if not self.eye_window.isVisible():
+        if not self.eye_window.isVisible() and not self.constellation_window.isVisible():
             self.dsp.set_eye_stream(False, None)
+
+    def _on_constellation_visibility_changed(self, visible: bool):
+        if visible:
+            if self.constellation_window._current_vfo is None:
+                vfo_id = self.ctrl_panel.vfo_tab.active_vfo_id()
+                if vfo_id is not None:
+                    self.constellation_window.set_active_vfo(vfo_id)
+                    return
+            self.dsp.set_eye_stream(True, self.constellation_window._current_vfo)
+            return
+        if not self.eye_window.isVisible() and not self.osc_window.isVisible():
+            self.dsp.set_eye_stream(False, None)
+
+    def _on_constellation_vfo_changed(self, vfo_id: object):
+        if vfo_id is None:
+            return
+        self.dsp.set_eye_stream(self.constellation_window.isVisible(), int(vfo_id))
 
     def _sync_vfo_choices(self):
         choices = []
@@ -734,6 +775,7 @@ class ASURMainWindow(QMainWindow):
         active = self.ctrl_panel.vfo_tab.active_vfo_id()
         self.eye_window.set_vfo_choices(choices, active_vfo_id=active)
         self.osc_window.set_vfo_choices(choices, active_vfo_id=active)
+        self.constellation_window.set_vfo_choices(choices, active_vfo_id=active)
         self.decoder_win.set_vfo_choices(choices, active_vfo_id=active)
         self.rate_window.set_vfo_choices(choices, active_vfo_id=active)
 
@@ -804,6 +846,7 @@ class ASURMainWindow(QMainWindow):
         self._decoder_windows.clear()
         self.eye_window.close()
         self.osc_window.close()
+        self.constellation_window.close()
         self.decoder_win.close()
         self.rate_window.close()
 
