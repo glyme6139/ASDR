@@ -1,0 +1,255 @@
+
+<style>
+  .freq-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  .freq-table th { font-size: 12px; font-weight: 500; color: var(--color-text-secondary); text-align: left; padding: 8px 10px; border-bottom: 0.5px solid var(--color-border-tertiary); }
+  .freq-table td { padding: 7px 10px; border-bottom: 0.5px solid var(--color-border-tertiary); vertical-align: top; line-height: 1.4; }
+  .freq-table tr:last-child td { border-bottom: none; }
+  .freq-table tr:hover td { background: var(--color-background-secondary); }
+  .band-header td { background: var(--color-background-secondary); font-weight: 500; font-size: 12px; color: var(--color-text-secondary); padding: 5px 10px; letter-spacing: 0.04em; text-transform: uppercase; }
+  .badge { display: inline-block; font-size: 11px; font-weight: 500; padding: 2px 7px; border-radius: 4px; }
+  .b-green { background: #EAF3DE; color: #3B6D11; }
+  .b-amber { background: #FAEEDA; color: #854F0B; }
+  .b-red { background: #FCEBEB; color: #A32D2D; }
+  .b-blue { background: #E6F1FB; color: #185FA5; }
+  .b-gray { background: #F1EFE8; color: #5F5E5A; }
+  .b-purple { background: #EEEDFE; color: #534AB7; }
+  .b-teal { background: #E1F5EE; color: #0F6E56; }
+  @media (prefers-color-scheme: dark) {
+    .b-green { background: #27500A; color: #C0DD97; }
+    .b-amber { background: #633806; color: #FAC775; }
+    .b-red { background: #791F1F; color: #F7C1C1; }
+    .b-blue { background: #0C447C; color: #B5D4F4; }
+    .b-gray { background: #444441; color: #D3D1C7; }
+    .b-purple { background: #3C3489; color: #CECBF6; }
+    .b-teal { background: #085041; color: #9FE1CB; }
+    .band-header td { background: var(--color-background-tertiary); }
+  }
+  .freq { font-family: var(--font-mono); font-size: 12px; color: var(--color-text-primary); }
+  .star { color: #EF9F27; font-size: 14px; }
+</style>
+
+<h2 class="sr-only">Radio frequency guide for Haute-Savoie / Annecy — signals by band with interest rating</h2>
+
+<div style="padding: 0.5rem 0 1.25rem;">
+  <div style="display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 1rem; font-size: 12px;">
+    <span><span class="badge b-green">listenable</span> clear audio</span>
+    <span><span class="badge b-amber">digital</span> encrypted or coded</span>
+    <span><span class="badge b-red">encrypted</span> no content</span>
+    <span><span class="badge b-blue">data/telemetry</span> pulsed/data</span>
+    <span><span class="badge b-purple">aviation</span> AM voice</span>
+    <span><span class="badge b-teal">navigation</span> nav aid</span>
+    <span><span class="badge b-gray">passive</span> listen only</span>
+  </div>
+
+  <table class="freq-table">
+    <thead>
+      <tr>
+        <th style="width:22%">Frequency / Range</th>
+        <th style="width:22%">Service</th>
+        <th style="width:12%">Mode</th>
+        <th style="width:14%">Type</th>
+        <th style="width:8%">Interest</th>
+        <th>Notes (local context)</th>
+      </tr>
+    </thead>
+    <tbody>
+
+      <tr class="band-header"><td colspan="6">HF / shortwave (below 30 MHz)</td></tr>
+      <tr>
+        <td class="freq">2–30 MHz</td>
+        <td>Amateur radio HF bands</td>
+        <td>SSB, CW, digi</td>
+        <td><span class="badge b-green">listenable</span></td>
+        <td class="star">★★★</td>
+        <td>International propagation — can hear distant stations. Key bands: 40m (7 MHz), 20m (14 MHz), 15m (21 MHz). Good from high ground around Annecy.</td>
+      </tr>
+      <tr>
+        <td class="freq">26.965–27.405 MHz</td>
+        <td>CB radio</td>
+        <td>AM / FM</td>
+        <td><span class="badge b-green">listenable</span></td>
+        <td class="star">★★</td>
+        <td>Still used by truckers and some rural workers in the Alps. Ch.9 = 27.065 MHz emergency.</td>
+      </tr>
+
+      <tr class="band-header"><td colspan="6">VHF Low (30–88 MHz)</td></tr>
+      <tr>
+        <td class="freq">68–88 MHz</td>
+        <td>Pompiers (analogue legacy)</td>
+        <td>NFM</td>
+        <td><span class="badge b-green">listenable</span></td>
+        <td class="star">★★★</td>
+        <td>85.500 & 86.600 MHz national fire frequencies still in partial use. Local SDIS 74 ops before ANTARES rollout.</td>
+      </tr>
+      <tr>
+        <td class="freq">72.210–72.490 MHz</td>
+        <td>RC models (aeronautics)</td>
+        <td>OOK / PPM</td>
+        <td><span class="badge b-blue">data/telemetry</span></td>
+        <td class="star">★</td>
+        <td>French/Italian RC aircraft band. Short bursts when a transmitter is active nearby.</td>
+      </tr>
+      <tr>
+        <td class="freq">72.600 MHz</td>
+        <td>Wildlife telemetry beacon</td>
+        <td>OOK CW</td>
+        <td><span class="badge b-blue">data/telemetry</span></td>
+        <td class="star">★★★</td>
+        <td>Your signal — identified. OFB/research fixed station. Visible on SDR as narrow spike.</td>
+      </tr>
+      <tr>
+        <td class="freq">70–74 MHz</td>
+        <td>Other wildlife telemetry</td>
+        <td>OOK CW</td>
+        <td><span class="badge b-blue">data/telemetry</span></td>
+        <td class="star">★★</td>
+        <td>Other collared animals (chamois, lynx, wolves) may appear as sporadic pulse beacons in this range. Slow-scan the band.</td>
+      </tr>
+      <tr>
+        <td class="freq">80–83 MHz</td>
+        <td>SAMU / ambulances</td>
+        <td>NFM</td>
+        <td><span class="badge b-green">listenable</span></td>
+        <td class="star">★★</td>
+        <td>Legacy analogue. Some ops still on ~80 MHz in alpine areas before full ANTARES migration.</td>
+      </tr>
+
+      <tr class="band-header"><td colspan="6">FM Broadcast (88–108 MHz)</td></tr>
+      <tr>
+        <td class="freq">88–108 MHz</td>
+        <td>FM radio broadcast</td>
+        <td>WFM stereo</td>
+        <td><span class="badge b-green">listenable</span></td>
+        <td class="star">★</td>
+        <td>Strong local signals from Swiss and French transmitters. RDS data decodable. DX propagation events (Sporadic-E in summer) can bring in Spanish/Italian stations.</td>
+      </tr>
+
+      <tr class="band-header"><td colspan="6">VHF High (108–174 MHz)</td></tr>
+      <tr>
+        <td class="freq">108–118 MHz</td>
+        <td>Aviation navigation (VOR/ILS)</td>
+        <td>AM / CW ident</td>
+        <td><span class="badge b-teal">navigation</span></td>
+        <td class="star">★★★</td>
+        <td>Chambéry VOR (CBY) ~114–115 MHz. Annecy NDB "AT". Morse idents audible at low volume. Continuous signal.</td>
+      </tr>
+      <tr>
+        <td class="freq">118–137 MHz</td>
+        <td>Aviation voice (ATC)</td>
+        <td>AM</td>
+        <td><span class="badge b-purple">aviation</span></td>
+        <td class="star">★★★★</td>
+        <td>Annecy TWR: 118.200 MHz. Approach: 121.205 MHz. Guard: 121.500 MHz. Busy during ski season with medevac and private jets. Helicopters (PGHM, SAF) very active in summer.</td>
+      </tr>
+      <tr>
+        <td class="freq">121.500 MHz</td>
+        <td>Aviation emergency guard</td>
+        <td>AM</td>
+        <td><span class="badge b-purple">aviation</span></td>
+        <td class="star">★★★</td>
+        <td>International distress frequency. Always monitored. ELT activations from aircraft accidents occasionally audible.</td>
+      </tr>
+      <tr>
+        <td class="freq">143.9875 MHz</td>
+        <td>Vol libre / paragliding</td>
+        <td>NFM</td>
+        <td><span class="badge b-green">listenable</span></td>
+        <td class="star">★★★★</td>
+        <td>FFLV national paragliding frequency. Very active around Annecy (Forclaz, Montmin, Semnoz). Pilots chat, report conditions, coordinate with instructors.</td>
+      </tr>
+      <tr>
+        <td class="freq">150–154 MHz</td>
+        <td>Mountain rescue networks (GRA)</td>
+        <td>NFM</td>
+        <td><span class="badge b-green">listenable</span></td>
+        <td class="star">★★★★</td>
+        <td>Grand Réseau Radio des Alpes. SAMB (Sécurité Alerte Mont-Blanc). 154.4625 MHz = 3 Mont-Blanc relays. Professional rescue comms, refuge alerts.</td>
+      </tr>
+      <tr>
+        <td class="freq">156.800 MHz</td>
+        <td>Marine VHF ch.16</td>
+        <td>NFM</td>
+        <td><span class="badge b-green">listenable</span></td>
+        <td class="star">★★</td>
+        <td>Lac d'Annecy maritime traffic. Used by sailing clubs, rescue boats. Low activity but audible from the lakeshore.</td>
+      </tr>
+      <tr>
+        <td class="freq">161.300 MHz</td>
+        <td>Canal Emergency (Canal E)</td>
+        <td>NFM + CTCSS 123 Hz</td>
+        <td><span class="badge b-green">listenable</span></td>
+        <td class="star">★★★★</td>
+        <td>Transfrontier mountain emergency: Haute-Savoie (SDIS 74) + Valais (CH) + Val d'Aoste (IT). 33 relays covering Mont-Blanc massif. Monitored 24/7 from Annecy/Meythet.</td>
+      </tr>
+
+      <tr class="band-header"><td colspan="6">UHF (200–512 MHz)</td></tr>
+      <tr>
+        <td class="freq">380–410 MHz</td>
+        <td>INPT (TETRAPOL) — ACROPOL / RUBIS / ANTARES</td>
+        <td>TETRAPOL digital</td>
+        <td><span class="badge b-red">encrypted</span></td>
+        <td class="star">★★</td>
+        <td>Police nationale (ACROPOL), Gendarmerie (RUBIS), Pompiers/SAMU (ANTARES). Encrypted voice + data. Identifiable by characteristic GMSK bursts on waterfall — can see activity even if you can't decode.</td>
+      </tr>
+      <tr>
+        <td class="freq">406 MHz</td>
+        <td>EPIRB / PLB distress beacons</td>
+        <td>Digital burst</td>
+        <td><span class="badge b-blue">data/telemetry</span></td>
+        <td class="star">★★</td>
+        <td>406 MHz PLB activations from hikers/climbers in distress. Decoded by COSPAS-SARSAT. Occasional in the Alps during accidents.</td>
+      </tr>
+      <tr>
+        <td class="freq">430–440 MHz</td>
+        <td>Amateur radio UHF</td>
+        <td>NFM, DMR, fusion</td>
+        <td><span class="badge b-green">listenable</span></td>
+        <td class="star">★★★</td>
+        <td>Local F4/HB9 amateur repeaters. Geneva/Annecy region well-covered. Analogue voice still common. Some DMR repeaters.</td>
+      </tr>
+      <tr>
+        <td class="freq">457 kHz</td>
+        <td>Avalanche transceivers (DVA/ARVA)</td>
+        <td>CW / audio tone</td>
+        <td><span class="badge b-blue">data/telemetry</span></td>
+        <td class="star">★★★</td>
+        <td>Standard avalanche beacon frequency. With a sensitive LF receiver you can pick these up. Very short range but interesting in ski season.</td>
+      </tr>
+      <tr>
+        <td class="freq">465.650 / 465.750 MHz</td>
+        <td>Plan Rouge UHF (mass casualty)</td>
+        <td>NFM</td>
+        <td><span class="badge b-amber">digital</span></td>
+        <td class="star">★</td>
+        <td>National mass casualty coordination channels. Rarely heard except during major incidents.</td>
+      </tr>
+
+      <tr class="band-header"><td colspan="6">SHF / microwave & satellites</td></tr>
+      <tr>
+        <td class="freq">1090 MHz</td>
+        <td>ADS-B aircraft transponders</td>
+        <td>Mode S / ADS-B</td>
+        <td><span class="badge b-blue">data/telemetry</span></td>
+        <td class="star">★★★★★</td>
+        <td>Every aircraft over the Alps transmits position, altitude, speed. Feed to FlightAware/FR24 with a simple dongle. Excellent coverage from Annecy due to surrounding terrain elevation.</td>
+      </tr>
+      <tr>
+        <td class="freq">1575.42 MHz</td>
+        <td>GPS L1</td>
+        <td>DSSS</td>
+        <td><span class="badge b-teal">navigation</span></td>
+        <td class="star">★★</td>
+        <td>GPS satellite signals. With a patch antenna and SDR you can receive raw GPS. Interesting for signal analysis.</td>
+      </tr>
+      <tr>
+        <td class="freq">137.x MHz</td>
+        <td>NOAA/Meteor weather satellites</td>
+        <td>APT / LRPT</td>
+        <td><span class="badge b-blue">data/telemetry</span></td>
+        <td class="star">★★★★</td>
+        <td>NOAA APT at 137.5/137.9125 MHz — decode live weather images with WXtoImg. Meteor-M2 (LRPT) gives colour images. Good passes over the Alps several times/day.</td>
+      </tr>
+
+    </tbody>
+  </table>
+</div>

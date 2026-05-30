@@ -85,6 +85,8 @@ class ASURMainWindow(QMainWindow):
             self.dsp.spectrum_buf,
             self.dsp.waterfall_buf,
             self.dsp.display_gen,
+            self.dsp.wf_queue_buf,
+            self.dsp.wf_gen,
         )
 
         # VFOTabPanel creates tab 0 during __init__ before vfo_added is connected,
@@ -251,6 +253,7 @@ class ASURMainWindow(QMainWindow):
         self.ipc.decoder_result.connect(self._on_decoder_result, Q)
         self.ipc.decoder_data.connect(self._on_decoder_data, Q)
         self.ipc.signal_strength.connect(self._on_signal_strength, Q)
+        self.ipc.signal_strength_fast.connect(self._on_signal_strength_fast, Q)
         self.ipc.timing_report.connect(self._handle_timing_report, Q)
         self.ipc.vfo_bandwidth_update.connect(self._on_vfo_bandwidth_update, Q)
         self.ipc.eye_samples.connect(self._on_eye_samples, Q)
@@ -466,7 +469,10 @@ class ASURMainWindow(QMainWindow):
     def _on_signal_strength(self, updates: dict):
         for vfo_id, (db, is_active) in updates.items():
             self.ctrl_panel.vfo_tab.update_signal_strength(vfo_id, db, is_active)
-            self.rate_window.push_squelch_state(vfo_id, bool(is_active))
+
+    def _on_signal_strength_fast(self, updates: dict):
+        for vfo_id, db in updates.items():
+            self.rate_window.push_signal_strength(vfo_id, float(db))
 
     # ------------------------------------------------------------------
     # Device control handlers

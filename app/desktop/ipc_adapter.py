@@ -23,6 +23,7 @@ class IPCAdapterThread(QThread):
     decoder_data          = Signal(int, str, object) # vfo_id, decoder_name, data-dict
     error_occurred        = Signal(str)
     signal_strength       = Signal(object)          # dict — same reason
+    signal_strength_fast  = Signal(object)          # dict {vfo_id: peak_db} at 50 Hz
     timing_report         = Signal(object)
     vfo_bandwidth_update  = Signal(int, float)      # vfo_id, bandwidth_hz
     eye_samples           = Signal(int, object)     # vfo_id, list[float]
@@ -53,6 +54,8 @@ class IPCAdapterThread(QThread):
                         self.error_occurred.emit(msg['message'])
                     elif t == 'signal_strength':
                         self.signal_strength.emit(msg['updates'])
+                    elif t == 'signal_strength_fast':
+                        self.signal_strength_fast.emit(msg['updates'])
                     elif t == 'timing_report':
                         self.timing_report.emit(msg['data'])
                     elif t == 'vfo_bandwidth_update':

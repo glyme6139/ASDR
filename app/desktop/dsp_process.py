@@ -20,13 +20,17 @@ from .timing import TimingConfig
 logger = logging.getLogger(__name__)
 
 DISPLAY_FFT_SIZE = 32768  # must match sdr_worker.DISPLAY_FFT_SIZE
+N_WF_SLOTS       = 16     # waterfall row queue depth (slots × WF_ROW_BINS bytes)
+WF_ROW_BINS      = 4096   # bins per queued waterfall row (== FFT_SIZE in sdr_worker)
 
 
 # ---------------------------------------------------------------------------
 # Subprocess entry point — module-level so Windows spawn can pickle it
 # ---------------------------------------------------------------------------
 
-def _dsp_worker_main(cmd_q, result_q, spec_shm_name: str, wf_shm_name: str, disp_gen, timing_config: dict | None = None):
+def _dsp_worker_main(cmd_q, result_q, spec_shm_name: str, wf_shm_name: str,
+                     wf_q_shm_name: str, disp_gen, wf_gen,
+                     timing_config: dict | None = None):
     """
     DSP subprocess entry point.
     Must be a module-level function (not a lambda or nested function) for
@@ -49,18 +53,21 @@ def _dsp_worker_main(cmd_q, result_q, spec_shm_name: str, wf_shm_name: str, disp
         report_handler=emit_timing_report,
     )
 
-    spec_shm = SharedMemory(name=spec_shm_name)
-    wf_shm   = SharedMemory(name=wf_shm_name)
-    spec_arr = np.ndarray((DISPLAY_FFT_SIZE,), dtype=np.float32, buffer=spec_shm.buf)
-    wf_arr   = np.ndarray((DISPLAY_FFT_SIZE,), dtype=np.uint8,   buffer=wf_shm.buf)
+    spec_shm  = SharedMemory(name=spec_shm_name)
+    wf_shm    = SharedMemory(name=wf_shm_name)
+    wf_q_shm  = SharedMemory(name=wf_q_shm_name)
+    spec_arr  = np.ndarray((DISPLAY_FFT_SIZE,),        dtype=np.float32, buffer=spec_shm.buf)
+    wf_arr    = np.ndarray((DISPLAY_FFT_SIZE,),        dtype=np.uint8,   buffer=wf_shm.buf)
+    wf_queue  = np.ndarray((N_WF_SLOTS, WF_ROW_BINS), dtype=np.uint8,   buffer=wf_q_shm.buf)
 
     from app.desktop.sdr_worker import DSPWorker
-    worker = DSPWorker(cmd_q, result_q, spec_arr, wf_arr, disp_gen, profiler=profiler)
+    worker = DSPWorker(cmd_q, result_q, spec_arr, wf_arr, disp_gen, wf_queue, wf_gen, profiler=profiler)
     try:
         worker.run()
     finally:
         spec_shm.close()
         wf_shm.close()
+        wf_q_shm.close()
 
 
 # ---------------------------------------------------------------------------
@@ -80,18 +87,24 @@ class DSPProcess:
         self._cmd_q    = self._ctx.Queue()
         self._result_q = self._ctx.Queue()
 
-        # Shared memory: spectrum (float32) and waterfall row (uint8)
-        self._spec_shm = SharedMemory(create=True, size=DISPLAY_FFT_SIZE * 4)
-        self._wf_shm   = SharedMemory(create=True, size=DISPLAY_FFT_SIZE * 1)
-        self._disp_gen = self._ctx.Value('L', 0)  # generation counter
-        self._timing   = timing or TimingConfig()
+        # Shared memory: spectrum (float32), single waterfall slot (uint8), and
+        # the high-rate waterfall row queue (N_WF_SLOTS × WF_ROW_BINS uint8).
+        self._spec_shm  = SharedMemory(create=True, size=DISPLAY_FFT_SIZE * 4)
+        self._wf_shm    = SharedMemory(create=True, size=DISPLAY_FFT_SIZE * 1)
+        self._wf_q_shm  = SharedMemory(create=True, size=N_WF_SLOTS * WF_ROW_BINS)
+        self._disp_gen  = self._ctx.Value('L', 0)  # spectrum generation counter
+        self._wf_gen    = self._ctx.Value('L', 0)  # waterfall row counter
+        self._timing    = timing or TimingConfig()
 
         # Read-only numpy views for the UI side
         self.spectrum_buf  = np.ndarray((DISPLAY_FFT_SIZE,), dtype=np.float32,
                                         buffer=self._spec_shm.buf)
         self.waterfall_buf = np.ndarray((DISPLAY_FFT_SIZE,), dtype=np.uint8,
                                         buffer=self._wf_shm.buf)
+        self.wf_queue_buf  = np.ndarray((N_WF_SLOTS, WF_ROW_BINS), dtype=np.uint8,
+                                        buffer=self._wf_q_shm.buf)
         self.display_gen   = self._disp_gen
+        self.wf_gen        = self._wf_gen
 
         self._process: mp.Process = None
 
@@ -103,7 +116,9 @@ class DSPProcess:
                 self._result_q,
                 self._spec_shm.name,
                 self._wf_shm.name,
+                self._wf_q_shm.name,
                 self._disp_gen,
+                self._wf_gen,
                 {'enabled': self._timing.enabled, 'sample_count': self._timing.sample_count},
             ),
             daemon=True,
@@ -124,9 +139,11 @@ class DSPProcess:
         # Release shared memory (unlink frees the OS object)
         self._spec_shm.close()
         self._wf_shm.close()
+        self._wf_q_shm.close()
         try:
             self._spec_shm.unlink()
             self._wf_shm.unlink()
+            self._wf_q_shm.unlink()
         except Exception:
             pass
         logger.info("DSP subprocess stopped")

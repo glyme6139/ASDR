@@ -27,6 +27,10 @@ logger = logging.getLogger(__name__)
 FFT_SIZE         = 4096
 DISPLAY_FFT_SIZE = 32768
 DISPLAY_HZ       = 20
+WATERFALL_HZ     = 100   # waterfall row rate — reuses the per-block 4096-pt FFT
+SIG_FAST_HZ      = 50    # signal_strength_fast emit rate for the signal rate window
+N_WF_SLOTS       = 16    # must match dsp_process.N_WF_SLOTS
+WF_ROW_BINS      = FFT_SIZE
 MIN_BINS         = 4
 
 # Minimum intermediate sample rate for the FFT channelizer.
@@ -61,12 +65,16 @@ class DSPWorker:
     DEMO_TICK        = 0.05
 
     def __init__(self, cmd_q, result_q, spec_arr: np.ndarray,
-                 wf_arr: np.ndarray, disp_gen, profiler: TimingProfiler | None = None):
+                 wf_arr: np.ndarray, disp_gen,
+                 wf_queue: np.ndarray, wf_gen,
+                 profiler: TimingProfiler | None = None):
         self._cmd_q    = cmd_q
         self._result_q = result_q
         self._spec_arr = spec_arr   # shared memory float32 view
         self._wf_arr   = wf_arr     # shared memory uint8 view
-        self._disp_gen = disp_gen   # mp.Value('L', 0)
+        self._disp_gen = disp_gen   # mp.Value('L', 0) — spectrum generation
+        self._wf_queue = wf_queue   # shared memory (N_WF_SLOTS, WF_ROW_BINS) uint8
+        self._wf_gen   = wf_gen     # mp.Value('L', 0) — waterfall row counter
         self._profiler = profiler or profiler_from_config(TimingConfig())
 
         from app.sdr.vfo import VFOManager
@@ -92,6 +100,9 @@ class DSPWorker:
         self._sample_rate  = 20e6
         self._display_skip = 1
         self._display_tick = 0
+        self._wf_skip      = 1
+        self._wf_tick      = 0
+        self._wf4_floor    = None   # separate floor tracker for 4096-pt waterfall rows
 
         self._vfo_iq_accum: dict = {}
         self._vfo_iq_nb_sr: dict = {}
@@ -101,7 +112,9 @@ class DSPWorker:
         self._disp_window = np.hanning(DISPLAY_FFT_SIZE).astype(np.float32)
         self._wf_floor    = None
 
-        self._last_sig_t  = 0.0
+        self._last_sig_t      = 0.0
+        self._last_sig_fast_t = 0.0
+        self._vfo_peak_db: dict = {}   # peak spectral power per VFO since last fast emit
         self._eye_enabled = False
         self._eye_vfo_id = None
         self._last_eye_t = 0.0
@@ -144,6 +157,7 @@ class DSPWorker:
     def _update_rate_params(self, sr: float):
         self._sample_rate  = sr
         self._display_skip = max(1, round((sr / FFT_SIZE) / DISPLAY_HZ))
+        self._wf_skip      = max(1, round((sr / FFT_SIZE) / WATERFALL_HZ))
 
     def _try_init_hackrf(self) -> bool:
         try:
@@ -509,6 +523,10 @@ class DSPWorker:
         # Regenerate waterfall slice using the floor from the current full spectrum
         wf_full = self._make_waterfall_row(self._spec_arr)
         np.copyto(self._wf_arr, wf_full)
+        # Decimate 32768→4096 for the waterfall queue (every 8th bin)
+        slot = self._wf_gen.value % N_WF_SLOTS
+        np.copyto(self._wf_queue[slot], wf_full[::DISPLAY_FFT_SIZE // WF_ROW_BINS])
+        self._wf_gen.value  += 1
         self._disp_gen.value += 1
 
     def _do_disconnect(self):
@@ -556,7 +574,8 @@ class DSPWorker:
         if not recording:
             self.recorder = None
 
-    _TETRA_MIN_BW = 50_000  # Hz — TETRA needs ≥2× the 18 kbaud symbol rate
+    _TETRA_MIN_BW = 50_000    # Hz — TETRA needs ≥2× the 18 kbaud symbol rate
+    _DVBT_MIN_BW  = 8_000_000 # Hz — DVB-T 8 MHz channel
 
     def _do_toggle_decoder(self, vfo_id: int, decoder_name: str, enabled: bool):
         vfo = self.vfo_manager.get_vfo(vfo_id)
@@ -577,6 +596,18 @@ class DSPWorker:
                 logger.info(
                     "TETRA: auto-set VFO %d bandwidth to %.0f kHz (was %.1f kHz)",
                     vfo_id, self._TETRA_MIN_BW / 1e3, old_bw / 1e3,
+                )
+            if decoder_name == 'DVB-T' and vfo.settings.bandwidth < self._DVBT_MIN_BW:
+                old_bw = vfo.settings.bandwidth
+                vfo.set_bandwidth(self._DVBT_MIN_BW)
+                self._emit({
+                    'type': 'vfo_bandwidth_update',
+                    'vfo_id': vfo_id,
+                    'bandwidth_hz': self._DVBT_MIN_BW,
+                })
+                logger.info(
+                    "DVB-T: auto-set VFO %d bandwidth to %.0f MHz (was %.1f kHz)",
+                    vfo_id, self._DVBT_MIN_BW / 1e6, old_bw / 1e3,
                 )
         else:
             vfo.remove_decoder(decoder_name)
@@ -607,6 +638,9 @@ class DSPWorker:
             elif name == 'Manchester':
                 from app.decoders.manchester import ManchesterDecoder
                 return ManchesterDecoder()
+            elif name == 'DVB-T':
+                from app.decoders.dvbt import DVBTDecoder
+                return DVBTDecoder()
             else:
                 from app.decoders.modulation import create_modulation_decoder
                 return create_modulation_decoder(name)
@@ -657,12 +691,33 @@ class DSPWorker:
 
     def _process_block(self, block: np.ndarray):
         with self._profiler.measure("DSP / block total"):
-            sr     = self._sample_rate
-            N      = FFT_SIZE
-            bin_hz = sr / N
+            sr          = self._sample_rate
+            N           = FFT_SIZE
+            bin_hz      = sr / N
+            center_freq = self.vfo_manager.center_freq
 
             with self._profiler.measure("DSP / block fft"):
                 fft_out = np.fft.fftshift(np.fft.fft(block))
+
+            # High-rate waterfall queue update (100 Hz) — reuses fft_out, no extra FFT
+            self._wf_tick += 1
+            if self._wf_tick >= self._wf_skip:
+                self._wf_tick = 0
+                slot = self._wf_gen.value % N_WF_SLOTS
+                self._wf_queue[slot] = self._make_wf4_row(fft_out)
+                self._wf_gen.value += 1
+
+                # Per-VFO spectral peak — reuses the same power spectrum for free
+                power = fft_out.real ** 2 + fft_out.imag ** 2
+                for _v in self.vfo_manager.get_all_vfos():
+                    _cbin = N // 2 + round((_v.settings.frequency - center_freq) / bin_hz)
+                    _hw   = max(1, round(_v.settings.bandwidth / bin_hz / 2))
+                    _lo   = max(0, _cbin - _hw)
+                    _hi   = min(N, _cbin + _hw)
+                    if _lo < _hi:
+                        _db = 10.0 * np.log10(float(power[_lo:_hi].mean()) + 1e-10)
+                        if _db > self._vfo_peak_db.get(_v.id, -200.0):
+                            self._vfo_peak_db[_v.id] = _db
 
             # High-res display FFT (rate-limited)
             self._display_tick += 1
@@ -685,7 +740,6 @@ class DSPWorker:
                     self._disp_gen.value += 1
 
             # Per-VFO audio channelization
-            center_freq = self.vfo_manager.center_freq
             for vfo in self.vfo_manager.get_all_vfos():
                 with self._profiler.measure(f"DSP / VFO {vfo.id} channelize"):
                     iq_nb, nb_sr = self._extract_vfo_iq(fft_out, vfo, sr, N, bin_hz, center_freq)
@@ -749,8 +803,16 @@ class DSPWorker:
                         pos += iq_needed
                     self._vfo_iq_accum[vfo_id] = [buf[pos:]] if pos < total else []
 
-            # Signal strength (throttled to ~150 ms)
+            # Signal strength — two paths with different rates and consumers
             now = time.monotonic()
+            # Fast path (50 Hz): spectral peak per VFO → signal rate window
+            if now - self._last_sig_fast_t >= (1.0 / SIG_FAST_HZ):
+                self._last_sig_fast_t = now
+                if self._vfo_peak_db:
+                    fast_upd = dict(self._vfo_peak_db)
+                    self._vfo_peak_db.clear()
+                    self._emit({'type': 'signal_strength_fast', 'updates': fast_upd})
+            # Slow path (~150 ms): vfo.signal_db → squelch panels
             if now - self._last_sig_t >= 0.15:
                 self._last_sig_t = now
                 updates = {vfo.id: (vfo.signal_db, vfo.is_active)
@@ -828,6 +890,20 @@ class DSPWorker:
         narrowband = np.fft.ifft(np.fft.ifftshift(extracted))
         narrowband = (narrowband * (N / inter_bins)).astype(np.complex64)
         return narrowband, bin_hz * inter_bins
+
+    def _make_wf4_row(self, fft_shifted: np.ndarray) -> np.ndarray:
+        """Build a WF_ROW_BINS-element uint8 waterfall row from the 4096-pt FFT.
+        Uses a separate floor tracker so it doesn't interfere with the display FFT path.
+        """
+        power = fft_shifted.real ** 2 + fft_shifted.imag ** 2
+        spec  = (10.0 * np.log10(power.astype(np.float32) + 1e-10))
+        floor = float(np.percentile(spec, 15))
+        if self._wf4_floor is None:
+            self._wf4_floor = floor
+        else:
+            # IIR matched to display path: same ~1 s time constant at WATERFALL_HZ
+            self._wf4_floor += (DISPLAY_HZ / WATERFALL_HZ) * 0.05 * (floor - self._wf4_floor)
+        return (np.clip((spec - self._wf4_floor) / 70.0, 0.0, 1.0) * 255).astype(np.uint8)
 
     def _make_waterfall_row(self, spectrum: np.ndarray) -> np.ndarray:
         if len(spectrum) == 0:

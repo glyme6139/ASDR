@@ -419,12 +419,15 @@ class VFO:
         self._update_spectrum(audio)
 
         # Run registered decoders on the audio (and optionally IQ).
-        # The audio has been resampled to audio_target samples, which the mixer
-        # plays at AUDIO_RATE — so decoders must be told AUDIO_RATE, not nb_sr.
+        # IQ-based decoders (e.g. DVB-T) receive the narrowband IQ sample rate;
+        # audio decoders get AUDIO_RATE (the resampled audio playback rate).
         decoder_results = []
         for decoder in self.decoders:
             try:
-                decoder.set_sample_rate(AUDIO_RATE)
+                if hasattr(decoder, 'set_iq_sample_rate'):
+                    decoder.set_iq_sample_rate(nb_sr)
+                else:
+                    decoder.set_sample_rate(AUDIO_RATE)
                 if profiler is not None:
                     with profiler.measure(f"decoder / {decoder.name}"):
                         result = decoder.process(iq, audio=audio)

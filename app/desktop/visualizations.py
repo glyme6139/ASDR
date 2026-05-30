@@ -11,7 +11,7 @@ from typing import Dict, Optional
 
 import numpy as np
 from PySide6.QtCore import QObject, QRectF, QTimer, Signal
-from PySide6.QtWidgets import QWidget, QVBoxLayout
+from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QSpinBox
 import pyqtgraph as pg
 
 # OpenGL rendering: GPU takes over the actual draw calls, releasing the Python GIL
@@ -39,6 +39,7 @@ VFO_COLORS = [
 ACTIVE_LINE_WIDTH   = 2
 INACTIVE_LINE_WIDTH = 1
 _FILL_DB            = -140.0   # fillLevel for spectrum curve
+_WATERFALL_HZ       = 100      # must match sdr_worker.WATERFALL_HZ; rows = seconds × this
 
 
 class ClickableRegion(pg.LinearRegionItem):
@@ -406,6 +407,25 @@ class WaterfallViewer:
         bw_mhz = self._sample_rate / 1e6
         self.image_item.setRect(QRectF(lo_mhz, 0, bw_mhz, self.history_size))
 
+    def resize_history(self, new_size: int):
+        """Reallocate the ring buffer to a new history depth. Clears existing data."""
+        if new_size < 1 or new_size == self.history_size:
+            return
+        self.history_size = new_size
+        self._ring      = np.zeros((self.freq_bins, new_size), dtype=np.uint8)
+        self._ordered   = np.empty((self.freq_bins, new_size), dtype=np.uint8)
+        self._write_idx = 0
+        self._dirty     = False
+        # Set image to the new empty buffer BEFORE _update_image_rect so that
+        # setRect → _recalcTransform uses the correct new shape, not the old one.
+        self.image_item.setImage(self._ring, autoLevels=False)
+        vb = self._plot.getViewBox()
+        vb.setYRange(0, new_size, padding=0)
+        vb.setLimits(yMin=0, yMax=new_size, minYRange=new_size, maxYRange=new_size)
+        self._update_image_rect()
+        for text in self._wf_labels.values():
+            text.setPos(text.pos().x(), new_size * 0.97)
+
     # ------------------------------------------------------------------
     # Frequency range
     # ------------------------------------------------------------------
@@ -613,7 +633,26 @@ class VisualizationPanel(QWidget):
 
         self._glw = pg.GraphicsLayoutWidget()
         self._glw.setBackground('#1a1a1a')
-        layout.addWidget(self._glw)
+        layout.addWidget(self._glw, stretch=1)
+
+        # Compact bottom bar — waterfall history depth control
+        bar = QHBoxLayout()
+        bar.setContentsMargins(6, 2, 6, 2)
+        bar.setSpacing(4)
+        bar.addStretch()
+        bar.addWidget(QLabel("History:"))
+        self._history_spin = QSpinBox()
+        self._history_spin.setRange(1, 60)
+        self._history_spin.setValue(5)
+        self._history_spin.setSuffix(" s")
+        self._history_spin.setFixedWidth(72)
+        self._history_spin.setToolTip("Waterfall history depth (seconds visible)")
+        bar.addWidget(self._history_spin)
+        bar_widget = QWidget()
+        bar_widget.setLayout(bar)
+        bar_widget.setFixedHeight(26)
+        layout.addWidget(bar_widget)
+
         self.setLayout(layout)
 
         spec_plot = self._glw.addPlot(row=0, col=0)
@@ -629,7 +668,11 @@ class VisualizationPanel(QWidget):
         wf_plot.setXLink(spec_plot)
 
         self.spectrum  = SpectrumViewer(spec_plot, profiler=self._profiler)
-        self.waterfall = WaterfallViewer(wf_plot, freq_bins=32768, profiler=self._profiler)
+        _default_history = self._history_spin.value() * _WATERFALL_HZ
+        self.waterfall = WaterfallViewer(wf_plot, history_size=_default_history, freq_bins=32768, profiler=self._profiler)
+        self._history_spin.valueChanged.connect(
+            lambda s: self.waterfall.resize_history(s * _WATERFALL_HZ)
+        )
 
         self.spectrum.vfo_drag_active.connect(
             lambda vid, f, bw: self.waterfall.show_vfo_region(vid, f, bw)
@@ -656,17 +699,22 @@ class VisualizationPanel(QWidget):
     def update_waterfall(self, data: np.ndarray):
         self._pending_waterfall = data
 
-    def set_process_display(self, spec_arr: np.ndarray, wf_arr: np.ndarray, disp_gen):
+    def set_process_display(self, spec_arr: np.ndarray, wf_arr: np.ndarray, disp_gen,
+                            wf_queue: np.ndarray = None, wf_gen=None):
         """Wire up shared-memory numpy arrays from the DSP subprocess.
 
-        Once called, _flush_pending reads directly from shared memory instead
-        of the _pending_* / SharedLatest paths.  disp_gen is a multiprocessing
-        Value('L') incremented by the DSP process on every new frame.
+        wf_queue is an (N_SLOTS, ROW_BINS) uint8 array; wf_gen is a
+        multiprocessing Value('L') incremented once per queued row.  When
+        provided, _flush_pending drains all pending rows each tick instead of
+        consuming one row per display-gen tick (gives up to 5× time resolution).
         """
-        self._shm_spec     = spec_arr
-        self._shm_wf       = wf_arr
-        self._shm_gen      = disp_gen
-        self._shm_last_gen = -1
+        self._shm_spec         = spec_arr
+        self._shm_wf           = wf_arr
+        self._shm_gen          = disp_gen
+        self._shm_last_gen     = -1
+        self._shm_wf_queue     = wf_queue   # (N_SLOTS, ROW_BINS) uint8 or None
+        self._shm_wf_gen       = wf_gen     # mp.Value or None
+        self._shm_wf_last_gen  = 0
 
     def _flush_pending(self):
         with self._profiler.measure("visual / frame flush"):
@@ -674,11 +722,26 @@ class VisualizationPanel(QWidget):
 
             # Fast path: shared memory from DSP subprocess
             if hasattr(self, '_shm_spec'):
+                # Spectrum: update whenever disp_gen changes (20 Hz)
                 gen = self._shm_gen.value
                 if gen != self._shm_last_gen:
                     self._shm_last_gen = gen
                     self.spectrum.update_spectrum(self._shm_spec)
-                    self.waterfall.update_waterfall(self._shm_wf)
+                    # Fallback for sweep / legacy path with no wf_queue
+                    if self._shm_wf_queue is None:
+                        self.waterfall.update_waterfall(self._shm_wf)
+
+                # Waterfall: drain all queued rows (up to N_SLOTS per tick)
+                if self._shm_wf_queue is not None:
+                    wf_now  = int(self._shm_wf_gen.value)
+                    n_slots = self._shm_wf_queue.shape[0]
+                    pending = min(wf_now - int(self._shm_wf_last_gen), n_slots)
+                    if pending > 0:
+                        for i in range(pending):
+                            slot = (self._shm_wf_last_gen + i) % n_slots
+                            self.waterfall.update_waterfall(self._shm_wf_queue[slot])
+                        self._shm_wf_last_gen = wf_now
+
                 self.waterfall.render_pending()
                 return
 
