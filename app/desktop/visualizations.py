@@ -7,10 +7,11 @@ Both views live in one GraphicsLayoutWidget:
 """
 
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import numpy as np
 from PySide6.QtCore import QObject, QRectF, QTimer, Signal
+from PySide6.QtGui import QFont
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QSpinBox
 import pyqtgraph as pg
 
@@ -59,6 +60,190 @@ class VFOMarker:
     color:      str
     freq_hz:    float = 0.0
     bandwidth_hz: float = 12_500.0
+
+
+# ---------------------------------------------------------------------------
+# Signal auto-detection overlay
+# ---------------------------------------------------------------------------
+
+_ANNOTATION_COLOR  = '#a0c8ff'   # pale blue — distinct from VFO cyan/yellow
+_ANNOTATION_FILL   = '#a0c8ff18' # ~10 % opacity fill
+_ANNOTATION_HOVER  = '#a0c8ff30' # ~19 % opacity on hover
+_ANNOTATION_ZVAL   = 5           # below VFO markers (z 10-12)
+_ANNOTATION_FONT   = QFont("Monospace", 8)
+
+
+def _fmt_hz(hz: float) -> str:
+    if hz >= 1e6:
+        return f"{hz / 1e6:.4f} MHz"
+    if hz >= 1e3:
+        return f"{hz / 1e3:.1f} kHz"
+    return f"{hz:.0f} Hz"
+
+
+class _AnnotationRegion(pg.LinearRegionItem):
+    """Non-movable LinearRegionItem with hover and click signals."""
+
+    sigHovered = Signal(object, bool)  # (self, entering: bool)
+    sigClicked = Signal(object)        # (self,)
+
+    def __init__(self, signal_data: dict, *args, **kwargs):
+        kwargs['movable'] = False
+        super().__init__(*args, **kwargs)
+        self.signal_data = signal_data
+        self.setAcceptHoverEvents(True)
+
+    def hoverEvent(self, ev):
+        # pyqtgraph passes a HoverEvent; ev.isExit() is True when leaving
+        self.sigHovered.emit(self, not ev.isExit())
+
+    def mouseClickEvent(self, ev):
+        # pyqtgraph MouseClickEvent; accept so it doesn't propagate
+        self.sigClicked.emit(self)
+        ev.accept()
+
+
+class SignalOverlay(QObject):
+    """
+    Manages auto-detected signal annotation overlays on a spectrum PlotItem.
+
+    Each detected signal is rendered as:
+      - a non-movable coloured band (_AnnotationRegion)
+      - a compact label at the top of the plot showing the modulation hint
+      - a shared tooltip TextItem revealed on hover with full details
+
+    annotation_clicked carries the raw signal-data dict so the main window
+    can open the correct Artemis entry without any extra lookups.
+    """
+
+    annotation_clicked = Signal(object)   # signal_data dict
+
+    def __init__(self, plot: pg.PlotItem, parent: QObject | None = None):
+        super().__init__(parent)
+        self._plot        = plot
+        self._annotations: List[tuple] = []   # (region, label)
+
+        # Shared tooltip — positioned in the upper-left corner on hover
+        self._tooltip = pg.TextItem(
+            anchor=(0.0, 0.0),
+            fill=pg.mkBrush(15, 15, 15, 210),
+        )
+        self._tooltip.setFont(_ANNOTATION_FONT)
+        self._tooltip.setZValue(100)
+        self._tooltip.hide()
+        plot.addItem(self._tooltip)
+
+        self._hover_locked = False   # True while any annotation is hovered
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def update(self, signals: list):
+        """Replace all annotations with a new list of signal dicts."""
+        if self._hover_locked:
+            return
+        self._clear()
+        if not signals:
+            return
+        yr = self._plot.getViewBox().viewRange()[1]
+        for s in signals:
+            self._add(s, yr)
+
+    def clear(self):
+        self._clear()
+
+    # ------------------------------------------------------------------
+    # Internal
+    # ------------------------------------------------------------------
+
+    def _clear(self):
+        for region, label in self._annotations:
+            self._plot.removeItem(region)
+            self._plot.removeItem(label)
+        self._annotations.clear()
+        self._tooltip.hide()
+
+    def _add(self, sig: dict, yr: tuple):
+        center_mhz  = sig['center_hz'] / 1e6
+        half_bw_mhz = sig['bandwidth_hz'] / 2e6
+
+        region = _AnnotationRegion(
+            signal_data=sig,
+            values=[center_mhz - half_bw_mhz, center_mhz + half_bw_mhz],
+            brush=pg.mkBrush(pg.mkColor(_ANNOTATION_FILL)),
+            pen=pg.mkPen(color=_ANNOTATION_COLOR, width=1),
+        )
+        region.setZValue(_ANNOTATION_ZVAL)
+
+        label = pg.TextItem(
+            text=sig['modulation_hint'],
+            color=_ANNOTATION_COLOR,
+            anchor=(0.5, 1.0),
+        )
+        label.setFont(_ANNOTATION_FONT)
+        label.setPos(center_mhz, yr[1])
+        label.setZValue(_ANNOTATION_ZVAL + 1)
+        # Labels should not eat mouse events
+        label.setAcceptHoverEvents(False)
+
+        self._plot.addItem(region)
+        self._plot.addItem(label)
+        self._annotations.append((region, label))
+
+        region.sigHovered.connect(
+            lambda _, entering, s=sig, lbl=label: self._on_hover(s, lbl, entering)
+        )
+        region.sigClicked.connect(
+            lambda _, s=sig: self.annotation_clicked.emit(s)
+        )
+
+    def _on_hover(self, sig: dict, label: pg.TextItem, entering: bool):
+        self._hover_locked = entering
+        if entering:
+            label.setColor('#ffffff')
+            region = self._sender_region(sig)
+            if region is not None:
+                region.setBrush(pg.mkBrush(pg.mkColor(_ANNOTATION_HOVER)))
+
+            # Build tooltip text
+            bw_str  = _fmt_hz(sig['bandwidth_hz'])
+            text = (
+                f"Center:  {_fmt_hz(sig['center_hz'])}\n"
+                f"BW (−6 dB): ≈{bw_str}\n"
+                f"Peak:    {sig['peak_db']:.1f} dBFS\n"
+                f"SNR:     {sig['snr_db']:.1f} dB\n"
+                f"Type:    {sig['modulation_hint']}\n"
+                f"\nClick to search Artemis"
+            )
+            xr = self._plot.getViewBox().viewRange()[0]
+            yr = self._plot.getViewBox().viewRange()[1]
+            center_mhz = sig['center_hz'] / 1e6
+
+            # Extend left when signal is in the right half so the box stays in-frame
+            if center_mhz < (xr[0] + xr[1]) / 2.0:
+                self._tooltip.anchor = pg.Point(0.0, 0.0)
+            else:
+                self._tooltip.anchor = pg.Point(1.0, 0.0)
+
+            # setText triggers an internal reposition that applies the new anchor
+            self._tooltip.setText(text)
+
+            y_pos = yr[1] - (yr[1] - yr[0]) * 0.01
+            self._tooltip.setPos(center_mhz, y_pos)
+            self._tooltip.show()
+        else:
+            label.setColor(_ANNOTATION_COLOR)
+            region = self._sender_region(sig)
+            if region is not None:
+                region.setBrush(pg.mkBrush(pg.mkColor(_ANNOTATION_FILL)))
+            self._tooltip.hide()
+
+    def _sender_region(self, sig: dict) -> '_AnnotationRegion | None':
+        for region, _ in self._annotations:
+            if region.signal_data is sig:
+                return region
+        return None
 
 
 class SpectrumViewer(QObject):
@@ -621,6 +806,10 @@ class VisualizationPanel(QWidget):
     The X axes are linked — panning/zooming one tracks the other.
     """
 
+    # Emitted when the user clicks an auto-detected signal annotation.
+    # Carries the raw signal-data dict (center_hz, bandwidth_hz, modulation_hint, …).
+    signal_annotation_clicked = Signal(object)
+
     def __init__(self, parent=None, display_buffers=None, timing: TimingConfig | None = None,
                  report_handler=None):
         super().__init__(parent)
@@ -673,6 +862,10 @@ class VisualizationPanel(QWidget):
         self._history_spin.valueChanged.connect(
             lambda s: self.waterfall.resize_history(s * _WATERFALL_HZ)
         )
+
+        # Auto-detection overlay (sits below VFO markers in z-order)
+        self._signal_overlay = SignalOverlay(spec_plot, parent=self)
+        self._signal_overlay.annotation_clicked.connect(self.signal_annotation_clicked)
 
         self.spectrum.vfo_drag_active.connect(
             lambda vid, f, bw: self.waterfall.show_vfo_region(vid, f, bw)
@@ -813,3 +1006,14 @@ class VisualizationPanel(QWidget):
 
     def set_active_vfo_marker(self, vfo_id: int):
         self.spectrum.set_active_vfo_marker(vfo_id)
+
+    # ------------------------------------------------------------------
+    # Signal auto-detection overlay
+    # ------------------------------------------------------------------
+
+    def update_signal_annotations(self, signals: list):
+        """Refresh all auto-detected signal overlays on the spectrum plot."""
+        self._signal_overlay.update(signals)
+
+    def clear_signal_annotations(self):
+        self._signal_overlay.clear()

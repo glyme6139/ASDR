@@ -152,6 +152,11 @@ class DSPProcess:
     def result_queue(self):
         return self._result_q
 
+    @property
+    def spec_shm_name(self) -> str:
+        """Name of the spectrum shared-memory block (read by the signal analyzer)."""
+        return self._spec_shm.name
+
     # ------------------------------------------------------------------
     # Command proxies (thread-safe: Queue.put_nowait is GIL-protected)
     # ------------------------------------------------------------------

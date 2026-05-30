@@ -23,6 +23,7 @@ from .visualizations import VisualizationPanel, VFO_COLORS
 from .control_panels import ControlPanel
 from .dsp_process import DSPProcess
 from .ipc_adapter import IPCAdapterThread
+from .signal_analyzer_process import SignalAnalyzerProcess, SignalAnalyzerIPCThread
 from .constellation_window import ConstellationWindow
 from .eye_diagram_window import EyeDiagramWindow
 from .oscilloscope_window import OscilloscopeWindow
@@ -75,6 +76,14 @@ class ASURMainWindow(QMainWindow):
         self.dsp = DSPProcess(timing=self._timing)
         self.ipc = IPCAdapterThread(self.dsp.result_queue, profiler=self._profiler)
 
+        self.signal_analyzer = SignalAnalyzerProcess(
+            spec_shm_name=self.dsp.spec_shm_name,
+            disp_gen=self.dsp.display_gen,
+            center_hz=DEFAULT_CENTER_HZ,
+            sample_rate=DEFAULT_SAMPLE_RATE,
+        )
+        self.signal_analyzer_ipc = SignalAnalyzerIPCThread(self.signal_analyzer.result_queue)
+
         self._initUI()
         self._connect_signals()
         # session controls moved to main menu
@@ -97,6 +106,8 @@ class ASURMainWindow(QMainWindow):
 
         self.dsp.start()
         self.ipc.start()
+        self.signal_analyzer.start()
+        self.signal_analyzer_ipc.start()
 
         # Load session if available and apply settings
         try:
@@ -338,6 +349,12 @@ class ASURMainWindow(QMainWindow):
         self.ctrl_panel.vfo_tab.active_vfo_changed.connect(self._on_active_vfo_for_signal_id)
         self.ctrl_panel.vfo_tab.active_vfo_changed.connect(self._on_active_vfo_changed)
 
+        # ---- Signal auto-detection overlay ----
+        self.signal_analyzer_ipc.scan_result.connect(self._on_scan_result, Q)
+        self.vis_panel.signal_annotation_clicked.connect(
+            self._on_signal_annotation_clicked, Q
+        )
+
         self.timing_window.sample_count_changed.connect(self._on_timing_sample_count_changed)
         self.eye_window.visibility_changed.connect(self._on_eye_window_visibility_changed)
         self.eye_window.vfo_changed.connect(self._on_eye_window_vfo_changed)
@@ -466,6 +483,15 @@ class ASURMainWindow(QMainWindow):
         if self.decoder_win.isVisible() and self.decoder_win._current_vfo is None:
             self.decoder_win.set_active_vfo(vfo_id)
 
+    def _on_scan_result(self, signals: list):
+        self.vis_panel.update_signal_annotations(signals)
+
+    def _on_signal_annotation_clicked(self, sig: dict):
+        """Open / refresh the Artemis Signal ID panel for the clicked annotation."""
+        center_hz = sig.get('center_hz', self._center_hz)
+        self.ctrl_panel.signal_id_panel.set_frequency(center_hz)
+        self.ctrl_panel.signal_id_panel._do_search()
+
     def _on_signal_strength(self, updates: dict):
         for vfo_id, (db, is_active) in updates.items():
             self.ctrl_panel.vfo_tab.update_signal_strength(vfo_id, db, is_active)
@@ -505,12 +531,16 @@ class ASURMainWindow(QMainWindow):
         self._center_hz = freq_hz
         self.dsp.set_center_frequency(freq_hz)
         self.vis_panel.set_freq_range(freq_hz, self._sample_rate)
+        self.vis_panel.clear_signal_annotations()
+        self.signal_analyzer.notify_freq_change(freq_hz, self._sample_rate)
         self._check_vfo_ranges()
 
     def _on_sample_rate_changed(self, sample_rate: float):
         self._sample_rate = sample_rate
         self.dsp.set_sample_rate(sample_rate)
         self.vis_panel.set_freq_range(self._center_hz, sample_rate)
+        self.vis_panel.clear_signal_annotations()
+        self.signal_analyzer.notify_freq_change(self._center_hz, sample_rate)
         self._check_vfo_ranges()
         try:
             self.timing_window.set_dsp_context(sample_rate=sample_rate)
@@ -616,6 +646,8 @@ class ASURMainWindow(QMainWindow):
 
             if 'frequency' in status or 'sample_rate' in status:
                 self.vis_panel.set_freq_range(center, sr)
+                self.vis_panel.clear_signal_annotations()
+                self.signal_analyzer.notify_freq_change(center, sr)
                 self._check_vfo_ranges()
                 try:
                     self.timing_window.set_dsp_context(sample_rate=sr)
@@ -857,6 +889,8 @@ class ASURMainWindow(QMainWindow):
         self.rate_window.close()
 
         self.ipc.stop()
+        self.signal_analyzer_ipc.stop()
+        self.signal_analyzer.stop()
         self.dsp.stop()
         event.accept()
 
