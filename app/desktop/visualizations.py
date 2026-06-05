@@ -1013,7 +1013,8 @@ class VisualizationPanel(QWidget):
 
     def update_signal_annotations(self, signals: list):
         """Refresh all auto-detected signal overlays on the spectrum plot."""
-        self._signal_overlay.update(signals)
+        with self._profiler.measure("visual / signal annotations"):
+            self._signal_overlay.update(signals)
 
     def clear_signal_annotations(self):
         self._signal_overlay.clear()

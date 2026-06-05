@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QMainWindow, QWidget, QVBoxLayout,
 )
 
+import bisect
 import collections
 import time
 import pyqtgraph as pg
@@ -104,6 +105,12 @@ class TimingWindow(QMainWindow):
         self.table.itemChanged.connect(self._on_table_item_changed)
         layout.addWidget(self.table)
 
+        # ── Hover label ───────────────────────────────────────────────────────
+        self._hover_label = QLabel("")
+        self._hover_label.setFixedHeight(16)
+        self._hover_label.setStyleSheet("color: #dddddd; font-size: 10px; padding: 0 4px;")
+        layout.addWidget(self._hover_label)
+
         # ── Plot ─────────────────────────────────────────────────────────────
         self._plot = pg.PlotWidget()
         self._plot.setBackground('#111111')
@@ -129,6 +136,16 @@ class TimingWindow(QMainWindow):
         self._plot_colors = [
             '#00ffff', '#ffd166', '#7dd3fc', '#ff7b7b', '#9ad3bc', '#c89bff', '#ffb86b', '#88b3ff'
         ]
+
+        self._hover_vline = pg.InfiniteLine(
+            angle=90, movable=False,
+            pen=pg.mkPen('#888888', width=1, style=Qt.DashLine),
+        )
+        self._hover_vline.setZValue(50)
+        self._hover_vline.hide()
+        self._plot.addItem(self._hover_vline)
+        self._plot.scene().sigMouseMoved.connect(self._on_plot_mouse_moved)
+
         layout.addWidget(self._plot, stretch=1)
 
         # ── Wiring ───────────────────────────────────────────────────────────
@@ -394,6 +411,54 @@ class TimingWindow(QMainWindow):
                 self._plot_upper[key].setData(x, ys_max)
                 self._plot_lower[key].setData(x, ys_min)
                 self._plot_curves[key].setData(x, ys_mean)
+
+    def _on_plot_mouse_moved(self, pos):
+        from PySide6.QtCore import QPointF
+        vb = self._plot.getViewBox()
+        if not self._plot.sceneBoundingRect().contains(pos):
+            self._hover_label.setText("")
+            self._hover_vline.hide()
+            return
+
+        mouse_point = vb.mapSceneToView(pos)
+        mx = float(mouse_point.x())
+        my = float(mouse_point.y())
+
+        # Convert 15 px in y to plot units for a pixel-stable proximity threshold
+        p_offset = vb.mapSceneToView(QPointF(pos.x(), pos.y() + 15))
+        y_threshold = abs(float(p_offset.y()) - my)
+
+        best_key = None
+        best_dist = float('inf')
+        best_y = 0.0
+
+        for key in self._visible_keys:
+            curve = self._plot_curves.get(key)
+            if curve is None:
+                continue
+            xdata, ydata = curve.getData()
+            if xdata is None or len(xdata) == 0:
+                continue
+            idx = bisect.bisect_left(xdata, mx)
+            for i in (max(0, idx - 1), min(len(xdata) - 1, idx)):
+                dy = abs(float(ydata[i]) - my)
+                if dy < best_dist:
+                    best_dist = dy
+                    best_key = key
+                    best_y = float(ydata[i])
+
+        self._hover_vline.setPos(mx)
+        self._hover_vline.show()
+
+        if best_key is not None and best_dist <= y_threshold:
+            source, stage = self._key_labels[best_key]
+            color = self._key_colors.get(best_key, '#ffffff')
+            self._hover_label.setText(
+                f'<span style="color:{color}; font-weight:600">{source} — {stage}</span>'
+                f'&nbsp;&nbsp;<span style="color:#aaaaaa">{best_y:.3f} ms</span>'
+            )
+        else:
+            self._hover_label.setText("")
 
     def closeEvent(self, event):
         event.ignore()

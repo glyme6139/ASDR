@@ -276,6 +276,8 @@ class DSPWorker:
             self.audio_mixer.set_volume(msg['vfo_id'], msg['volume'])
         elif cmd == 'toggle_decoder':
             self._do_toggle_decoder(msg['vfo_id'], msg['decoder_name'], msg['enabled'])
+        elif cmd == 'configure_decoder':
+            self._do_configure_decoder(msg['vfo_id'], msg['decoder_name'], msg.get('params', {}))
         elif cmd == 'set_timing_sample_count':
             self._profiler.set_sample_count(msg['n'])
         elif cmd == 'set_eye_stream':
@@ -612,11 +614,20 @@ class DSPWorker:
         else:
             vfo.remove_decoder(decoder_name)
 
+    def _do_configure_decoder(self, vfo_id: int, decoder_name: str, params: dict):
+        vfo = self.vfo_manager.get_vfo(vfo_id)
+        if vfo is None:
+            return
+        for dec in vfo.decoders:
+            if dec.name == decoder_name and hasattr(dec, 'configure'):
+                dec.configure(params)
+                break
+
     def _make_decoder(self, name: str):
         try:
             if name == 'POCSAG':
                 from app.decoders.pocsag import POCSAGDecoder
-                return POCSAGDecoder()
+                return POCSAGDecoder(debug=True)
             elif name == 'RDS':
                 from app.decoders.rds import RDSDecoder
                 return RDSDecoder()
@@ -641,6 +652,12 @@ class DSPWorker:
             elif name == 'DVB-T':
                 from app.decoders.dvbt import DVBTDecoder
                 return DVBTDecoder()
+            elif name == 'WEFAX':
+                from app.decoders.wefax import WEFAXDecoder
+                return WEFAXDecoder()
+            elif name == 'FSK':
+                from app.decoders.fsk import FSKDecoder
+                return FSKDecoder()
             else:
                 from app.decoders.modulation import create_modulation_decoder
                 return create_modulation_decoder(name)
@@ -778,13 +795,15 @@ class DSPWorker:
 
                         if tetra_pcm is not None:
                             out_audio = _resample_8k_to_48k(tetra_pcm)
-                            self.audio_mixer.push_audio(vfo_id, out_audio)
+                            with self._profiler.measure(f"DSP / VFO {vfo_id} audio mix"):
+                                self.audio_mixer.push_audio(vfo_id, out_audio)
                             self._emit_eye_samples(vfo_id, out_audio)
                         elif audio is not None and len(audio) > 0:
                             if np.iscomplexobj(audio):
                                 self._emit_iq_samples(vfo_id, audio)
                             else:
-                                self.audio_mixer.push_audio(vfo_id, audio)
+                                with self._profiler.measure(f"DSP / VFO {vfo_id} audio mix"):
+                                    self.audio_mixer.push_audio(vfo_id, audio)
                                 self._emit_eye_samples(vfo_id, audio)
 
                         for result in dec_results:

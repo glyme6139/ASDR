@@ -214,6 +214,10 @@ class DSPProcess:
         self._send({'cmd': 'toggle_decoder', 'vfo_id': int(vfo_id),
                     'decoder_name': str(decoder_name), 'enabled': bool(enabled)})
 
+    def configure_decoder(self, vfo_id: int, decoder_name: str, params: dict):
+        self._send({'cmd': 'configure_decoder', 'vfo_id': int(vfo_id),
+                    'decoder_name': str(decoder_name), 'params': dict(params)})
+
     def set_eye_stream(self, enabled: bool, vfo_id: int | None):
         self._send({'cmd': 'set_eye_stream', 'enabled': bool(enabled), 'vfo_id': vfo_id})
 

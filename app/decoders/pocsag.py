@@ -347,11 +347,12 @@ class _POCSAGSingleBaudTS:
 
     _ecc_tables = None
 
-    def __init__(self, audio_rate: int, baud: int, on_message: Callable[[Dict[str, Any]], None]):
+    def __init__(self, audio_rate: int, baud: int, on_message: Callable[[Dict[str, Any]], None], debug: bool = False):
         self.audio_rate = audio_rate
         self.baudRate = baud
         self.spb = float(audio_rate) / float(baud)
         self.onMessage = on_message
+        self.debug = debug
         self.reset()
 
     def reset(self) -> None:
@@ -368,7 +369,9 @@ class _POCSAGSingleBaudTS:
         self.pageActive = False
         self.pageCapcode = 0
         self.pageFunc = 0
+        self.pageFrameSlot: int = 0
         self.pageBits: List[int] = []
+        self.pageCWs:  List[Dict] = []
 
     def process(self, samples: np.ndarray) -> None:
         spb = self.spb
@@ -437,29 +440,43 @@ class _POCSAGSingleBaudTS:
     def _on_codeword(self, cw: int) -> None:
         pass1 = self._ecc_correct(cw)
         pass2 = self._ecc_correct(pass1['cw'])
+        errors    = pass2['errors']
+        corrected = pass2['cw']
 
-        if pass2['errors'] >= 3:
-            # Uncorrectable codeword.  For alpha messages, silently dropping
-            # the 20 data bits shifts the 7-bit character accumulator by
-            # (20 mod 7) = 6 positions, making every subsequent character
-            # wrong.  Insert the raw bits instead so alignment is preserved;
-            # at worst we get a few garbage characters for this codeword.
-            if self.pageActive and ((cw >> 31) & 1) == 1:
-                data = (cw >> 11) & 0xFFFFF
-                for b in range(19, -1, -1):
-                    self.pageBits.append((data >> b) & 1)
+        if errors >= 3:
+            # Uncorrectable — insert raw bits to preserve 7-bit char alignment.
+            if self.pageActive:
+                self.pageCWs.append({'idx': self.batchCwIdx, 'type': 'bad',
+                                     'raw': cw, 'corrected': corrected, 'errors': 3})
+                if (cw >> 31) & 1:
+                    data = (cw >> 11) & 0xFFFFF
+                    for b in range(19, -1, -1):
+                        self.pageBits.append((data >> b) & 1)
             self.batchCwIdx += 1
             if self.batchCwIdx >= 16:
                 self.state = 'hunt'
             return
 
-        corrected = pass2['cw']
-
         if corrected == self.IDLE_CW:
-            if self.pageActive and self.pageBits:
+            if self.pageActive:
+                self.pageCWs.append({'idx': self.batchCwIdx, 'type': 'idle',
+                                     'raw': cw, 'corrected': corrected, 'errors': errors})
                 self._emit_page()
             self.pageActive = False
+
+        elif ((corrected >> 31) & 1) == 0:
+            # Address codeword — flush any open page, then start a new one.
+            if self.pageActive:
+                self._emit_page()
+            self.pageCWs = [{'idx': self.batchCwIdx, 'type': 'addr',
+                              'raw': cw, 'corrected': corrected, 'errors': errors}]
+            self._process_cw(corrected, self.batchCwIdx)
+
         else:
+            # Data codeword
+            if self.pageActive:
+                self.pageCWs.append({'idx': self.batchCwIdx, 'type': 'data',
+                                     'raw': cw, 'corrected': corrected, 'errors': errors})
             self._process_cw(corrected, self.batchCwIdx)
 
         self.batchCwIdx += 1
@@ -472,14 +489,12 @@ class _POCSAGSingleBaudTS:
 
     def _process_cw(self, cw: int, cw_idx: int) -> None:
         if ((cw >> 31) & 1) == 0:
-            if self.pageActive and self.pageBits:
-                self._emit_page()
-
             addr_high = (cw >> 13) & 0x3FFFF
             func = (cw >> 11) & 0x3
             frame = (cw_idx >> 1) & 0x7
             self.pageCapcode = (addr_high << 3) | frame
             self.pageFunc = func
+            self.pageFrameSlot = frame
             self.pageBits = []
             self.pageActive = True
         else:
@@ -585,8 +600,7 @@ class _POCSAGSingleBaudTS:
                     c = 0
                     cb = 0
         elif self.pageFunc != 0:
-            # nmap = '0123456789*-() '  # standard POCSAG numeric map (matches multimon-ng) KEPT FOR REFERENCE
-            nmap = '0123456789 -.)(';  # POCSAG numeric map (matches BrowSDR/Mayhem reference)
+            nmap = '0123456789*-() '
             for i in range(0, len(self.pageBits), 4):
                 if i + 3 >= len(self.pageBits):
                     break
@@ -602,16 +616,33 @@ class _POCSAGSingleBaudTS:
         clean = ''.join(' ' if ord(ch) < 32 or ord(ch) == 127 else ch for ch in text)
         clean = ' '.join(clean.split()).strip()
 
-        if clean or self.pageFunc == 0:
-            self.onMessage({
-                'capcode': self.pageCapcode,
-                'func': self.pageFunc,
-                'type': 'alpha' if self.pageFunc == 3 else ('tone' if self.pageFunc == 0 else 'numeric'),
-                'text': clean,
-                'baud': self.baudRate,
-            })
+        raw_hex = None
+        if self.debug and self.pageBits:
+            raw_bytes = bytearray()
+            for i in range(0, len(self.pageBits), 8):
+                chunk = self.pageBits[i:i + 8]
+                byte_val = 0
+                for j, b in enumerate(chunk):
+                    byte_val |= (b & 1) << (7 - j)
+                raw_bytes.append(byte_val)
+            raw_hex = raw_bytes.hex(' ').upper()
+
+        if clean or self.pageFunc == 0 or (self.debug and self.pageBits):
+            msg = {
+                'capcode':    self.pageCapcode,
+                'func':       self.pageFunc,
+                'type':       'alpha' if self.pageFunc == 3 else ('tone' if self.pageFunc == 0 else 'numeric'),
+                'text':       clean,
+                'baud':       self.baudRate,
+                'frame_slot': self.pageFrameSlot,
+                'codewords':  list(self.pageCWs),
+            }
+            if raw_hex is not None:
+                msg['raw_hex'] = raw_hex
+            self.onMessage(msg)
 
         self.pageBits = []
+        self.pageCWs  = []
         self.pageActive = False
 
 
@@ -622,8 +653,8 @@ class POCSAGDecoder(BaseAudioDecoder):
         super().__init__('POCSAG', sample_rate)
         self.debug = debug
         self._results: List[DecoderResult] = []
-        self._d1200 = _POCSAGSingleBaudTS(sample_rate, 1200, self._handle_message)
-        self._d512 = _POCSAGSingleBaudTS(sample_rate, 512, self._handle_message)
+        self._d1200 = _POCSAGSingleBaudTS(sample_rate, 1200, self._handle_message, debug=debug)
+        self._d512 = _POCSAGSingleBaudTS(sample_rate, 512, self._handle_message, debug=debug)
 
     def _handle_message(self, msg: Dict[str, Any]) -> None:
         self._results.append(
@@ -657,8 +688,12 @@ class POCSAGDecoder(BaseAudioDecoder):
         msg_type = data.get('type', 'alpha')
         text     = str(data.get('text', '')).strip()
         baud     = data.get('baud', '?')
+        raw_hex  = data.get('raw_hex')
         header   = f"[{capcode}/{func} {msg_type}@{baud}]"
-        return f"{header} {text}" if text else header
+        body     = text or ''
+        if raw_hex:
+            body = f"{body} [raw: {raw_hex}]".strip()
+        return f"{header} {body}" if body else header
 
 
 class POCSAGIQDecoder(BaseAudioDecoder):

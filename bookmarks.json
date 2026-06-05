@@ -84,6 +84,17 @@
       "decoders": [
         "POCSAG"
       ]
+    },
+    {
+      "name": "DAPNET 439",
+      "frequency": 439986997.0,
+      "demod_mode": "NFM",
+      "bandwidth": 7000.0,
+      "squelch_level": -120.0,
+      "volume": 0.01,
+      "decoders": [
+        "POCSAG"
+      ]
     }
   ]
 }

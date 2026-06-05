@@ -23,6 +23,8 @@ from .tetra import TETRADecoder  # now a package: app/decoders/tetra/
 from .acars import ACARSDecoder
 from .dmr import DMRDecoder
 from .manchester import ManchesterDecoder
+from .wefax import WEFAXDecoder
+from .fsk import FSKDecoder, PRESETS as FSK_PRESETS, FSK_PRESET_NAMES
 
 __all__ = [
     'BaseDecoder',
@@ -41,4 +43,8 @@ __all__ = [
     'ACARSDecoder',
     'DMRDecoder',
     'ManchesterDecoder',
+    'WEFAXDecoder',
+    'FSKDecoder',
+    'FSK_PRESETS',
+    'FSK_PRESET_NAMES',
 ]

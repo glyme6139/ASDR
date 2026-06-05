@@ -31,6 +31,8 @@ from .signal_decoder_window import SignalDecoderWindow
 from .signal_rate_window import SignalRateWindow
 from .timing import TimingConfig, profiler_from_config
 from .timing_window import TimingWindow
+from .rfi_log_window import RFILogWindow
+from app.rfi.rfi_classifier import RFIClassifier
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +74,8 @@ class ASURMainWindow(QMainWindow):
         self.constellation_window = ConstellationWindow(self)
         self.decoder_win = SignalDecoderWindow(self)
         self.rate_window = SignalRateWindow(self)
+        self.rfi_log_window = RFILogWindow()
+        self.rfi_classifier = RFIClassifier()
 
         self.dsp = DSPProcess(timing=self._timing)
         self.ipc = IPCAdapterThread(self.dsp.result_queue, profiler=self._profiler)
@@ -206,6 +210,9 @@ class ASURMainWindow(QMainWindow):
             self._rate_action.triggered.connect(self._show_rate_window)
             self._decoder_win_action = view_menu.addAction("Signal Decoder")
             self._decoder_win_action.triggered.connect(self._show_decoder_win)
+            view_menu.addSeparator()
+            self._rfi_log_action = view_menu.addAction("RFI Logger")
+            self._rfi_log_action.triggered.connect(self._show_rfi_log_window)
         except Exception:
             pass
 
@@ -484,7 +491,21 @@ class ASURMainWindow(QMainWindow):
             self.decoder_win.set_active_vfo(vfo_id)
 
     def _on_scan_result(self, signals: list):
-        self.vis_panel.update_signal_annotations(signals)
+        with self._profiler.measure("UI / scan result"):
+            self.vis_panel.update_signal_annotations(signals)
+            if signals:
+                try:
+                    events = self.rfi_classifier.classify(signals)
+                    if self.rfi_log_window.isVisible():
+                        for event in events:
+                            self.rfi_log_window.push_event(event)
+                except Exception:
+                    logger.exception("RFI classification error")
+
+    def _show_rfi_log_window(self):
+        self.rfi_log_window.show()
+        self.rfi_log_window.raise_()
+        self.rfi_log_window.activateWindow()
 
     def _on_signal_annotation_clicked(self, sig: dict):
         """Open / refresh the Artemis Signal ID panel for the clicked annotation."""
@@ -592,6 +613,10 @@ class ASURMainWindow(QMainWindow):
             win = create_window(decoder_name, vfo_id)
             if win is None:
                 return
+            win.set_configure_fn(
+                lambda params, _vid=vfo_id, _dn=decoder_name:
+                    self.dsp.configure_decoder(_vid, _dn, params)
+            )
             self._decoder_windows[key] = win
         win.show()
         win.raise_()
@@ -887,6 +912,8 @@ class ASURMainWindow(QMainWindow):
         self.constellation_window.close()
         self.decoder_win.close()
         self.rate_window.close()
+        self.rfi_log_window.close()
+        self.rfi_classifier.close()
 
         self.ipc.stop()
         self.signal_analyzer_ipc.stop()

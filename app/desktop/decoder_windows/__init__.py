@@ -9,14 +9,20 @@ from .adsb_map import ADSBMapWindow
 from .tetra_view import TETRAWindow
 from .acars_view import ACARSWindow
 from .dmr_view import DMRWindow
+from .pocsag_view import POCSAGWindow
+from .wefax_view import WEFAXWindow
+from .fsk_view import FSKWindow
 from .base import BaseDecoderWindow
 
 # Map decoder_name → window class (constructor receives vfo_id: int)
 WINDOW_REGISTRY: dict = {
-    "ADSB":  ADSBMapWindow,
-    "TETRA": TETRAWindow,
-    "ACARS": ACARSWindow,
-    "DMR":   DMRWindow,
+    "ADSB":   ADSBMapWindow,
+    "TETRA":  TETRAWindow,
+    "ACARS":  ACARSWindow,
+    "DMR":    DMRWindow,
+    "POCSAG": POCSAGWindow,
+    "WEFAX":  WEFAXWindow,
+    "FSK":    FSKWindow,
 }
 
 
@@ -37,6 +43,9 @@ __all__ = [
     "TETRAWindow",
     "ACARSWindow",
     "DMRWindow",
+    "POCSAGWindow",
+    "WEFAXWindow",
+    "FSKWindow",
     "WINDOW_REGISTRY",
     "has_window",
     "create_window",

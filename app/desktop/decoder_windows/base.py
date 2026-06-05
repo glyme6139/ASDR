@@ -26,6 +26,13 @@ class BaseDecoderWindow(QMainWindow):
         # Closing hides the window; it is not destroyed until the VFO is removed.
         self.setAttribute(Qt.WA_QuitOnClose, False)
 
+    def set_configure_fn(self, fn) -> None:
+        """
+        Provide a callable that subclasses can use to push runtime config
+        changes back to the running decoder.  Signature: fn(params: dict).
+        Called by the main window after window creation; ignored by default.
+        """
+
     def push_result(self, data: dict) -> None:
         """
         Receive one structured decoder result from the UI thread.

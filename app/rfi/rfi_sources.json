@@ -1,0 +1,459 @@
+{
+  "version": "1.0",
+  "country": "FR",
+  "_comment": "Frequency band database for France. Edit bands, calibration, and logging freely.",
+  "calibration": {
+    "offset_db": 0.0,
+    "_comment_offset": "Adjust to calibrate dBFS → dBm. E.g. set -30 if your setup typically reads ~30 dB above actual. Requires a known reference signal or calibrated source.",
+    "antenna_impedance_ohms": 50.0
+  },
+  "logging": {
+    "enabled": true,
+    "log_dir": "logs/rfi",
+    "min_snr_db": 8.0,
+    "deduplicate_hz": 50000,
+    "_comment_dedup_hz": "Frequency resolution for deduplication — signals within this window count as the same source.",
+    "deduplicate_seconds": 60.0
+  },
+  "bands": [
+    {
+      "id": "lf_longwave",
+      "name": "Longwave (LW) Broadcast",
+      "start_hz": 148500,
+      "stop_hz": 283500,
+      "likely_sources": ["Europe 1 (183 kHz)", "RTL (234 kHz)", "RFI/France Inter (162 kHz)"],
+      "rfi_risk": "low",
+      "category": "broadcast",
+      "notes": "French and European LW broadcast stations. Normal signal."
+    },
+    {
+      "id": "mw_broadcast",
+      "name": "Mediumwave (AM) Broadcast",
+      "start_hz": 526500,
+      "stop_hz": 1606500,
+      "likely_sources": ["AM broadcast stations", "NDB beacons"],
+      "rfi_risk": "low",
+      "category": "broadcast",
+      "notes": "Normal AM broadcast. HackRF has limited sensitivity here."
+    },
+    {
+      "id": "hf_amateur_160m",
+      "name": "Amateur 160m Band",
+      "start_hz": 1810000,
+      "stop_hz": 2000000,
+      "likely_sources": ["Amateur radio (SSB, CW)", "Utility stations"],
+      "rfi_risk": "low",
+      "category": "amateur"
+    },
+    {
+      "id": "hf_amateur_80m",
+      "name": "Amateur 80m Band",
+      "start_hz": 3500000,
+      "stop_hz": 3800000,
+      "likely_sources": ["Amateur radio (SSB, CW, digital)"],
+      "rfi_risk": "low",
+      "category": "amateur"
+    },
+    {
+      "id": "hf_amateur_40m",
+      "name": "Amateur 40m Band",
+      "start_hz": 7000000,
+      "stop_hz": 7200000,
+      "likely_sources": ["Amateur radio (SSB, CW, FT8/FT4, digital)"],
+      "rfi_risk": "low",
+      "category": "amateur"
+    },
+    {
+      "id": "hf_rfi_switching_psu",
+      "name": "Switching PSU / LED Driver RFI (HF)",
+      "start_hz": 5000000,
+      "stop_hz": 30000000,
+      "likely_sources": [
+        "Switching power supply (alimentation à découpage)",
+        "LED driver electronics",
+        "CFL lamp ballast",
+        "Solar inverter (onduleur solaire)",
+        "Variable speed drive (variateur de vitesse)",
+        "CPL / Powerline adapter (courants porteurs en ligne)"
+      ],
+      "rfi_risk": "high",
+      "category": "rfi_source",
+      "notes": "Broadband HF RFI typical of switch-mode electronics. Look for harmonics spaced at the switching frequency (typically 25–200 kHz apart). Onduleurs solaires are a very common source in France."
+    },
+    {
+      "id": "hf_amateur_20m",
+      "name": "Amateur 20m Band",
+      "start_hz": 14000000,
+      "stop_hz": 14350000,
+      "likely_sources": ["Amateur radio (SSB, FT8, CW)"],
+      "rfi_risk": "low",
+      "category": "amateur"
+    },
+    {
+      "id": "hf_amateur_17m",
+      "name": "Amateur 17m Band",
+      "start_hz": 18068000,
+      "stop_hz": 18168000,
+      "likely_sources": ["Amateur radio (SSB, digital)"],
+      "rfi_risk": "low",
+      "category": "amateur"
+    },
+    {
+      "id": "hf_amateur_15m",
+      "name": "Amateur 15m Band",
+      "start_hz": 21000000,
+      "stop_hz": 21450000,
+      "likely_sources": ["Amateur radio"],
+      "rfi_risk": "low",
+      "category": "amateur"
+    },
+    {
+      "id": "hf_amateur_10m",
+      "name": "Amateur 10m Band",
+      "start_hz": 28000000,
+      "stop_hz": 29700000,
+      "likely_sources": ["Amateur radio (FM, SSB, digital beacons)"],
+      "rfi_risk": "low",
+      "category": "amateur"
+    },
+    {
+      "id": "vhf_ism_50mhz",
+      "name": "Amateur 6m Band / Low VHF RFI",
+      "start_hz": 50000000,
+      "stop_hz": 54000000,
+      "likely_sources": ["Amateur radio (FM, SSB)", "Switching PSU harmonics"],
+      "rfi_risk": "medium",
+      "category": "amateur",
+      "notes": "Signals here from domestic electronics are likely RFI harmonics."
+    },
+    {
+      "id": "rfi_vhf_general",
+      "name": "VHF RFI / Switching PSU Harmonics",
+      "start_hz": 30000000,
+      "stop_hz": 87000000,
+      "likely_sources": [
+        "Switching power supply harmonics",
+        "HDMI cable radiation",
+        "USB 3.0 cable radiation (near 2.4 GHz too)",
+        "LED driver harmonics",
+        "Solar inverter harmonics",
+        "Computer / graphics card emissions"
+      ],
+      "rfi_risk": "high",
+      "category": "rfi_source",
+      "notes": "Any broadband or harmonic signal here not matching a known service is likely a domestic RFI source. HDMI and PSU harmonics are very common."
+    },
+    {
+      "id": "fm_broadcast",
+      "name": "FM Broadcast (87.5–108 MHz)",
+      "start_hz": 87500000,
+      "stop_hz": 108000000,
+      "likely_sources": [
+        "France Inter (87.8, 91.7, 94.0, 95.9, 99.0 MHz — varies by city)",
+        "France Info (105.5, 107.1 MHz)",
+        "France Culture (93.5, 93.9 MHz)",
+        "FIP (105.1 MHz)",
+        "NRJ, RTL, Europe 1, BFM Radio, RFM, Chérie FM, etc.",
+        "Local FM stations"
+      ],
+      "rfi_risk": "low",
+      "category": "broadcast",
+      "notes": "Normal FM broadcast. RDS subcarrier at ±57 kHz. Unusually strong local FM may indicate a pirate transmitter."
+    },
+    {
+      "id": "aviation_vor_ils",
+      "name": "VHF Aviation (108–118 MHz) — VOR / ILS / Nav",
+      "start_hz": 108000000,
+      "stop_hz": 118000000,
+      "likely_sources": ["VOR navigation beacons", "ILS glideslope/localizer"],
+      "rfi_risk": "low",
+      "category": "navigation"
+    },
+    {
+      "id": "aviation_voice",
+      "name": "VHF Aviation Voice (118–137 MHz)",
+      "start_hz": 118000000,
+      "stop_hz": 137000000,
+      "likely_sources": ["ATC voice communications (AM)", "Aircraft communications (AM)"],
+      "rfi_risk": "low",
+      "category": "communications",
+      "notes": "AM modulated, 25 kHz or 8.33 kHz channel spacing in Europe."
+    },
+    {
+      "id": "noaa_weather_sats",
+      "name": "NOAA / MetOp Weather Satellites (137 MHz)",
+      "start_hz": 137000000,
+      "stop_hz": 138000000,
+      "likely_sources": [
+        "NOAA-15 APT (137.620 MHz)",
+        "NOAA-18 APT (137.9125 MHz)",
+        "NOAA-19 APT (137.100 MHz)",
+        "MetOp LRPT (137.100, 137.9125 MHz)"
+      ],
+      "rfi_risk": "low",
+      "category": "satellite"
+    },
+    {
+      "id": "marine_vhf",
+      "name": "Marine VHF (156–174 MHz)",
+      "start_hz": 156000000,
+      "stop_hz": 174000000,
+      "likely_sources": [
+        "Marine VHF communications (FM)",
+        "AIS Class A/B (161.975 MHz, 162.025 MHz)",
+        "SÉCURITÉ, MAYDAY (Channel 16 — 156.800 MHz)",
+        "Port operations, weather broadcasts"
+      ],
+      "rfi_risk": "low",
+      "category": "maritime"
+    },
+    {
+      "id": "dab_band3",
+      "name": "DAB/DAB+ Digital Radio (174–230 MHz)",
+      "start_hz": 174000000,
+      "stop_hz": 230000000,
+      "likely_sources": [
+        "DAB multiplexes (France Bleu, Radio France, NRJ, RTL, BFM, etc.)",
+        "Block 5A-12D, various channel widths of 1.536 MHz"
+      ],
+      "rfi_risk": "low",
+      "category": "broadcast",
+      "notes": "DAB is being deployed in France but coverage is still limited outside major cities."
+    },
+    {
+      "id": "amateur_vhf_2m",
+      "name": "Amateur 2m Band (144–146 MHz)",
+      "start_hz": 144000000,
+      "stop_hz": 146000000,
+      "likely_sources": ["Amateur radio (FM, SSB, digital, repeaters)"],
+      "rfi_risk": "low",
+      "category": "amateur"
+    },
+    {
+      "id": "paging_pocsag",
+      "name": "Paging / POCSAG (466 MHz area)",
+      "start_hz": 465000000,
+      "stop_hz": 467000000,
+      "likely_sources": [
+        "POCSAG paging (466.075, 466.175 MHz)",
+        "FLEX paging",
+        "Hospital / emergency paging systems"
+      ],
+      "rfi_risk": "low",
+      "category": "paging"
+    },
+    {
+      "id": "tetra_emergency_fr",
+      "name": "TETRA Emergency Services — Acropol/INPT (380–400 MHz)",
+      "start_hz": 380000000,
+      "stop_hz": 400000000,
+      "likely_sources": [
+        "Police Nationale (Acropol / INPT)",
+        "Gendarmerie",
+        "SAMU / SMUR (emergency medical)",
+        "Pompiers (fire brigade)",
+        "SNCF railways"
+      ],
+      "rfi_risk": "low",
+      "category": "communications",
+      "notes": "French public safety TETRA network. Encrypted — decoding is illegal."
+    },
+    {
+      "id": "pmr446",
+      "name": "PMR446 Walkie-Talkies (446 MHz)",
+      "start_hz": 446000000,
+      "stop_hz": 446200000,
+      "likely_sources": [
+        "Consumer walkie-talkies (licence-free)",
+        "Neighborhood / event communications"
+      ],
+      "rfi_risk": "low",
+      "category": "communications"
+    },
+    {
+      "id": "ism_433",
+      "name": "ISM 433 MHz Band",
+      "start_hz": 433050000,
+      "stop_hz": 434790000,
+      "likely_sources": [
+        "Wireless weather stations (Oregon Scientific, etc.)",
+        "Car key fobs / remote locking (433.92 MHz)",
+        "Wireless doorbells",
+        "Wireless thermometers and sensors",
+        "Tire pressure monitoring (TPMS)",
+        "Wireless power outlets / home automation",
+        "Short-range remote controls"
+      ],
+      "rfi_risk": "low",
+      "category": "ism",
+      "notes": "Very common band for cheap wireless devices. Numerous short bursts normal."
+    },
+    {
+      "id": "amateur_70cm",
+      "name": "Amateur 70cm Band (430–440 MHz)",
+      "start_hz": 430000000,
+      "stop_hz": 440000000,
+      "likely_sources": ["Amateur radio (FM, digital, repeaters, ATV)"],
+      "rfi_risk": "low",
+      "category": "amateur"
+    },
+    {
+      "id": "gsm900_uplink",
+      "name": "GSM-900 Uplink (880–915 MHz)",
+      "start_hz": 880000000,
+      "stop_hz": 915000000,
+      "likely_sources": ["Mobile phone uplink (Orange, SFR, Bouygues, Free)"],
+      "rfi_risk": "low",
+      "category": "cellular",
+      "notes": "Uplink from handset to tower. Close-range phones will be strongest."
+    },
+    {
+      "id": "gsm900_downlink",
+      "name": "GSM-900 / 4G-900 Downlink (925–960 MHz)",
+      "start_hz": 925000000,
+      "stop_hz": 960000000,
+      "likely_sources": ["Mobile network base stations (Orange, SFR, Bouygues, Free)", "2G GSM + 4G LTE"],
+      "rfi_risk": "low",
+      "category": "cellular"
+    },
+    {
+      "id": "ism_868",
+      "name": "ISM 868 MHz (EU LoRa / SigFox / Smart Meters)",
+      "start_hz": 863000000,
+      "stop_hz": 870000000,
+      "likely_sources": [
+        "LoRaWAN gateways and devices",
+        "SigFox devices",
+        "Enedis Linky smart meter (Wavenis 868 MHz module)",
+        "Zigbee home automation (868.0–868.6 MHz)",
+        "Z-Wave home automation (868.42 MHz)",
+        "Wireless alarm systems",
+        "Smart home sensors"
+      ],
+      "rfi_risk": "low",
+      "category": "ism",
+      "notes": "Linky meters use Wavenis at 868 MHz in some areas; newer rollouts may use Wize at 169 MHz or PLC."
+    },
+    {
+      "id": "linky_wize_169",
+      "name": "Enedis Linky / Wize Smart Meters (169 MHz)",
+      "start_hz": 169400000,
+      "stop_hz": 169650000,
+      "likely_sources": ["Enedis Linky smart meter (Wize protocol at 169.4–169.6 MHz)"],
+      "rfi_risk": "low",
+      "category": "utility",
+      "notes": "Some Linky deployments use the Wize / Wavenis-ULP protocol at 169 MHz (200 Hz channels)."
+    },
+    {
+      "id": "adsb",
+      "name": "ADS-B Mode S (1090 MHz)",
+      "start_hz": 1089500000,
+      "stop_hz": 1090500000,
+      "likely_sources": ["Aircraft ADS-B transponders (position, altitude, ICAO ID)"],
+      "rfi_risk": "low",
+      "category": "aviation"
+    },
+    {
+      "id": "gps_l1",
+      "name": "GPS L1 (1575.42 MHz)",
+      "start_hz": 1574000000,
+      "stop_hz": 1577000000,
+      "likely_sources": ["GPS satellites (BPSK spread-spectrum — normally below noise floor)"],
+      "rfi_risk": "low",
+      "category": "navigation",
+      "notes": "GPS is normally below the noise floor of an SDR without a dedicated LNA. A visible signal here may indicate a GPS jammer or repeater."
+    },
+    {
+      "id": "meteosat_lrit",
+      "name": "Meteosat LRIT/HRIT (1691–1702 MHz)",
+      "start_hz": 1690000000,
+      "stop_hz": 1710000000,
+      "likely_sources": ["Meteosat-12 LRIT (1691.020 MHz)", "Meteosat HRIT (1694.1 MHz)"],
+      "rfi_risk": "low",
+      "category": "satellite"
+    },
+    {
+      "id": "gsm1800_uplink",
+      "name": "GSM-1800 / 4G-1800 Uplink (1710–1785 MHz)",
+      "start_hz": 1710000000,
+      "stop_hz": 1785000000,
+      "likely_sources": ["Mobile phone uplink (Orange, SFR, Bouygues, Free — 2G/4G)"],
+      "rfi_risk": "low",
+      "category": "cellular"
+    },
+    {
+      "id": "gsm1800_downlink",
+      "name": "GSM-1800 / 4G-1800 Downlink (1805–1880 MHz)",
+      "start_hz": 1805000000,
+      "stop_hz": 1880000000,
+      "likely_sources": ["Mobile network base stations (2G/4G LTE Band 3)"],
+      "rfi_risk": "low",
+      "category": "cellular"
+    },
+    {
+      "id": "dect",
+      "name": "DECT Cordless Phones (1880–1900 MHz)",
+      "start_hz": 1880000000,
+      "stop_hz": 1900000000,
+      "likely_sources": [
+        "DECT cordless telephone base station",
+        "DECT baby monitor",
+        "DECT home automation gateway"
+      ],
+      "rfi_risk": "medium",
+      "category": "consumer",
+      "notes": "Normal in residential areas but can cause interference to other devices. DECT uses TDMA — you may see brief bursts."
+    },
+    {
+      "id": "umts_3g_2100",
+      "name": "3G UMTS (1920–2170 MHz)",
+      "start_hz": 1920000000,
+      "stop_hz": 2170000000,
+      "likely_sources": ["3G UMTS mobile network (being phased out in France)"],
+      "rfi_risk": "low",
+      "category": "cellular"
+    },
+    {
+      "id": "rfi_hdmi",
+      "name": "HDMI / DisplayPort Cable Radiation",
+      "start_hz": 400000000,
+      "stop_hz": 2000000000,
+      "likely_sources": [
+        "HDMI cable acting as antenna for pixel clock harmonics",
+        "DisplayPort cable",
+        "Unshielded video cable",
+        "USB 3.x cable (5 Gbps = harmonics at 625 MHz, 1.25 GHz)"
+      ],
+      "rfi_risk": "high",
+      "category": "rfi_source",
+      "notes": "HDMI radiates strongly at pixel clock harmonics (typically 74.25 MHz * N). This is one of the most common RFI sources in modern homes. Try disconnecting HDMI cables to identify."
+    },
+    {
+      "id": "rfi_smps_uhf",
+      "name": "Switching PSU Harmonics (UHF range)",
+      "start_hz": 200000000,
+      "stop_hz": 1000000000,
+      "likely_sources": [
+        "Switching power supply (alimentation à découpage)",
+        "USB charger / phone charger",
+        "Computer power supply",
+        "LED driver / LED strip power supply",
+        "Solar inverter (onduleur photovoltaïque)",
+        "Motor controller (variateur de vitesse)"
+      ],
+      "rfi_risk": "high",
+      "category": "rfi_source",
+      "notes": "Switching harmonics can extend well into UHF. Cheap chargers and LED power supplies are particularly bad. Look for regularly-spaced spectral lines."
+    },
+    {
+      "id": "rfi_lte_tdd_2600",
+      "name": "4G LTE 2600 MHz (Band 7)",
+      "start_hz": 2500000000,
+      "stop_hz": 2690000000,
+      "likely_sources": ["4G LTE band 7 (Orange, SFR, Bouygues, Free)"],
+      "rfi_risk": "low",
+      "category": "cellular",
+      "notes": "At the upper edge of HackRF range — sensitivity is reduced."
+    }
+  ]
+}
