@@ -6,7 +6,7 @@ from datetime import datetime
 from typing import Callable, List, Optional
 
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QColor, QFont, QPalette
+from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -27,9 +27,8 @@ import pyqtgraph as pg
 from .base import BaseDecoderWindow
 from app.decoders.fsk import PRESETS, FSK_PRESET_NAMES
 
-_MONO     = QFont('Consolas', 10)
-_MONO_SM  = QFont('Consolas', 9)
-_MONO_LG  = QFont('Consolas', 11)
+_MONO    = QFont('Consolas', 10)
+_MONO_LG = QFont('Consolas', 11)
 
 _MAX_TEXT_CHARS = 20_000
 _MAX_HEX_LINES  = 500

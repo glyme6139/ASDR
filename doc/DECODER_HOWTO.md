@@ -39,6 +39,52 @@ class FooDecoder(BaseAudioDecoder):
 
 `data` must be a plain-Python dict (no numpy arrays) — it crosses the IPC queue.
 
+### Reserved keys in `data`
+
+| Key | Type | Purpose |
+|---|---|---|
+| `new_bits` | `list[int]` | Raw recovered symbols (0/1) produced **in this call only**. When present the main window forwards them to the Bitstream Analyzer window automatically. |
+
+Include `new_bits` whenever your decoder produces binary symbols, even if no higher-level framing has completed yet — this is what lets the Bitstream Analyzer give a live entropy and run-length view independent of character decoding.
+
+**Flushing pattern** — accumulate symbols between result emissions so the window gets a steady feed even with no decoded characters:
+
+```python
+class FooDecoder(BaseAudioDecoder):
+    def __init__(self, sample_rate=48_000):
+        super().__init__('FOO', sample_rate)
+        self._pending_bits: list[int] = []
+        self._last_bits_t = 0.0
+
+    def decode_audio(self, audio):
+        now = time.time()
+        symbols = self._demodulate(audio)          # your demod returns List[int]
+        self._pending_bits.extend(symbols)
+
+        # flush accumulated bits at most every 0.5 s
+        if self._pending_bits and now - self._last_bits_t >= 0.5:
+            self._last_bits_t = now
+            new_bits = self._pending_bits
+            self._pending_bits = []
+        else:
+            new_bits = []
+
+        chars = self._frame(symbols)               # higher-level framing
+        if not chars and not new_bits:
+            return None
+
+        return DecoderResult(
+            decoder_name='FOO',
+            timestamp=now,
+            data={'text': ''.join(chars), 'new_bits': new_bits},
+            confidence=0.8 if chars else 0.0,
+            metadata={'type': 'foo'},
+        )
+
+    def reset(self):
+        self._pending_bits = []
+```
+
 ## 2. Export it — `app/decoders/__init__.py`
 
 ```python
@@ -107,3 +153,4 @@ WINDOW_REGISTRY: dict = {
 - [ ] `app/desktop/sdr_worker.py` — add branch in `_make_decoder`
 - [ ] *(optional)* `app/desktop/decoder_windows/foo_view.py` — window class
 - [ ] *(optional)* `app/desktop/decoder_windows/__init__.py` — register window
+- [ ] *(optional)* emit `new_bits` in `data` to feed the Bitstream Analyzer

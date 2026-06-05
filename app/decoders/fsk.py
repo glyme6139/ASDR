@@ -221,6 +221,12 @@ class FSKDecoder(BaseAudioDecoder):
         self._MEAS_INTERVAL = 1.0                 # seconds between analysis runs
         self._pending_meas: dict = {}             # cached result waiting to be emitted
 
+        # Accumulate newly decoded symbols and flush them to the bitstream window
+        # every _BITS_FLUSH_INTERVAL seconds so it updates even with no decoded chars.
+        self._pending_new_bits: List[int] = []
+        self._last_bits_flush_t = 0.0
+        self._BITS_FLUSH_INTERVAL = 0.5
+
         self.configure({'preset': preset})
 
     # ------------------------------------------------------------------
@@ -253,7 +259,8 @@ class FSKDecoder(BaseAudioDecoder):
         self._figures = False
         self._afsk_buf  = np.zeros(0, dtype=np.float64)
         self._meas_buf  = np.zeros(0, dtype=np.float32)
-        self._pending_meas = {}
+        self._pending_meas    = {}
+        self._pending_new_bits = []
 
         # Pre-compute per-symbol reference waveforms for AFSK detection
         if self.mode == 'afsk':
@@ -308,8 +315,17 @@ class FSKDecoder(BaseAudioDecoder):
             meas = self._pending_meas
             self._pending_meas = {}
 
-            # Always emit a result when measurement data is ready (even with no chars)
-            if not chars and not meas:
+            # Accumulate new symbols; flush to bitstream window every 0.5 s
+            if symbols:
+                self._pending_new_bits.extend(symbols)
+            if self._pending_new_bits and now - self._last_bits_flush_t >= self._BITS_FLUSH_INTERVAL:
+                self._last_bits_flush_t = now
+                new_bits = self._pending_new_bits
+                self._pending_new_bits = []
+            else:
+                new_bits = []
+
+            if not chars and not meas and not new_bits:
                 return None
 
             return DecoderResult(
@@ -326,6 +342,7 @@ class FSKDecoder(BaseAudioDecoder):
                     'bits':       ''.join(str(b) for b in self._raw_bits),
                     'char_count': len(chars),
                     'meas':       meas,
+                    'new_bits':   new_bits,
                 },
                 confidence=0.7 if chars else 0.0,
                 metadata={'type': 'fsk', 'mode': self.mode, 'baud': self.baud},
@@ -341,7 +358,8 @@ class FSKDecoder(BaseAudioDecoder):
         self._raw_bits   = []
         self._afsk_buf   = np.zeros(0, dtype=np.float64)
         self._meas_buf   = np.zeros(0, dtype=np.float32)
-        self._pending_meas = {}
+        self._pending_meas    = {}
+        self._pending_new_bits = []
         if self.mode == 'afsk':
             self._build_afsk_refs()
 

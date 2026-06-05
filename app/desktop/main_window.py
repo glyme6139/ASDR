@@ -32,6 +32,7 @@ from .signal_rate_window import SignalRateWindow
 from .timing import TimingConfig, profiler_from_config
 from .timing_window import TimingWindow
 from .rfi_log_window import RFILogWindow
+from .bitstream_window import BitstreamAnalysisWindow
 from app.rfi.rfi_classifier import RFIClassifier
 
 logger = logging.getLogger(__name__)
@@ -75,6 +76,7 @@ class ASURMainWindow(QMainWindow):
         self.decoder_win = SignalDecoderWindow(self)
         self.rate_window = SignalRateWindow(self)
         self.rfi_log_window = RFILogWindow()
+        self.bitstream_window = BitstreamAnalysisWindow()
         self.rfi_classifier = RFIClassifier()
 
         self.dsp = DSPProcess(timing=self._timing)
@@ -210,6 +212,8 @@ class ASURMainWindow(QMainWindow):
             self._rate_action.triggered.connect(self._show_rate_window)
             self._decoder_win_action = view_menu.addAction("Signal Decoder")
             self._decoder_win_action.triggered.connect(self._show_decoder_win)
+            self._bitstream_action = view_menu.addAction("Bitstream Analyzer")
+            self._bitstream_action.triggered.connect(self._show_bitstream_window)
             view_menu.addSeparator()
             self._rfi_log_action = view_menu.addAction("RFI Logger")
             self._rfi_log_action.triggered.connect(self._show_rfi_log_window)
@@ -502,6 +506,11 @@ class ASURMainWindow(QMainWindow):
                 except Exception:
                     logger.exception("RFI classification error")
 
+    def _show_bitstream_window(self):
+        self.bitstream_window.show()
+        self.bitstream_window.raise_()
+        self.bitstream_window.activateWindow()
+
     def _show_rfi_log_window(self):
         self.rfi_log_window.show()
         self.rfi_log_window.raise_()
@@ -602,6 +611,10 @@ class ASURMainWindow(QMainWindow):
         win = self._decoder_windows.get(key)
         if win is not None and win.isVisible():
             win.push_result(data)
+        new_bits = data.get('new_bits')
+        if new_bits and self.bitstream_window.isVisible():
+            vfo_name = self._vfo_state.get(vfo_id, {}).get('name', f'VFO {vfo_id + 1}')
+            self.bitstream_window.push_bits(new_bits, source=f'{decoder_name} — {vfo_name}')
 
     def _on_open_decoder_window(self, vfo_id: int, decoder_name: str):
         from app.desktop.decoder_windows import create_window, has_window
@@ -913,6 +926,7 @@ class ASURMainWindow(QMainWindow):
         self.decoder_win.close()
         self.rate_window.close()
         self.rfi_log_window.close()
+        self.bitstream_window.close()
         self.rfi_classifier.close()
 
         self.ipc.stop()
