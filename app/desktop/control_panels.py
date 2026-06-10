@@ -1521,8 +1521,6 @@ class ControlPanel(QWidget):
         self._initUI()
 
     def _initUI(self):
-        from .signal_id_panel import SignalIDPanel
-
         outer_layout = QVBoxLayout()
         outer_layout.setContentsMargins(4, 4, 4, 4)
         outer_layout.setSpacing(4)
@@ -1540,19 +1538,14 @@ class ControlPanel(QWidget):
         self.bookmark_panel = BookmarkPanel(
             get_vfo_snapshot=self.vfo_tab.get_active_vfo_snapshot
         )
-        self.signal_id_panel = SignalIDPanel()
 
         device_group   = CollapsibleSection("Source",    self.source_panel)
         vfo_group      = CollapsibleSection("VFOs",      self.vfo_tab)
         bookmark_group = CollapsibleSection("Bookmarks", self.bookmark_panel)
-        signal_id_group = CollapsibleSection(
-            "Signal ID", self.signal_id_panel, expanded=False
-        )
 
         content_layout.addWidget(device_group,    stretch=0)
         content_layout.addWidget(vfo_group,       stretch=0)
         content_layout.addWidget(bookmark_group,  stretch=0)
-        content_layout.addWidget(signal_id_group, stretch=0)
 
         content_layout.addStretch()
         content.setLayout(content_layout)

@@ -10,9 +10,9 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 import numpy as np
-from PySide6.QtCore import QObject, QRectF, QTimer, Signal
-from PySide6.QtGui import QFont
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QSpinBox
+from PySide6.QtCore import QObject, QRectF, QTimer, Signal, Qt
+from PySide6.QtGui import QFont, QKeySequence, QShortcut
+from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QSpinBox, QPushButton
 import pyqtgraph as pg
 
 # OpenGL rendering: GPU takes over the actual draw calls, releasing the Python GIL
@@ -800,6 +800,217 @@ class WaterfallViewer:
         return lut
 
 
+class MeasurementMarkers:
+    """Draggable precision markers for the spectrum/waterfall display.
+
+    Right-click (spectrum or waterfall): cycle frequency markers M1→M2→clear.
+    Shift+right-click (waterfall only):  cycle time markers T1→T2→clear.
+    When two markers of the same type exist a Δ label appears.
+    """
+
+    _FREQ_COLORS = ('#ff4444', '#ff8800')  # M1 red, M2 orange
+    _TIME_COLORS = ('#44ff44', '#00ff88')  # T1 green, T2 teal
+
+    def __init__(self, spec_plot: pg.PlotItem, wf_plot: pg.PlotItem,
+                 waterfall: 'WaterfallViewer'):
+        self._sp  = spec_plot
+        self._wp  = wf_plot
+        self._wf  = waterfall
+
+        self._fmarkers: list[dict] = []
+        self._tmarkers: list[dict] = []
+        self._fdelta: Optional[pg.TextItem] = None
+        self._tdelta: Optional[pg.TextItem] = None
+
+        spec_plot.getViewBox().sigRangeChanged.connect(self._reposition_freq_labels)
+        wf_plot.getViewBox().sigRangeChanged.connect(self._reposition_time_labels)
+
+    # ------------------------------------------------------------------ public
+
+    def handle_click(self, scene_pos, shift: bool, in_waterfall: bool):
+        """Dispatch a right-click to freq or time markers."""
+        if in_waterfall and shift:
+            pos = self._wp.getViewBox().mapSceneToView(scene_pos)
+            self._place_time_marker(pos.y())
+        else:
+            vb  = self._wp.getViewBox() if in_waterfall else self._sp.getViewBox()
+            pos = vb.mapSceneToView(scene_pos)
+            self._place_freq_marker(pos.x())
+
+    def clear_all(self):
+        self._clear_freq()
+        self._clear_time()
+
+    # ------------------------------------------------------------------ freq markers
+
+    def _place_freq_marker(self, freq_mhz: float):
+        if len(self._fmarkers) >= 2:
+            self._clear_freq()
+        idx   = len(self._fmarkers)
+        color = self._FREQ_COLORS[idx]
+        name  = f"M{idx + 1}"
+        pen   = pg.mkPen(color=color, width=1, style=Qt.DashLine)
+
+        line_s = pg.InfiniteLine(pos=freq_mhz, angle=90, movable=True, pen=pen)
+        line_s.setZValue(20)
+        line_w = pg.InfiniteLine(pos=freq_mhz, angle=90, movable=True, pen=pen)
+        line_w.setZValue(20)
+
+        yr    = self._sp.getViewBox().viewRange()[1]
+        lbl_s = pg.TextItem(text=f"{name} {freq_mhz:.4f} MHz", color=color, anchor=(0.0, 1.0))
+        lbl_s.setZValue(21)
+        lbl_s.setPos(freq_mhz, yr[1])
+
+        lbl_w = pg.TextItem(text=f"{name} {freq_mhz:.4f} MHz", color=color, anchor=(0.0, 0.0))
+        lbl_w.setZValue(21)
+        lbl_w.setPos(freq_mhz, self._wf.history_size * 0.97)
+
+        self._sp.addItem(line_s);  self._sp.addItem(lbl_s)
+        self._wp.addItem(line_w);  self._wp.addItem(lbl_w)
+
+        m = dict(line_s=line_s, line_w=line_w, lbl_s=lbl_s, lbl_w=lbl_w,
+                 freq_mhz=freq_mhz, idx=idx)
+        self._fmarkers.append(m)
+
+        line_s.sigPositionChanged.connect(lambda l, _m=m: self._sync_freq(_m, l.value(), from_wf=False))
+        line_w.sigPositionChanged.connect(lambda l, _m=m: self._sync_freq(_m, l.value(), from_wf=True))
+
+        self._update_fdelta()
+
+    def _sync_freq(self, m: dict, freq_mhz: float, from_wf: bool):
+        m['freq_mhz'] = freq_mhz
+        name  = f"M{m['idx'] + 1}"
+        label = f"{name} {freq_mhz:.4f} MHz"
+        m['lbl_s'].setText(label)
+        m['lbl_w'].setText(label)
+        yr = self._sp.getViewBox().viewRange()[1]
+        m['lbl_s'].setPos(freq_mhz, yr[1])
+        m['lbl_w'].setPos(freq_mhz, self._wf.history_size * 0.97)
+        other = m['line_w'] if not from_wf else m['line_s']
+        other.blockSignals(True)
+        other.setValue(freq_mhz)
+        other.blockSignals(False)
+        self._update_fdelta()
+
+    def _update_fdelta(self):
+        if self._fdelta:
+            self._sp.removeItem(self._fdelta)
+            self._fdelta = None
+        if len(self._fmarkers) != 2:
+            return
+        f1, f2 = self._fmarkers[0]['freq_mhz'], self._fmarkers[1]['freq_mhz']
+        df_hz  = abs(f1 - f2) * 1e6
+        mid    = (f1 + f2) / 2
+        yr     = self._sp.getViewBox().viewRange()[1]
+        self._fdelta = pg.TextItem(
+            text=f"Δf = {_fmt_hz(df_hz)}", color='#ffffff', anchor=(0.5, 1.0)
+        )
+        self._fdelta.setZValue(22)
+        self._fdelta.setPos(mid, yr[1])
+        self._sp.addItem(self._fdelta)
+
+    def _clear_freq(self):
+        for m in self._fmarkers:
+            self._sp.removeItem(m['line_s']);  self._sp.removeItem(m['lbl_s'])
+            self._wp.removeItem(m['line_w']);  self._wp.removeItem(m['lbl_w'])
+        self._fmarkers.clear()
+        if self._fdelta:
+            self._sp.removeItem(self._fdelta)
+            self._fdelta = None
+
+    def _reposition_freq_labels(self):
+        yr = self._sp.getViewBox().viewRange()[1]
+        for m in self._fmarkers:
+            m['lbl_s'].setPos(m['freq_mhz'], yr[1])
+        if self._fdelta and len(self._fmarkers) == 2:
+            f1, f2 = self._fmarkers[0]['freq_mhz'], self._fmarkers[1]['freq_mhz']
+            self._fdelta.setPos((f1 + f2) / 2, yr[1])
+
+    # ------------------------------------------------------------------ time markers
+
+    def _place_time_marker(self, row_y: float):
+        if len(self._tmarkers) >= 2:
+            self._clear_time()
+        idx   = len(self._tmarkers)
+        color = self._TIME_COLORS[idx]
+        name  = f"T{idx + 1}"
+        secs  = max(0.0, (self._wf.history_size - 1 - row_y) / _WATERFALL_HZ)
+        pen   = pg.mkPen(color=color, width=1, style=Qt.DashLine)
+
+        line  = pg.InfiniteLine(pos=row_y, angle=0, movable=True, pen=pen)
+        line.setZValue(20)
+
+        xr  = self._wp.getViewBox().viewRange()[0]
+        lbl = pg.TextItem(text=f"{name} −{secs:.2f}s", color=color, anchor=(1.0, 0.5))
+        lbl.setZValue(21)
+        lbl.setPos(xr[1], row_y)
+
+        self._wp.addItem(line);  self._wp.addItem(lbl)
+
+        m = dict(line=line, lbl=lbl, row_y=row_y, secs=secs, idx=idx)
+        self._tmarkers.append(m)
+        line.sigPositionChanged.connect(lambda l, _m=m: self._sync_time(_m, l.value()))
+        self._update_tdelta()
+
+    def _sync_time(self, m: dict, row_y: float):
+        m['row_y'] = row_y
+        m['secs']  = max(0.0, (self._wf.history_size - 1 - row_y) / _WATERFALL_HZ)
+        xr = self._wp.getViewBox().viewRange()[0]
+        m['lbl'].setPos(xr[1], row_y)
+        m['lbl'].setText(f"T{m['idx'] + 1} −{m['secs']:.2f}s")
+        self._update_tdelta()
+
+    def _update_tdelta(self):
+        if self._tdelta:
+            self._wp.removeItem(self._tdelta)
+            self._tdelta = None
+        if len(self._tmarkers) != 2:
+            return
+        t1, t2 = self._tmarkers[0]['secs'],  self._tmarkers[1]['secs']
+        y1, y2 = self._tmarkers[0]['row_y'], self._tmarkers[1]['row_y']
+        dt     = abs(t1 - t2)
+        mid_y  = (y1 + y2) / 2
+        xr     = self._wp.getViewBox().viewRange()[0]
+        self._tdelta = pg.TextItem(
+            text=f"Δt = {dt:.3f}s", color='#ffffff', anchor=(1.0, 0.5)
+        )
+        self._tdelta.setZValue(22)
+        self._tdelta.setPos(xr[1], mid_y)
+        self._wp.addItem(self._tdelta)
+
+    def _clear_time(self):
+        for m in self._tmarkers:
+            self._wp.removeItem(m['line']);  self._wp.removeItem(m['lbl'])
+        self._tmarkers.clear()
+        if self._tdelta:
+            self._wp.removeItem(self._tdelta)
+            self._tdelta = None
+
+    def _reposition_time_labels(self):
+        xr = self._wp.getViewBox().viewRange()[0]
+        for m in self._tmarkers:
+            m['lbl'].setPos(xr[1], m['row_y'])
+        if self._tdelta and len(self._tmarkers) == 2:
+            y1, y2 = self._tmarkers[0]['row_y'], self._tmarkers[1]['row_y']
+            self._tdelta.setPos(xr[1], (y1 + y2) / 2)
+
+
+class _ClickableGLW(pg.GraphicsLayoutWidget):
+    """GraphicsLayoutWidget that exposes right-click via a plain Python signal.
+
+    Overriding QGraphicsView.mousePressEvent is the most reliable interception
+    point — it fires before any PyQtGraph item routing or ViewBox handling.
+    """
+    sigRightClicked = Signal(float, float, bool)  # scene_x, scene_y, shift_held
+
+    def mousePressEvent(self, ev):
+        super().mousePressEvent(ev)
+        if ev.button() == Qt.MouseButton.RightButton:
+            sp = self.mapToScene(ev.pos())
+            self.sigRightClicked.emit(sp.x(), sp.y(),
+                                      bool(ev.modifiers() & Qt.KeyboardModifier.ShiftModifier))
+
+
 class VisualizationPanel(QWidget):
     """
     Spectrum (10%) above waterfall (90%) in one GraphicsLayoutWidget.
@@ -820,14 +1031,26 @@ class VisualizationPanel(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        self._glw = pg.GraphicsLayoutWidget()
+        self._glw = _ClickableGLW()
         self._glw.setBackground('#1a1a1a')
         layout.addWidget(self._glw, stretch=1)
 
-        # Compact bottom bar — waterfall history depth control
+        # Compact bottom bar — controls
         bar = QHBoxLayout()
         bar.setContentsMargins(6, 2, 6, 2)
         bar.setSpacing(4)
+
+        self._pause_btn = QPushButton("⏸  Pause")
+        self._pause_btn.setFixedWidth(80)
+        self._pause_btn.setToolTip("Freeze display (Space)")
+        self._pause_btn.clicked.connect(self.toggle_pause)
+        bar.addWidget(self._pause_btn)
+
+        self._clear_markers_btn = QPushButton("✕ Markers")
+        self._clear_markers_btn.setFixedWidth(86)
+        self._clear_markers_btn.setToolTip("Clear all measurement markers")
+        bar.addWidget(self._clear_markers_btn)
+
         bar.addStretch()
         bar.addWidget(QLabel("History:"))
         self._history_spin = QSpinBox()
@@ -849,9 +1072,10 @@ class VisualizationPanel(QWidget):
         # spec_plot.setDownsampling(ds=8, auto=False)
         self._glw.ci.layout.setRowStretchFactor(0, 4)   # 40 %
 
-
         wf_plot = self._glw.addPlot(row=1, col=0)
         self._glw.ci.layout.setRowStretchFactor(1, 6)   # 60 %
+        self._spec_plot = spec_plot
+        self._wf_plot   = wf_plot
 
         # Link X so zoom/pan in one view mirrors the other
         wf_plot.setXLink(spec_plot)
@@ -882,6 +1106,33 @@ class VisualizationPanel(QWidget):
         self._render_timer.timeout.connect(self._flush_pending)
         self._render_timer.start()
 
+        # Pause state
+        self._paused = False
+        self._need_gen_sync = False
+
+        # "PAUSED" overlay label (shown on top of the GL widget)
+        self._pause_label = QLabel("⏸  PAUSED", self)
+        self._pause_label.setStyleSheet(
+            "color: #ff4444; font-size: 14px; font-weight: bold;"
+            " background: rgba(0,0,0,160); padding: 2px 6px; border-radius: 3px;"
+        )
+        self._pause_label.adjustSize()
+        self._pause_label.move(8, 8)
+        self._pause_label.hide()
+        self._pause_label.raise_()
+
+        # Measurement markers
+        self._markers = MeasurementMarkers(spec_plot, wf_plot, self.waterfall)
+        self._clear_markers_btn.clicked.connect(self._markers.clear_all)
+
+        # Right-click → measurement markers
+        self._glw.sigRightClicked.connect(self._on_right_click)
+
+        # Space shortcut for pause toggle
+        _sc = QShortcut(QKeySequence(Qt.Key_Space), self)
+        _sc.setContext(Qt.WidgetWithChildrenShortcut)
+        _sc.activated.connect(self.toggle_pause)
+
     # ------------------------------------------------------------------
     # Data ingestion — store only; timer does the actual rendering
     # ------------------------------------------------------------------
@@ -910,8 +1161,18 @@ class VisualizationPanel(QWidget):
         self._shm_wf_last_gen  = 0
 
     def _flush_pending(self):
+        if self._paused:
+            return
+
         with self._profiler.measure("visual / frame flush"):
             t0 = time.monotonic()
+
+            # Sync gen counters on first frame after unpause to avoid replaying
+            # stale queue data that accumulated while the display was frozen.
+            if self._need_gen_sync and hasattr(self, '_shm_wf_gen'):
+                self._need_gen_sync = False
+                if self._shm_wf_gen is not None:
+                    self._shm_wf_last_gen = int(self._shm_wf_gen.value)
 
             # Fast path: shared memory from DSP subprocess
             if hasattr(self, '_shm_spec'):
@@ -970,6 +1231,46 @@ class VisualizationPanel(QWidget):
             dt = (time.monotonic() - t0) * 1000.0
             if dt > 30.0:
                 logger.warning(f"[Visualization] render slow: {dt:.1f} ms")
+
+    # ------------------------------------------------------------------
+    # Pause and measurement markers
+    # ------------------------------------------------------------------
+
+    def toggle_pause(self):
+        self._paused = not self._paused
+        if self._paused:
+            self._pause_label.show()
+            self._pause_label.raise_()
+            self._pause_btn.setText("▶  Resume")
+        else:
+            self._need_gen_sync = True
+            self._pause_label.hide()
+            self._pause_btn.setText("⏸  Pause")
+
+    def _on_right_click(self, scene_x: float, scene_y: float, shift: bool):
+        from PySide6.QtCore import QPointF
+        scene_pos = QPointF(scene_x, scene_y)
+        sp_vb = self._spec_plot.getViewBox()
+        wp_vb = self._wf_plot.getViewBox()
+
+        # Map scene → data coords for each ViewBox, then check against visible range.
+        # sceneBoundingRect() is unreliable in PyQtGraph; viewRange() is authoritative.
+        wf_pt  = wp_vb.mapSceneToView(scene_pos)
+        sp_pt  = sp_vb.mapSceneToView(scene_pos)
+        wf_xr, wf_yr = wp_vb.viewRange()
+        sp_xr, sp_yr = sp_vb.viewRange()
+
+        in_wf = (wf_xr[0] <= wf_pt.x() <= wf_xr[1] and
+                 wf_yr[0] <= wf_pt.y() <= wf_yr[1])
+        in_sp = (sp_xr[0] <= sp_pt.x() <= sp_xr[1] and
+                 sp_yr[0] <= sp_pt.y() <= sp_yr[1])
+
+        if in_wf and shift:
+            self._markers._place_time_marker(wf_pt.y())
+        elif in_wf:
+            self._markers._place_freq_marker(wf_pt.x())
+        elif in_sp:
+            self._markers._place_freq_marker(sp_pt.x())
 
     # ------------------------------------------------------------------
     # Proxy helpers so callers don't need to reach into .spectrum/.waterfall

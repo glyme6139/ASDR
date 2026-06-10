@@ -33,6 +33,7 @@ from .timing import TimingConfig, profiler_from_config
 from .timing_window import TimingWindow
 from .rfi_log_window import RFILogWindow
 from .bitstream_window import BitstreamAnalysisWindow
+from .signal_id_panel import SignalIDWindow
 from app.rfi.rfi_classifier import RFIClassifier
 
 logger = logging.getLogger(__name__)
@@ -77,6 +78,7 @@ class ASURMainWindow(QMainWindow):
         self.rate_window = SignalRateWindow(self)
         self.rfi_log_window = RFILogWindow()
         self.bitstream_window = BitstreamAnalysisWindow()
+        self.signal_id_window = SignalIDWindow(db_path=None, freq_hz=DEFAULT_CENTER_HZ)
         self.rfi_classifier = RFIClassifier()
 
         self.dsp = DSPProcess(timing=self._timing)
@@ -144,7 +146,7 @@ class ASURMainWindow(QMainWindow):
         self.ctrl_panel = ControlPanel()
         top_layout.addWidget(self.ctrl_panel, stretch=1)
         try:
-            self.ctrl_panel.signal_id_panel.set_timing_report_handler(self._handle_timing_report)
+            self.signal_id_window.panel.set_timing_report_handler(self._handle_timing_report)
         except Exception:
             pass
 
@@ -214,6 +216,8 @@ class ASURMainWindow(QMainWindow):
             self._decoder_win_action.triggered.connect(self._show_decoder_win)
             self._bitstream_action = view_menu.addAction("Bitstream Analyzer")
             self._bitstream_action.triggered.connect(self._show_bitstream_window)
+            self._signal_id_action = view_menu.addAction("Signal ID")
+            self._signal_id_action.triggered.connect(self._show_signal_id_window)
             view_menu.addSeparator()
             self._rfi_log_action = view_menu.addAction("RFI Logger")
             self._rfi_log_action.triggered.connect(self._show_rfi_log_window)
@@ -355,9 +359,6 @@ class ASURMainWindow(QMainWindow):
         self.vis_panel.spectrum.vfo_selected.connect(self._on_vfo_selected_from_spectrum)
         self.vis_panel.spectrum.vfo_marker_changed.connect(self._on_vfo_marker_changed)
 
-        # ---- Signal ID panel — track active VFO frequency ----
-        self.ctrl_panel.vfo_tab.frequency_changed.connect(self._on_vfo_freq_for_signal_id)
-        self.ctrl_panel.vfo_tab.active_vfo_changed.connect(self._on_active_vfo_for_signal_id)
         self.ctrl_panel.vfo_tab.active_vfo_changed.connect(self._on_active_vfo_changed)
 
         # ---- Signal auto-detection overlay ----
@@ -418,6 +419,8 @@ class ASURMainWindow(QMainWindow):
         bw = self._vfo_state.get(vfo_id, {}).get('bandwidth_hz', 12_500)
         self.vis_panel.update_vfo_marker(vfo_id, freq_hz, bw)
         self._check_vfo_ranges()
+        if vfo_id == self.ctrl_panel.vfo_tab.active_vfo_id():
+            self.signal_id_window.panel.set_frequency(freq_hz)
 
     def _on_vfo_bandwidth_changed(self, vfo_id: int, bandwidth_hz: float):
         self.dsp.set_vfo_bandwidth(vfo_id, bandwidth_hz)
@@ -455,7 +458,7 @@ class ASURMainWindow(QMainWindow):
         bw = self._vfo_state.get(active_id, {}).get('bandwidth_hz', 12_500)
         self.vis_panel.update_vfo_marker(active_id, freq_hz, bw)
         self._check_vfo_ranges()
-        self.ctrl_panel.signal_id_panel.set_frequency(freq_hz)
+        self.signal_id_window.panel.set_frequency(freq_hz)
 
     def _on_vfo_selected_from_spectrum(self, vfo_id: int):
         self.ctrl_panel.vfo_tab.set_active_vfo(vfo_id)
@@ -474,15 +477,7 @@ class ASURMainWindow(QMainWindow):
                 self._vfo_state[vfo_id]['bandwidth_hz'] = bw_hz
         self.vis_panel.waterfall.update_vfo_marker(vfo_id, freq_hz)
         self._check_vfo_ranges()
-        self.ctrl_panel.signal_id_panel.set_frequency(freq_hz)
-
-    def _on_vfo_freq_for_signal_id(self, vfo_id: int, freq_hz: float):
-        if vfo_id == self.ctrl_panel.vfo_tab.active_vfo_id():
-            self.ctrl_panel.signal_id_panel.set_frequency(freq_hz)
-
-    def _on_active_vfo_for_signal_id(self, vfo_id: int):
-        freq_hz = self._vfo_state.get(vfo_id, {}).get('freq_hz', 100e6)
-        self.ctrl_panel.signal_id_panel.set_frequency(freq_hz)
+        self.signal_id_window.panel.set_frequency(freq_hz)
 
     def _on_active_vfo_changed(self, vfo_id: int):
         if self.eye_window.isVisible() and self.eye_window._current_vfo is None:
@@ -493,6 +488,8 @@ class ASURMainWindow(QMainWindow):
             self.constellation_window.set_active_vfo(vfo_id)
         if self.decoder_win.isVisible() and self.decoder_win._current_vfo is None:
             self.decoder_win.set_active_vfo(vfo_id)
+        freq_hz = self._vfo_state.get(vfo_id, {}).get('freq_hz', DEFAULT_CENTER_HZ)
+        self.signal_id_window.panel.set_frequency(freq_hz)
 
     def _on_scan_result(self, signals: list):
         with self._profiler.measure("UI / scan result"):
@@ -516,11 +513,17 @@ class ASURMainWindow(QMainWindow):
         self.rfi_log_window.raise_()
         self.rfi_log_window.activateWindow()
 
+    def _show_signal_id_window(self):
+        self.signal_id_window.show()
+        self.signal_id_window.raise_()
+        self.signal_id_window.activateWindow()
+
     def _on_signal_annotation_clicked(self, sig: dict):
-        """Open / refresh the Artemis Signal ID panel for the clicked annotation."""
+        """Open the Signal ID window and search for the clicked annotation's frequency."""
         center_hz = sig.get('center_hz', self._center_hz)
-        self.ctrl_panel.signal_id_panel.set_frequency(center_hz)
-        self.ctrl_panel.signal_id_panel._do_search()
+        self.signal_id_window.panel.set_frequency(center_hz)
+        self._show_signal_id_window()
+        self.signal_id_window.panel._do_search()
 
     def _on_signal_strength(self, updates: dict):
         for vfo_id, (db, is_active) in updates.items():
@@ -927,6 +930,7 @@ class ASURMainWindow(QMainWindow):
         self.rate_window.close()
         self.rfi_log_window.close()
         self.bitstream_window.close()
+        self.signal_id_window.close()
         self.rfi_classifier.close()
 
         self.ipc.stop()

@@ -27,6 +27,21 @@
       "notes": "French and European LW broadcast stations. Normal signal."
     },
     {
+      "id": "nfc_rfid_hf",
+      "name": "NFC / HF RFID (13.56 MHz)",
+      "start_hz": 13553000,
+      "stop_hz": 13567000,
+      "likely_sources": [
+        "NFC payment terminals and cards",
+        "RFID access badges (ISO 14443 / ISO 15693)",
+        "NFC-enabled smartphones",
+        "Library / retail RFID tags"
+      ],
+      "rfi_risk": "low",
+      "category": "ism",
+      "notes": "ISM band at 13.56 MHz. Signals normally very short-range (<10 cm for NFC). A visible signal here usually means a reader is nearby."
+    },
+    {
       "id": "mw_broadcast",
       "name": "Mediumwave (AM) Broadcast",
       "start_hz": 526500,
@@ -345,6 +360,61 @@
       "notes": "Some Linky deployments use the Wize / Wavenis-ULP protocol at 169 MHz (200 Hz channels)."
     },
     {
+      "id": "dvbt2_tnt",
+      "name": "DVB-T2 / TNT Digital Television (470–790 MHz)",
+      "start_hz": 470000000,
+      "stop_hz": 790000000,
+      "likely_sources": [
+        "TNT multiplexes R1–R8 (TF1, France 2, France 3, Canal+, France 5, M6, Arte, etc.)",
+        "Local / regional TNT multiplexes",
+        "DVB-T2 transmitters (8 MHz channel spacing)"
+      ],
+      "rfi_risk": "low",
+      "category": "broadcast",
+      "notes": "French terrestrial digital TV (TNT) uses DVB-T2, 8 MHz channels in UHF band IV/V. Signal should be ~8 MHz wide. The HackRF can receive but not decode directly without a DVB-T software stack."
+    },
+    {
+      "id": "lte_band20_dl",
+      "name": "4G LTE Band 20 Downlink — 800 MHz (791–821 MHz)",
+      "start_hz": 791000000,
+      "stop_hz": 821000000,
+      "likely_sources": [
+        "4G LTE base stations (Orange, SFR, Bouygues, Free — Band 20)",
+        "Rural area coverage — Band 20 is the primary rural 4G band in France"
+      ],
+      "rfi_risk": "low",
+      "category": "cellular",
+      "notes": "LTE Band 20 (800 MHz) is the backbone of French rural 4G coverage. Very widely deployed. Each operator has ~10 MHz of spectrum here."
+    },
+    {
+      "id": "lte_band20_ul",
+      "name": "4G LTE Band 20 Uplink — 800 MHz (832–862 MHz)",
+      "start_hz": 832000000,
+      "stop_hz": 862000000,
+      "likely_sources": [
+        "Mobile phone uplink to base station (Orange, SFR, Bouygues, Free — Band 20)",
+        "Nearby phones will appear strongest"
+      ],
+      "rfi_risk": "low",
+      "category": "cellular",
+      "notes": "Uplink pair for LTE Band 20. 41 MHz duplex gap from the downlink at 791–821 MHz."
+    },
+    {
+      "id": "gsmr_railway",
+      "name": "GSM-R Railway Communications (876–925 MHz)",
+      "start_hz": 876000000,
+      "stop_hz": 925000000,
+      "likely_sources": [
+        "SNCF locomotive to control centre voice / data",
+        "Train protection signalling (ETCS / KVB)",
+        "Level crossing systems",
+        "Trackside base stations (BTS)"
+      ],
+      "rfi_risk": "low",
+      "category": "railway",
+      "notes": "GSM-R uses 876–880 MHz uplink and 921–925 MHz downlink in France. Audible only near railway lines. Being phased out for FRMCS (5G) from ~2030."
+    },
+    {
       "id": "adsb",
       "name": "ADS-B Mode S (1090 MHz)",
       "start_hz": 1089500000,
@@ -362,6 +432,19 @@
       "rfi_risk": "low",
       "category": "navigation",
       "notes": "GPS is normally below the noise floor of an SDR without a dedicated LNA. A visible signal here may indicate a GPS jammer or repeater."
+    },
+    {
+      "id": "amateur_23cm",
+      "name": "Amateur 23cm Band (1240–1300 MHz)",
+      "start_hz": 1240000000,
+      "stop_hz": 1300000000,
+      "likely_sources": [
+        "Amateur radio (FM, SSB, ATV, digital)",
+        "Amateur radar / passive radar experiments"
+      ],
+      "rfi_risk": "low",
+      "category": "amateur",
+      "notes": "Shared with radiolocation (radar). Secondary allocation for amateurs in France. Rarely active except near club stations."
     },
     {
       "id": "meteosat_lrit",
@@ -446,14 +529,46 @@
       "notes": "Switching harmonics can extend well into UHF. Cheap chargers and LED power supplies are particularly bad. Look for regularly-spaced spectral lines."
     },
     {
-      "id": "rfi_lte_tdd_2600",
-      "name": "4G LTE 2600 MHz (Band 7)",
+      "id": "ism_2400_wifi_bt",
+      "name": "ISM 2.4 GHz — Wi-Fi / Bluetooth / Zigbee (2400–2484 MHz)",
+      "start_hz": 2400000000,
+      "stop_hz": 2484000000,
+      "likely_sources": [
+        "Wi-Fi 802.11b/g/n/ax (2.4 GHz channels 1–13, 20/40 MHz wide)",
+        "Bluetooth (FHSS across 79 × 1 MHz channels)",
+        "Zigbee / Z-Wave home automation",
+        "Microwave oven leakage (~2.45 GHz, broadband bursts during cooking)",
+        "Wireless baby monitors (analogue or digital)",
+        "FPV drone video links",
+        "Bluetooth Low Energy (BLE) beacons"
+      ],
+      "rfi_risk": "medium",
+      "category": "ism",
+      "notes": "Extremely busy band in residential areas. Microwave ovens cause broadband bursts at ~2.45 GHz when running — easily identified by the cooking cycle. Wi-Fi channels 1, 6, and 11 are non-overlapping in France. HackRF sensitivity drops above ~2 GHz; use a dedicated LNA for reliable reception here."
+    },
+    {
+      "id": "lte_band7",
+      "name": "4G LTE Band 7 — 2600 MHz (2500–2690 MHz)",
       "start_hz": 2500000000,
       "stop_hz": 2690000000,
       "likely_sources": ["4G LTE band 7 (Orange, SFR, Bouygues, Free)"],
       "rfi_risk": "low",
       "category": "cellular",
       "notes": "At the upper edge of HackRF range — sensitivity is reduced."
+    },
+    {
+      "id": "5g_nr_n78",
+      "name": "5G NR Band n78 — 3.5 GHz (3400–3800 MHz)",
+      "start_hz": 3400000000,
+      "stop_hz": 3800000000,
+      "likely_sources": [
+        "5G NR base stations (Orange, SFR, Bouygues, Free — all four operators)",
+        "Fixed wireless access (FWA) customer terminals",
+        "5G NSA / SA towers (often co-located with 4G)"
+      ],
+      "rfi_risk": "low",
+      "category": "cellular",
+      "notes": "The primary French 5G band. All four operators hold spectrum here following the 2020 auction. HackRF can receive this band but sensitivity is low above 2.5 GHz; an external LNA is strongly recommended. Each operator has 80–100 MHz of bandwidth."
     }
   ]
 }

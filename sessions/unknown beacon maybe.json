@@ -1,0 +1,23 @@
+{
+  "device": {
+    "center_freq": 7500000.0,
+    "sample_rate": 2000000,
+    "lna": 40,
+    "vga": 20,
+    "amp_enabled": true,
+    "autosave": true
+  },
+  "vfos": [
+    {
+      "name": "VFO 1",
+      "frequency": 7075769.0,
+      "demod_mode": "USB",
+      "bandwidth": 18000.0,
+      "volume": 0.18,
+      "squelch_level": -100.0,
+      "squelch_enabled": true,
+      "enabled": true,
+      "decoders": []
+    }
+  ]
+}
