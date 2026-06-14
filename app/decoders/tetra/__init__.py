@@ -21,7 +21,7 @@ from .network_time import NetworkTime
 from .lower_mac import (
     BSCH_SEED, scramble_seed, scramble,
     deinterleave, DEINT_BSCH, DEINT_TCH,
-    decode_bsch, decode_bsch_soft, decode_bkn,
+    decode_bsch, decode_bsch_soft, decode_bkn, decode_bkn_block,
     rm_decode, check_crc,
 )
 from .mac import (
@@ -184,6 +184,12 @@ class TETRADecoder(BaseDecoder):
         self._drain()
 
         return self._pending.popleft() if self._pending else None
+
+    def set_iq_sample_rate(self, rate: float) -> None:
+        """Called by the VFO channeliser with the actual narrowband IQ rate."""
+        rate = float(rate)
+        if rate > 0 and abs(rate - self.sample_rate) > 100:
+            self.sample_rate = int(rate)
 
     def reset(self):
         self._bits   = np.zeros(0, dtype=np.int8)
@@ -443,11 +449,19 @@ class TETRADecoder(BaseDecoder):
             b2 = burst[_NDB_B2_S:_NDB_B2_E]
 
             if is_bcch:
-                # Decode control channel payload
-                payload, crc_ok = decode_bkn(b1, b2, self._scramble_seed)
-                if not crc_ok:
+                # Decode B1 and B2 independently (each is a separate BKN block).
+                # B1 is the primary bearer; B2 may carry a second MAC PDU.
+                p1, ok1 = decode_bkn_block(b1, self._scramble_seed)
+                p2, ok2 = decode_bkn_block(b2, self._scramble_seed)
+
+                if not ok1 and not ok2:
                     return None   # suppress false BCCH noise
-                if crc_ok and payload is not None:
+
+                # Use whichever block passed CRC (prefer B1)
+                payload = p1 if ok1 else p2
+                crc_ok  = ok1 or ok2
+
+                if payload is not None:
                     frame = parse_mac_block(payload, tn=self._net.tn)
                     if frame is not None:
                         bb_info.update(frame.to_dict())
@@ -464,6 +478,21 @@ class TETRADecoder(BaseDecoder):
                         elif isinstance(p, list):  # NeighbourCell list
                             neighbours = [c.to_dict() for c in p]
                             self._neighbours = p
+
+                # If B2 also passed CRC and carries something different, queue it
+                if ok1 and ok2 and p2 is not None:
+                    frame2 = parse_mac_block(p2, tn=self._net.tn)
+                    if frame2 is not None and frame2.payload is not None:
+                        p2obj = frame2.payload
+                        if isinstance(p2obj, CallEvent):
+                            self._calls[frame2.slot] = p2obj
+                        elif isinstance(p2obj, SdsMessage):
+                            self._sds.append(p2obj)
+                            if len(self._sds) > 50:
+                                self._sds.pop(0)
+                        elif isinstance(p2obj, list):
+                            self._neighbours = p2obj
+
                 if self._net.is_bnch_slot() and self._cell is None:
                     si = parse_sysinfo(payload)
                     if si:
@@ -675,8 +704,10 @@ def _bits_from_phases(phases: np.ndarray, k: int) -> np.ndarray:
 
 # ── Soft sync-word correlator ─────────────────────────────────────────────────
 
-_SOFT_THRESHOLD  = 15.5   # minimum |Σ exp(j·Δφ)| over 19 Y symbols (max=19); noise max ≈14.8 for 102K tests
-                          # noise max ≈13–14 over 2500 effective tests; real signal ≈17
+_SOFT_THRESHOLD  = 12.5   # minimum |Σ exp(j·Δφ)| over 19 Y symbols (max=19)
+                          # noise peak ≈13–14 (2500 tests) / 14.8 (102K tests); real signal ≈17
+                          # Lowered from 15.5 — CRC is the real quality gate; threshold is just
+                          # a pre-filter to avoid wasted Viterbi calls on obvious noise.
 _SOFT_DF_STEP    = 300    # Hz — residual carrier offset search step
 _SOFT_DF_MAX     = 18000  # Hz — ±range; covers full 4th-power error (±sr/8 ≈ ±9.3 kHz)
 _MAX_PHASE_BUF   = 1500   # symbols — hard cap to bound soft-correlator cost

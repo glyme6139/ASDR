@@ -50,11 +50,11 @@ def scramble(bits: np.ndarray, seed: int) -> np.ndarray:
 # dest[i-1] = source[(1 + a*i % N) - 1]  (1-indexed, ETSI EN 300 392-2 §8.2.4)
 
 # (N, a) pairs by channel type
-DEINT_BSCH    = (120, 11)   # SCH/F  — BSCH in SB burst
+DEINT_BSCH    = (120, 11)   # SCH/F  — BSCH in SB burst (ETSI Table 8.5)
 DEINT_AACH    = (30,   3)   # AACH   — in BB field of SB (after RM decode)
-DEINT_BKN1    = (216, 13)   # BKN1   — B1 field of NDB
-DEINT_BKN2    = (216, 13)   # BKN2   — B2 field of NDB
-DEINT_TCH     = (432, 13)   # TCH/S  — B1+B2 combined
+DEINT_BKN1    = (216, 101)  # BKN1   — B1 field of NDB (ETSI/osmo-tetra: a=101)
+DEINT_BKN2    = (216, 101)  # BKN2   — B2 field of NDB
+DEINT_TCH     = (432, 13)   # TCH/S  — B1+B2 combined voice
 
 
 def deinterleave(bits: np.ndarray, N: int, a: int) -> np.ndarray:
@@ -100,12 +100,15 @@ for _s in range(_STATES):
 # Each mask cycles over the mother-code output (4 bits per info bit).
 # 1 = keep this coded bit; 0 = it was punctured (depuncture inserts erasure=2).
 
-# SCH/F (BSCH): 60 info bits × 4 = 240 mother bits → keep 120 → rate 1/2
-# Remove generators G2,G3 for each info bit.
-_BSCH_PUNCT_MASK = np.array([1, 1, 0, 0], dtype=np.uint8)
+# BKN (BCCH/DCCH) per-block: TETRA_RCPC_PUNCT_2_3 (osmo-tetra tetra_conv_enc.c)
+# Period=8 mother bits, keep positions 1,2,5 (0-indexed) → 3/8 mother bits kept.
+# 216 coded bits × (8/3) = 576 mother bits → Viterbi → 144 decoded bits.
+# P_rate2_3 = {0,1,2,5}, t=3, period=8 — depuncture maps j∈[1..N] to k via:
+#   k = 8*((j-1)//3) + P[(j-1)%3 + 1]   where P[1..3] = {1,2,5}
+# Equivalent periodic keep-mask over 8 mother positions:
+_BKN_RCPC_2_3_MASK = np.array([0, 1, 1, 0, 0, 1, 0, 0], dtype=np.uint8)
 
-# BKN type-1 (BCCH/DCCH): 144 info bits × 4 = 576 mother bits → keep 432 → rate 3/4
-# Remove generator G3 for each info bit: [G0,G1,G2,_].
+# Legacy 3/4 rate mask retained for TCH/S reference only (not used for BKN).
 _BKN_PUNCT_MASK = np.array([1, 1, 1, 0], dtype=np.uint8)
 
 
@@ -326,34 +329,33 @@ def decode_bsch(raw_bits: np.ndarray, seed: int = BSCH_SEED) -> Tuple[Optional[n
     """
     Decode BSCH (SCH/F) from 120 raw SB1 bits.
 
-    Pipeline: scramble → deinterleave(N=120,a=11) → depuncture → Viterbi → CRC
-    Returns (60 decoded bits, crc_ok).  First 44 bits are payload.
+    Pipeline: scramble → deinterleave(N=120,a=11) → depuncture(RCPC_2/3) → Viterbi → CRC
+    Type-2 layout: [60 SYNC-PDU bits | 16 CRC bits | 4 tail bits] = 80 bits.
+    Returns (60-bit SYNC PDU payload, crc_ok).
     """
     if len(raw_bits) < 120:
         return None, False
     raw = raw_bits[:120].copy()
 
-    # Log raw SB1 bits as a hex-encoded bit string (8 bits per hex digit pair)
     raw_hex = ''.join(f"{int(''.join(str(int(b)) for b in raw[i:i+8]), 2):02X}"
                       for i in range(0, 120, 8))
 
     b = scramble(raw, seed)
     N, a = DEINT_BSCH
     b = deinterleave(b, N, a)
-    dep = depuncture(b, _BSCH_PUNCT_MASK)
+    dep = depuncture(b, _BKN_RCPC_2_3_MASK)   # 120 → 320 mother bits
 
-    # Viterbi minimum path metric tells us estimated channel BER
     vit_errs = _viterbi_min_metric(dep)
 
-    decoded = viterbi_decode(dep)
-    if len(decoded) < 60:
+    decoded = viterbi_decode(dep)              # 320 → 80 bits
+    if len(decoded) < 80:
         return None, False
-    crc_val = crc16(decoded[:60])
+    # CRC over bits 0-75 (60 info + 16 CRC); bits 76-79 are tail bits
+    crc_val = crc16(decoded[:76])
     ok = (crc_val == _GOOD_CRC)
     _bsch_log.debug(
-        "BSCH: raw=%s vit_errs=%d crc=0x%04X ok=%s bits=%s",
+        "BSCH: raw=%s vit_errs=%d crc=0x%04X ok=%s",
         raw_hex, vit_errs, crc_val, ok,
-        ''.join(str(int(x)) for x in decoded[:44]),
     )
     return decoded[:60], ok
 
@@ -442,25 +444,24 @@ def decode_bsch_soft(phases_60: np.ndarray, seed: int = BSCH_SEED) -> Tuple[Opti
     for i in range(1, N + 1):
         soft_deint[i - 1] = soft[(a * i) % N]
 
-    # Depuncture: insert 0.0 (erasure) at punctured positions
-    period = len(_BSCH_PUNCT_MASK)
-    kept = int(np.sum(_BSCH_PUNCT_MASK))
+    # Depuncture: insert 0.0 (erasure) at punctured positions (RCPC_2/3, 120→320)
+    period = len(_BKN_RCPC_2_3_MASK)
+    kept = int(np.sum(_BKN_RCPC_2_3_MASK))
     n_p = len(soft_deint) // kept
     dep = np.zeros(n_p * period, dtype=np.float32)
     src = 0
     for j in range(len(dep)):
-        if _BSCH_PUNCT_MASK[j % period]:
+        if _BKN_RCPC_2_3_MASK[j % period]:
             dep[j] = soft_deint[src]; src += 1
 
-    decoded = _viterbi_soft(dep)
-    if len(decoded) < 60:
+    decoded = _viterbi_soft(dep)               # 320 → 80 bits
+    if len(decoded) < 80:
         return None, False
-    crc_val = crc16(decoded[:60])
+    crc_val = crc16(decoded[:76])
     ok = (crc_val == _GOOD_CRC)
     _bsch_log.debug(
-        "BSCH soft: crc=0x%04X ok=%s bits=%s",
+        "BSCH soft: crc=0x%04X ok=%s",
         crc_val, ok,
-        ''.join(str(int(x)) for x in decoded[:44]),
     )
     return decoded[:60], ok
 
@@ -477,24 +478,43 @@ def decode_aach(raw_bits_14: np.ndarray) -> Tuple[Optional[np.ndarray], bool]:
     return rm_decode(padded)
 
 
+def decode_bkn_block(raw_216: np.ndarray, seed: int) -> Tuple[Optional[np.ndarray], bool]:
+    """
+    Decode one BKN block (B1 or B2) from 216 raw NDB burst bits.
+
+    Per ETSI EN 300 392-2 / osmo-tetra tetra_lower_mac.c (TPSAP_T_NDB):
+      scramble → deinterleave(N=216, a=101) → depuncture(RCPC_2/3) → Viterbi → CRC
+
+    216 coded → 576 mother bits → Viterbi → 144 bits (124 payload + 16 CRC + 4 tail).
+    Returns (payload_124, crc_ok).
+    """
+    if len(raw_216) < 216:
+        return None, False
+    b = scramble(raw_216[:216], seed)
+    N, a = DEINT_BKN1                        # (216, 101)
+    b = deinterleave(b, N, a)
+    b = depuncture(b, _BKN_RCPC_2_3_MASK)   # 216 → 576
+    decoded = viterbi_decode(b)              # 576 → 144 bits
+    if len(decoded) < 144:
+        return None, False
+    # CRC over bits 0-139 (124 payload + 16 CRC); bits 140-143 are tail bits
+    ok = (crc16(decoded[:140]) == _GOOD_CRC)
+    return decoded[:124], ok
+
+
 def decode_bkn(raw_b1: np.ndarray, raw_b2: np.ndarray, seed: int) -> Tuple[Optional[np.ndarray], bool]:
     """
-    Decode BKN1+BKN2 from B1 (216 bits) + B2 (216 bits) of an NDB burst.
+    Decode B1 and B2 of an NDB burst, returning the first block that passes CRC.
 
-    Pipeline: scramble → deinterleave(N=432,a=13) → depuncture(3/4) → Viterbi → CRC
-    144 info bits (128 payload + 16 CRC) are recovered; CRC covers the payload.
-    Returns (payload_bits, crc_ok).  payload is 128 bits if CRC passes.
+    Each of B1 and B2 is an independent BKN block (ETSI: BKN1, BKN2).
+    Tries B1 first; falls back to B2.  Returns (payload_124, crc_ok).
+    Call decode_bkn_block directly to obtain both payloads independently.
     """
-    raw = np.concatenate([raw_b1[:216], raw_b2[:216]])  # 432 coded bits
-    b = scramble(raw, seed)
-    N, a = DEINT_TCH
-    b = deinterleave(b, N, a)
-    # Depuncture: 432 → 576 (insert erasures at G3 output of each info bit)
-    b = depuncture(b, _BKN_PUNCT_MASK)      # 432 → 576
-    decoded = viterbi_decode(b)             # 576 → 144 bits
-    if len(decoded) < 20:
-        return None, False
-    ok = check_crc(decoded)
-    # Strip last 16 CRC bits (tail bits already consumed by Viterbi flush)
-    payload = decoded[:-16] if len(decoded) >= 16 else decoded
-    return payload, ok
+    p1, ok1 = decode_bkn_block(raw_b1, seed)
+    if ok1:
+        return p1, True
+    p2, ok2 = decode_bkn_block(raw_b2, seed)
+    if ok2:
+        return p2, True
+    # Return best-effort B1 payload even if CRC failed
+    return p1, False

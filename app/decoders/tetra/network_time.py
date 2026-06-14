@@ -41,25 +41,29 @@ class NetworkTime:
         return f"MCC={self.mcc} MNC={self.mnc} CC={self.cc} LA={self.la}"
 
     def update_from_bsch(self, bsch_bits) -> None:
-        """Parse 44 payload bits from a decoded BSCH and update state."""
-        if bsch_bits is None or len(bsch_bits) < 44:
+        """Parse 60-bit SYNC PDU from decoded BSCH and update state.
+
+        ETSI EN 300 392-2 §21.5.2 / osmo-tetra testpdu.c SYNC PDU layout:
+          [0:4]   System Code (4 bits)
+          [4:10]  Colour Code (6 bits)
+          [10:12] TN (2 bits, 0-based → add 1)
+          [12:17] FN (5 bits, 0-based → add 1)
+          [17:23] MN (6 bits, 0-based → add 1)
+          [23:31] sharing/DTX/reserved (8 bits, ignored)
+          [31:41] MCC (10 bits)
+          [41:55] MNC (14 bits)
+          [55:60] other (5 bits, ignored)
+        """
+        if bsch_bits is None or len(bsch_bits) < 55:
             return
         b = bsch_bits
-        # ETSI EN 300 392-2 §21.5.2 BSCH field layout (44 bits):
-        #  [0:10]  MCC  (10 bits)
-        #  [10:24] MNC  (14 bits)
-        #  [24:28] CC   (4 bits)  — colour code 0-15
-        #  [28:30] reserved
-        #  [30:32] TN   (2 bits, 0-based → add 1)
-        #  [32:38] FN   (6 bits, 0-based → add 1)
-        #  [38:44] MN   (6 bits, 0-based → add 1)
-        # Note: bit order MSB-first within each field
-        self.mcc = _bits_to_int(b[0:10])
-        self.mnc = _bits_to_int(b[10:24])
-        self.cc  = _bits_to_int(b[24:28])
-        self.tn  = _bits_to_int(b[30:32]) + 1
-        self.fn  = _bits_to_int(b[32:38]) + 1
-        self.mn  = _bits_to_int(b[38:44]) + 1
+        self.cc  = _bits_to_int(b[4:10])
+        self.tn  = _bits_to_int(b[10:12]) + 1
+        self.fn  = _bits_to_int(b[12:17]) + 1
+        self.mn  = _bits_to_int(b[17:23]) + 1
+        if len(b) >= 55:
+            self.mcc = _bits_to_int(b[31:41])
+            self.mnc = _bits_to_int(b[41:55])
         self.wall_ts = time.time()
         self.synced = True
 

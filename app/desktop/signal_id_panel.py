@@ -13,7 +13,7 @@ import sqlite3
 from contextlib import nullcontext
 from typing import Callable, Optional, Tuple
 
-from PySide6.QtCore import Qt, QTimer, QUrl
+from PySide6.QtCore import QObject, Qt, QThread, QTimer, QUrl, Signal as QtSignal
 from PySide6.QtGui import QPixmap
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtWidgets import (
@@ -59,6 +59,56 @@ def _fmt_freq(hz) -> str:
     if hz < 1_000_000_000:
         return f"{hz / 1e6:.6f} MHz"
     return f"{hz / 1e9:.6f} GHz"
+
+
+def _load_signal_data_conn(conn, sig_id: int) -> Optional[dict]:
+    """Load all data for one signal from an open SQLite connection."""
+    try:
+        sig = conn.execute(
+            "SELECT NAME, DESCRIPTION, URL FROM signals WHERE SIG_ID = ?",
+            (sig_id,),
+        ).fetchone()
+        if not sig:
+            return None
+        return {
+            "sig_id":      sig_id,
+            "name":        sig["NAME"] or f"Signal {sig_id}",
+            "description": sig["DESCRIPTION"] or "",
+            "url":         sig["URL"] or "",
+            "freqs": conn.execute(
+                "SELECT VALUE, DESCRIPTION FROM frequency"
+                " WHERE SIG_ID = ? ORDER BY VALUE", (sig_id,)
+            ).fetchall(),
+            "bws": conn.execute(
+                "SELECT VALUE, DESCRIPTION FROM bandwidth WHERE SIG_ID = ?",
+                (sig_id,),
+            ).fetchall(),
+            "mods": conn.execute(
+                "SELECT VALUE FROM modulation WHERE SIG_ID = ?", (sig_id,)
+            ).fetchall(),
+            "modes": conn.execute(
+                "SELECT VALUE FROM mode WHERE SIG_ID = ?", (sig_id,)
+            ).fetchall(),
+            "locs": conn.execute(
+                "SELECT VALUE FROM location WHERE SIG_ID = ?", (sig_id,)
+            ).fetchall(),
+            "acfs": conn.execute(
+                "SELECT VALUE FROM acf WHERE SIG_ID = ?", (sig_id,)
+            ).fetchall(),
+            "cats": conn.execute(
+                "SELECT cl.VALUE FROM category c"
+                " JOIN category_label cl ON c.CLB_ID = cl.CLB_ID"
+                " WHERE c.SIG_ID = ?", (sig_id,),
+            ).fetchall(),
+            "docs": conn.execute(
+                "SELECT DOC_ID, EXTENSION, NAME, TYPE, PREVIEW"
+                " FROM documents WHERE SIG_ID = ? ORDER BY TYPE",
+                (sig_id,),
+            ).fetchall(),
+        }
+    except Exception as exc:
+        logger.error("Failed to load signal %d: %s", sig_id, exc)
+        return None
 
 
 def _render_signal_content(
@@ -246,6 +296,160 @@ def _render_signal_content(
 
 
 # ---------------------------------------------------------------------------
+# Background search worker
+# ---------------------------------------------------------------------------
+
+class _SearchWorker(QObject):
+    """
+    Runs Artemis DB searches (freq / keyword / filter) off the main thread.
+    Opens its own read-only connection so the main thread's connection is untouched.
+    """
+    results_ready = QtSignal(list, str)   # list[dict], status message
+    error         = QtSignal(str)
+
+    def __init__(self, db_path: str, mode: str, **kwargs):
+        super().__init__()
+        self._db_path   = db_path
+        self._mode      = mode      # 'freq' | 'keyword' | 'filter'
+        self._kwargs    = kwargs
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    def run(self):
+        try:
+            conn = sqlite3.connect(self._db_path)
+            conn.row_factory = sqlite3.Row
+            if self._mode == 'freq':
+                results, status = self._run_freq(conn)
+            elif self._mode == 'keyword':
+                results, status = self._run_keyword(conn)
+            else:
+                results, status = self._run_filter(conn)
+            conn.close()
+        except Exception as exc:
+            if not self._cancelled:
+                self.error.emit(str(exc))
+            return
+        if not self._cancelled:
+            self.results_ready.emit(results, status)
+
+    # ------------------------------------------------------------------
+    def _run_freq(self, conn):
+        freq_hz = self._kwargs['freq_hz']
+        cur = conn.execute(
+            "SELECT SIG_ID FROM FREQ_RANGE WHERE ? >= MIN_VALUE AND ? <= MAX_VALUE",
+            (freq_hz, freq_hz),
+        )
+        sig_ids = [row[0] for row in cur.fetchall()]
+        if not sig_ids:
+            return [], f"No signals at {freq_hz / 1e6:.4f} MHz"
+
+        # Rank by frequency proximity
+        ph = ",".join("?" * len(sig_ids))
+        rows = conn.execute(
+            f"SELECT SIG_ID, MIN(ABS(VALUE - ?)) AS dist"
+            f" FROM frequency WHERE SIG_ID IN ({ph})"
+            f" GROUP BY SIG_ID ORDER BY dist ASC",
+            [freq_hz, *sig_ids],
+        ).fetchall()
+        ranked  = [row[0] for row in rows]
+        missing = [s for s in sig_ids if s not in set(ranked)]
+        sig_ids = ranked + missing
+
+        return self._load_all(conn, sig_ids, f"{{n}} signal(s) at {freq_hz / 1e6:.4f} MHz")
+
+    def _run_keyword(self, conn):
+        text    = self._kwargs['text']
+        words   = text.split()
+        matched: Optional[set] = None
+        for word in words:
+            if self._cancelled:
+                return [], ""
+            term = f"%{word}%"
+            rows = conn.execute(
+                "SELECT DISTINCT s.SIG_ID FROM signals s"
+                " LEFT JOIN modulation m ON m.SIG_ID = s.SIG_ID"
+                " LEFT JOIN category c ON c.SIG_ID = s.SIG_ID"
+                " LEFT JOIN category_label cl ON cl.CLB_ID = c.CLB_ID"
+                " WHERE s.NAME LIKE ? OR s.DESCRIPTION LIKE ?"
+                "    OR m.VALUE LIKE ? OR cl.VALUE LIKE ?",
+                (term, term, term, term),
+            ).fetchall()
+            word_ids = {row[0] for row in rows}
+            matched = word_ids if matched is None else matched & word_ids
+        sig_ids = sorted(matched or [])
+        if not sig_ids:
+            return [], f'No results for "{text}"'
+        return self._load_all(conn, sig_ids, f'{{n}} result(s) for "{text}"')
+
+    def _run_filter(self, conn):
+        modulations = self._kwargs.get('modulations', [])
+        modes       = self._kwargs.get('modes', [])
+        locations   = self._kwargs.get('locations', [])
+        categories  = self._kwargs.get('categories', [])
+        bw_min      = self._kwargs.get('bandwidth_min_hz')
+        bw_max      = self._kwargs.get('bandwidth_max_hz')
+
+        base_query  = "SELECT DISTINCT s.SIG_ID FROM signals s"
+        conditions, params = [], []
+        if modulations:
+            ph = ",".join("?" * len(modulations))
+            base_query += " LEFT JOIN modulation m ON m.SIG_ID = s.SIG_ID"
+            conditions.append(f"m.VALUE IN ({ph})")
+            params.extend(modulations)
+        if modes:
+            ph = ",".join("?" * len(modes))
+            base_query += " LEFT JOIN mode mo ON mo.SIG_ID = s.SIG_ID"
+            conditions.append(f"mo.VALUE IN ({ph})")
+            params.extend(modes)
+        if locations:
+            ph = ",".join("?" * len(locations))
+            base_query += " LEFT JOIN location l ON l.SIG_ID = s.SIG_ID"
+            conditions.append(f"l.VALUE IN ({ph})")
+            params.extend(locations)
+        if categories:
+            ph = ",".join("?" * len(categories))
+            base_query += (
+                " LEFT JOIN category c ON c.SIG_ID = s.SIG_ID"
+                " LEFT JOIN category_label cl ON cl.CLB_ID = c.CLB_ID"
+            )
+            conditions.append(f"cl.VALUE IN ({ph})")
+            params.extend(categories)
+        if bw_min is not None or bw_max is not None:
+            base_query += " LEFT JOIN bandwidth b ON b.SIG_ID = s.SIG_ID"
+            if bw_min is not None and bw_max is not None:
+                conditions.append("(b.VALUE >= ? AND b.VALUE <= ?)")
+                params.extend([bw_min, bw_max])
+            elif bw_min is not None:
+                conditions.append("b.VALUE >= ?")
+                params.append(bw_min)
+            else:
+                conditions.append("b.VALUE <= ?")
+                params.append(bw_max)
+        if conditions:
+            base_query += " WHERE " + " AND ".join(conditions)
+        base_query += " ORDER BY s.SIG_ID"
+
+        rows    = conn.execute(base_query, params).fetchall()
+        sig_ids = [row[0] for row in rows]
+        if not sig_ids:
+            return [], "No signals match the selected filters"
+        return self._load_all(conn, sig_ids, "{n} signal(s) match filters")
+
+    def _load_all(self, conn, sig_ids: list, status_fmt: str):
+        results = []
+        for sig_id in sig_ids:
+            if self._cancelled:
+                return results, ""
+            data = _load_signal_data_conn(conn, sig_id)
+            if data is not None:
+                results.append(data)
+        return results, status_fmt.format(n=len(results))
+
+
+# ---------------------------------------------------------------------------
 # Detail window
 # ---------------------------------------------------------------------------
 
@@ -411,6 +615,16 @@ class SignalIDPanel(QWidget):
                 report_handler=timing_report_handler,
             )
 
+        # Lazy-build state: data_list[i] is built into the stack only when selected
+        self._pending_data: list[dict] = []
+        self._widget_built: list[bool] = []
+
+        # Active background search
+        self._search_worker: Optional[_SearchWorker] = None
+        # Keeps (thread, worker) pairs alive until thread.finished fires.
+        # Without this, Python GC can destroy the QThread while it's still running.
+        self._live_searches: list = []
+
         self._initUI()
 
     # ------------------------------------------------------------------
@@ -534,6 +748,8 @@ class SignalIDPanel(QWidget):
     # ------------------------------------------------------------------
 
     def _clear_results(self):
+        self._pending_data = []
+        self._widget_built = []
         self._result_list.blockSignals(True)
         self._result_list.clear()
         self._result_list.blockSignals(False)
@@ -542,19 +758,94 @@ class SignalIDPanel(QWidget):
             self._result_stack.removeWidget(w)
             w.deleteLater()
 
-    def _add_result(self, widget: QWidget, name: str):
-        idx = self._result_stack.count()
-        self._result_stack.addWidget(widget)
-        item = QListWidgetItem(name)
-        item.setToolTip(name)
-        self._result_list.addItem(item)
-        if idx == 0:
-            self._result_list.setCurrentRow(0)
-            self._result_stack.setCurrentIndex(0)
-
     def _on_result_selected(self, row: int):
         if row >= 0:
+            self._ensure_built(row)
             self._result_stack.setCurrentIndex(row)
+
+    def _ensure_built(self, row: int):
+        """Build the content widget for row if not already done, replacing its placeholder."""
+        if row < 0 or row >= len(self._pending_data) or self._widget_built[row]:
+            return
+        data = self._pending_data[row]
+        result = self._build_signal_tab_from_data(data)
+        if result is None:
+            return
+        _, new_widget = result
+        old = self._result_stack.widget(row)
+        self._result_stack.insertWidget(row, new_widget)
+        self._result_stack.removeWidget(old)
+        old.deleteLater()
+        self._widget_built[row] = True
+
+    # ------------------------------------------------------------------
+    # Background search
+    # ------------------------------------------------------------------
+
+    def _cancel_search(self):
+        if self._search_worker is not None:
+            self._search_worker.cancel()
+            # Disconnect only the UI-update slots; leave thread.quit connected so
+            # the thread can still exit cleanly after the worker finishes.
+            try:
+                self._search_worker.results_ready.disconnect(self._on_search_results)
+            except RuntimeError:
+                pass
+            try:
+                self._search_worker.error.disconnect(self._on_search_error)
+            except RuntimeError:
+                pass
+            self._search_worker = None
+
+    def _start_worker(self, mode: str, **kwargs):
+        self._cancel_search()
+        self._clear_results()
+        if self._db_path is None:
+            return
+        self._status_label.setText("Searching…")
+        worker = _SearchWorker(self._db_path, mode, **kwargs)
+        thread = QThread()
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.results_ready.connect(self._on_search_results)
+        worker.error.connect(self._on_search_error)
+        worker.results_ready.connect(thread.quit)
+        worker.error.connect(thread.quit)
+        # _on_thread_done fires after the thread has actually stopped — safe to drop refs there
+        thread.finished.connect(lambda t=thread: self._on_thread_done(t))
+        self._search_worker = worker
+        self._live_searches.append((thread, worker))
+        thread.start()
+
+    def _on_thread_done(self, thread):
+        """Called via thread.finished — the thread has stopped, safe to release refs."""
+        self._live_searches = [(t, w) for t, w in self._live_searches if t is not thread]
+        thread.deleteLater()
+
+    def _on_search_results(self, data_list: list, status: str):
+        self._search_worker = None
+        with self._timed("Signal ID / populate results"):
+            self._status_label.setText(status)
+            self._pending_data  = data_list
+            self._widget_built  = [False] * len(data_list)
+            self._result_list.blockSignals(True)
+            for data in data_list:
+                placeholder = QWidget()
+                self._result_stack.addWidget(placeholder)
+                item = QListWidgetItem(data["name"])
+                item.setToolTip(data["name"])
+                self._result_list.addItem(item)
+            self._result_list.blockSignals(False)
+            if data_list:
+                self._ensure_built(0)
+                self._result_list.setCurrentRow(0)
+                self._result_stack.setCurrentIndex(0)
+
+    def _on_search_error(self, msg: str):
+        self._search_worker = None
+        self._search_thread = None
+        self._status_label.setText(f"Search error: {msg}")
+        logger.error("Signal ID search error: %s", msg)
 
     # ------------------------------------------------------------------
     # Public API
@@ -599,86 +890,45 @@ class SignalIDPanel(QWidget):
 
     def search_keywords(self, text: str):
         """Search signals by keyword. Empty text reverts to frequency-based results."""
-        with self._timed("Signal ID / keyword search"):
-            text = text.strip()
-            if not text:
-                self._keyword_mode = False
-                self._do_search()
-                return
-
-            self._keyword_mode = True
+        text = text.strip()
+        if not text:
+            self._keyword_mode = False
+            self._do_search()
+            return
+        self._keyword_mode = True
+        if self._db_path is None:
             self._clear_results()
-            if self._db_conn is None:
-                return
-
-            words = text.split()
-            try:
-                matched: Optional[set] = None
-                for word in words:
-                    term = f"%{word}%"
-                    rows = self._db_conn.execute(
-                        "SELECT DISTINCT s.SIG_ID FROM signals s"
-                        " LEFT JOIN modulation m ON m.SIG_ID = s.SIG_ID"
-                        " LEFT JOIN category c ON c.SIG_ID = s.SIG_ID"
-                        " LEFT JOIN category_label cl ON cl.CLB_ID = c.CLB_ID"
-                        " WHERE s.NAME LIKE ? OR s.DESCRIPTION LIKE ?"
-                        "    OR m.VALUE LIKE ? OR cl.VALUE LIKE ?",
-                        (term, term, term, term),
-                    ).fetchall()
-                    word_ids = {row[0] for row in rows}
-                    matched = word_ids if matched is None else matched & word_ids
-            except Exception as exc:
-                self._status_label.setText(f"Search error: {exc}")
-                logger.error("Keyword search failed: %s", exc)
-                return
-
-            sig_ids = sorted(matched or [])
-            if not sig_ids:
-                self._status_label.setText(f'No results for "{text}"')
-                return
-
-            self._status_label.setText(f'{len(sig_ids)} result(s) for "{text}"')
-            for sig_id in sig_ids:
-                result = self._build_signal_tab(sig_id)
-                if result is not None:
-                    tab_name, widget = result
-                    self._add_result(widget, tab_name)
+            return
+        self._start_worker('keyword', text=text)
 
     def search_with_filters(self, modulations: list, modes: list, locations: list,
-                           categories: list, bandwidth_min_hz: Optional[float] = None,
-                           bandwidth_max_hz: Optional[float] = None) -> list:
+                            categories: list, bandwidth_min_hz: Optional[float] = None,
+                            bandwidth_max_hz: Optional[float] = None) -> list:
         """
-        Search signals applying multiple metadata filters.
-        Empty lists = no filter for that category.
-        Returns list of matching SIG_IDs.
+        Search signals applying multiple metadata filters synchronously.
+        Returns list of matching SIG_IDs. Use search_with_filters_async to display results.
         """
         if self._db_conn is None:
             return []
-
         with self._timed("Signal ID / filter search"):
             try:
                 base_query = "SELECT DISTINCT s.SIG_ID FROM signals s"
-                conditions = []
-                params = []
-
+                conditions, params = [], []
                 if modulations:
                     ph = ",".join("?" * len(modulations))
                     base_query += " LEFT JOIN modulation m ON m.SIG_ID = s.SIG_ID"
                     conditions.append(f"m.VALUE IN ({ph})")
                     params.extend(modulations)
-
                 if modes:
                     ph = ",".join("?" * len(modes))
                     base_query += " LEFT JOIN mode mo ON mo.SIG_ID = s.SIG_ID"
                     conditions.append(f"mo.VALUE IN ({ph})")
                     params.extend(modes)
-
                 if locations:
                     ph = ",".join("?" * len(locations))
                     base_query += " LEFT JOIN location l ON l.SIG_ID = s.SIG_ID"
                     conditions.append(f"l.VALUE IN ({ph})")
                     params.extend(locations)
-
                 if categories:
                     ph = ",".join("?" * len(categories))
                     base_query += (
@@ -687,7 +937,6 @@ class SignalIDPanel(QWidget):
                     )
                     conditions.append(f"cl.VALUE IN ({ph})")
                     params.extend(categories)
-
                 if bandwidth_min_hz is not None or bandwidth_max_hz is not None:
                     base_query += " LEFT JOIN bandwidth b ON b.SIG_ID = s.SIG_ID"
                     if bandwidth_min_hz is not None and bandwidth_max_hz is not None:
@@ -699,10 +948,8 @@ class SignalIDPanel(QWidget):
                     elif bandwidth_max_hz is not None:
                         conditions.append("b.VALUE <= ?")
                         params.append(bandwidth_max_hz)
-
                 if conditions:
                     base_query += " WHERE " + " AND ".join(conditions)
-
                 base_query += " ORDER BY s.SIG_ID"
                 rows = self._db_conn.execute(base_query, params).fetchall()
                 return [row[0] for row in rows]
@@ -710,11 +957,27 @@ class SignalIDPanel(QWidget):
                 logger.error("Filter search failed: %s", exc)
                 return []
 
+    def search_with_filters_async(self, modulations: list = None, modes: list = None,
+                                  locations: list = None, categories: list = None,
+                                  bandwidth_min_hz: Optional[float] = None,
+                                  bandwidth_max_hz: Optional[float] = None):
+        """Run a filter search in the background and populate the panel on completion."""
+        if self._db_path is None:
+            return
+        self._start_worker(
+            'filter',
+            modulations=modulations or [],
+            modes=modes or [],
+            locations=locations or [],
+            categories=categories or [],
+            bandwidth_min_hz=bandwidth_min_hz,
+            bandwidth_max_hz=bandwidth_max_hz,
+        )
+
     def get_filter_values(self) -> dict:
         """Retrieve unique values for all filter types from the database."""
         if self._db_conn is None:
             return {}
-
         with self._timed("Signal ID / load filter values"):
             result = {}
             try:
@@ -739,7 +1002,6 @@ class SignalIDPanel(QWidget):
                 result['categories'] = sorted([r[0] for r in rows if r[0]])
             except Exception as exc:
                 logger.warning("Failed to load filter values: %s", exc)
-
             return result
 
     # ------------------------------------------------------------------
@@ -779,105 +1041,21 @@ class SignalIDPanel(QWidget):
             self._do_search()
 
     # ------------------------------------------------------------------
-    # Search
+    # Search entry points
     # ------------------------------------------------------------------
 
     def _do_search(self):
-        with self._timed("Signal ID / frequency search"):
+        if self._db_path is None:
             self._clear_results()
-            if self._db_conn is None:
-                return
-
-            freq_hz = int(self._current_freq_hz)
-            try:
-                cur = self._db_conn.execute(
-                    "SELECT SIG_ID FROM FREQ_RANGE"
-                    " WHERE (? >= MIN_VALUE) AND (? <= MAX_VALUE)",
-                    (freq_hz, freq_hz),
-                )
-                sig_ids = [row[0] for row in cur.fetchall()]
-            except Exception as exc:
-                self._status_label.setText(f"Query error: {exc}")
-                logger.error("Artemis query failed: %s", exc)
-                return
-
-            if not sig_ids:
-                self._status_label.setText(f"No signals at {freq_hz / 1e6:.4f} MHz")
-                return
-
-            sig_ids = self._rank_by_proximity(sig_ids, freq_hz)
-            self._status_label.setText(f"{len(sig_ids)} signal(s) at {freq_hz / 1e6:.4f} MHz")
-
-            for sig_id in sig_ids:
-                result = self._build_signal_tab(sig_id)
-                if result is not None:
-                    tab_name, widget = result
-                    self._add_result(widget, tab_name)
+            return
+        self._start_worker('freq', freq_hz=int(self._current_freq_hz))
 
     # ------------------------------------------------------------------
-    # Data loading
+    # Tab builder (builds one widget from already-loaded data)
     # ------------------------------------------------------------------
 
-    def _load_signal_data(self, sig_id: int) -> Optional[dict]:
-        with self._timed("Signal ID / load signal data"):
-            conn = self._db_conn
-            try:
-                sig = conn.execute(
-                    "SELECT NAME, DESCRIPTION, URL FROM signals WHERE SIG_ID = ?",
-                    (sig_id,),
-                ).fetchone()
-                if not sig:
-                    return None
-                return {
-                    "sig_id":      sig_id,
-                    "name":        sig["NAME"] or f"Signal {sig_id}",
-                    "description": sig["DESCRIPTION"] or "",
-                    "url":         sig["URL"] or "",
-                    "freqs": conn.execute(
-                        "SELECT VALUE, DESCRIPTION FROM frequency"
-                        " WHERE SIG_ID = ? ORDER BY VALUE", (sig_id,)
-                    ).fetchall(),
-                    "bws": conn.execute(
-                        "SELECT VALUE, DESCRIPTION FROM bandwidth WHERE SIG_ID = ?",
-                        (sig_id,),
-                    ).fetchall(),
-                    "mods": conn.execute(
-                        "SELECT VALUE FROM modulation WHERE SIG_ID = ?", (sig_id,)
-                    ).fetchall(),
-                    "modes": conn.execute(
-                        "SELECT VALUE FROM mode WHERE SIG_ID = ?", (sig_id,)
-                    ).fetchall(),
-                    "locs": conn.execute(
-                        "SELECT VALUE FROM location WHERE SIG_ID = ?", (sig_id,)
-                    ).fetchall(),
-                    "acfs": conn.execute(
-                        "SELECT VALUE FROM acf WHERE SIG_ID = ?", (sig_id,)
-                    ).fetchall(),
-                    "cats": conn.execute(
-                        "SELECT cl.VALUE FROM category c"
-                        " JOIN category_label cl ON c.CLB_ID = cl.CLB_ID"
-                        " WHERE c.SIG_ID = ?", (sig_id,),
-                    ).fetchall(),
-                    "docs": conn.execute(
-                        "SELECT DOC_ID, EXTENSION, NAME, TYPE, PREVIEW"
-                        " FROM documents WHERE SIG_ID = ? ORDER BY TYPE",
-                        (sig_id,),
-                    ).fetchall(),
-                }
-            except Exception as exc:
-                logger.error("Failed to load signal %d: %s", sig_id, exc)
-                return None
-
-    # ------------------------------------------------------------------
-    # Tab builder
-    # ------------------------------------------------------------------
-
-    def _build_signal_tab(self, sig_id: int) -> Optional[Tuple[str, QWidget]]:
+    def _build_signal_tab_from_data(self, data: dict) -> Optional[Tuple[str, QWidget]]:
         with self._timed("Signal ID / build tab"):
-            data = self._load_signal_data(sig_id)
-            if data is None:
-                return None
-
             wrapper = QWidget()
             wrapper.setStyleSheet("background: #0f1724;")
             outer = QVBoxLayout(wrapper)
@@ -897,8 +1075,10 @@ class SignalIDPanel(QWidget):
                 QPushButton:hover { background: #1e3a5f; color: #7dd3fc; }
             """)
 
-            def _open(sig_id=sig_id, data=data):
-                self._open_detail_window(sig_id, data)
+            sig_id = data["sig_id"]
+
+            def _open(sid=sig_id, d=data):
+                self._open_detail_window(sid, d)
 
             open_btn.clicked.connect(_open)
             toolbar.addWidget(open_btn)
@@ -944,26 +1124,6 @@ class SignalIDPanel(QWidget):
                 child.valueChanged.connect(
                     lambda v: self._audio_out.setVolume(v / 100.0)
                 )
-
-    # ------------------------------------------------------------------
-    # Ranking
-    # ------------------------------------------------------------------
-
-    def _rank_by_proximity(self, sig_ids: list, freq_hz: int) -> list:
-        ph = ",".join("?" * len(sig_ids))
-        try:
-            rows = self._db_conn.execute(
-                f"SELECT SIG_ID, MIN(ABS(VALUE - ?)) AS dist"
-                f" FROM frequency WHERE SIG_ID IN ({ph})"
-                f" GROUP BY SIG_ID ORDER BY dist ASC",
-                [freq_hz, *sig_ids],
-            ).fetchall()
-        except Exception as exc:
-            logger.warning("Ranking query failed: %s", exc)
-            return sig_ids
-        ranked = [row[0] for row in rows]
-        missing = [s for s in sig_ids if s not in set(ranked)]
-        return ranked + missing
 
     # ------------------------------------------------------------------
     # Audio player (panel)
@@ -1248,26 +1408,13 @@ class SignalIDWindow(QMainWindow):
         bw_min = self._bw_min_combo.currentData() if self._bw_min_combo.currentIndex() > 0 else None
         bw_max = self._bw_max_combo.currentData() if self._bw_max_combo.currentIndex() > 0 else None
 
-        self.panel._clear_results()
-        if self.panel._db_conn is None:
-            return
-
         if keyword:
             self.panel.search_keywords(keyword)
         elif mods or modes or locs or cats or bw_min is not None or bw_max is not None:
-            sig_ids = self.panel.search_with_filters(
+            self.panel.search_with_filters_async(
                 modulations=mods, modes=modes, locations=locs, categories=cats,
                 bandwidth_min_hz=bw_min, bandwidth_max_hz=bw_max,
             )
-            if not sig_ids:
-                self.panel._status_label.setText("No signals match the selected filters")
-                return
-            self.panel._status_label.setText(f"{len(sig_ids)} signal(s) match filters")
-            for sig_id in sig_ids:
-                result = self.panel._build_signal_tab(sig_id)
-                if result is not None:
-                    tab_name, widget = result
-                    self.panel._add_result(widget, tab_name)
         else:
             self.panel._do_search()
 

@@ -108,7 +108,6 @@ You can filter by category — a few highlights worth noting for your mountain c
 
 ### Data Visualization
 - [ ] Heatmap display
-- [ ] Signal constellation diagram
 - [ ] Spectrogram with zoom
 
 ### Controls
