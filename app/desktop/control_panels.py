@@ -153,12 +153,14 @@ class SingleVFOTab(QWidget):
     paused_changed = Signal(int, bool)        # vfo_id, paused
     decoder_toggled = Signal(int, str, bool)  # vfo_id, decoder_name, enabled
     open_window_requested = Signal(int, str)  # vfo_id, decoder_name
+    locked_changed = Signal(int, bool)        # vfo_id, locked
 
     def __init__(self, vfo_id: int, parent=None):
         super().__init__(parent)
         self.vfo_id = vfo_id
         self._muted = False
         self._paused = False
+        self._locked = False
         self._suppress_signals = False
         self._initUI()
 
@@ -178,6 +180,14 @@ class SingleVFOTab(QWidget):
         self.freq_spin.setSingleStep(0.001)
         self.freq_spin.valueChanged.connect(self._on_freq_changed)
         freq_layout.addWidget(self.freq_spin)
+        self.lock_btn = QPushButton("🔓")
+        self.lock_btn.setCheckable(True)
+        self.lock_btn.setFixedWidth(30)
+        self.lock_btn.setToolTip(
+            "Lock frequency and bandwidth — blocks spectrum clicks, marker drags, and auto-BW"
+        )
+        self.lock_btn.toggled.connect(self._on_lock_toggled)
+        freq_layout.addWidget(self.lock_btn)
         freq_group.setLayout(freq_layout)
         layout.addWidget(freq_group)
 
@@ -257,9 +267,19 @@ class SingleVFOTab(QWidget):
         sig_row = QHBoxLayout()
         sig_row.addWidget(QLabel("Signal:"))
         self.signal_strength_label = QLabel("--- dB")
-        self.signal_strength_label.setFixedWidth(80)
+        self.signal_strength_label.setFixedWidth(64)
         self.signal_strength_label.setStyleSheet("color: #888888;")
         sig_row.addWidget(self.signal_strength_label)
+        self.snr_label = QLabel("SNR: ---")
+        self.snr_label.setFixedWidth(76)
+        self.snr_label.setStyleSheet("color: #888888; font-size: 11px;")
+        self.snr_label.setToolTip("Signal-to-Noise Ratio (dB) — spectral peak vs noise floor")
+        sig_row.addWidget(self.snr_label)
+        self.sinad_label = QLabel("SINAD: ---")
+        self.sinad_label.setFixedWidth(88)
+        self.sinad_label.setStyleSheet("color: #888888; font-size: 11px;")
+        self.sinad_label.setToolTip("SINAD (dB) — audio quality: (S+N+D)/(N+D)")
+        sig_row.addWidget(self.sinad_label)
         sig_row.addStretch()
         audio_layout.addLayout(sig_row)
 
@@ -310,6 +330,8 @@ class SingleVFOTab(QWidget):
 
     def set_frequency_silent(self, freq_hz: float):
         """Update frequency spinbox without emitting frequency_changed."""
+        if self._locked:
+            return
         self._suppress_signals = True
         self.freq_spin.setValue(freq_hz / 1e6)
         self._suppress_signals = False
@@ -320,13 +342,15 @@ class SingleVFOTab(QWidget):
     def get_bandwidth_hz(self) -> float:
         return self.bw_spin.value() * 1e3
 
-    def update_signal_strength(self, db: float, sq_open: bool):
+    def update_signal_strength(self, db: float, sq_open: bool, snr: float = 0.0, sinad: float = 0.0):
         """Update signal strength display. Called from a polling timer in main_window."""
         self.signal_strength_label.setText(f"{db:.1f} dB")
         if sq_open:
             self.signal_strength_label.setStyleSheet("color: #00cc44; font-weight: bold;")
         else:
             self.signal_strength_label.setStyleSheet("color: #cc2222;")
+        self.snr_label.setText(f"SNR: {snr:.1f}")
+        self.sinad_label.setText(f"SINAD: {sinad:.1f}")
 
     def append_decoder_output(self, decoder_name: str, text: str):
         self.decoder_output.append(f"[{decoder_name}] {text}")
@@ -366,6 +390,19 @@ class SingleVFOTab(QWidget):
 
     def is_paused(self) -> bool:
         return self._paused
+
+    def is_locked(self) -> bool:
+        return self._locked
+
+    def _on_lock_toggled(self, locked: bool):
+        self._locked = locked
+        self.freq_spin.setEnabled(not locked)
+        self.bw_spin.setEnabled(not locked)
+        self.lock_btn.setText("🔒" if locked else "🔓")
+        self.lock_btn.setStyleSheet(
+            "color: #f0a500; font-weight: bold;" if locked else ""
+        )
+        self.locked_changed.emit(self.vfo_id, locked)
 
     def _on_squelch_changed(self, value: int):
         self.squelch_label.setText(str(value))
@@ -421,6 +458,7 @@ class VFOTabPanel(QWidget):
     paused_changed = Signal(int, bool)
     decoder_toggled = Signal(int, str, bool)
     open_window_requested = Signal(int, str)  # vfo_id, decoder_name
+    locked_changed = Signal(int, bool)        # vfo_id, locked
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -479,6 +517,7 @@ class VFOTabPanel(QWidget):
         tab.paused_changed.connect(self.paused_changed)
         tab.decoder_toggled.connect(self.decoder_toggled)
         tab.open_window_requested.connect(self.open_window_requested)
+        tab.locked_changed.connect(self.locked_changed)
 
         label = f"VFO {vfo_id + 1}"
         self._tab_widget.addTab(tab, label)
@@ -556,10 +595,10 @@ class VFOTabPanel(QWidget):
         if tab:
             tab.append_decoder_output(decoder_name, text)
 
-    def update_signal_strength(self, vfo_id: int, db: float, sq_open: bool):
+    def update_signal_strength(self, vfo_id: int, db: float, sq_open: bool, snr: float = 0.0, sinad: float = 0.0):
         tab = self._tabs.get(vfo_id)
         if tab:
-            tab.update_signal_strength(db, sq_open)
+            tab.update_signal_strength(db, sq_open, snr, sinad)
 
     def set_vfo_color(self, vfo_id: int, color: str):
         """Set a small colored dot next to the VFO tab label."""
@@ -661,10 +700,14 @@ class VFOTabPanel(QWidget):
             item = tab.decoder_list.item(i)
             item.setCheckState(Qt.CheckState.Checked if item.text() in decoder_names else Qt.CheckState.Unchecked)
 
+    def is_vfo_locked(self, vfo_id: int) -> bool:
+        tab = self._tabs.get(vfo_id)
+        return tab.is_locked() if tab is not None else False
+
     def set_vfo_bandwidth(self, vfo_id: int, bandwidth_hz: float):
         """Update the bandwidth spinbox without re-emitting bandwidth_changed."""
         tab = self._tabs.get(vfo_id)
-        if tab is None:
+        if tab is None or tab.is_locked():
             return
         tab.bw_spin.blockSignals(True)
         tab.bw_spin.setValue(bandwidth_hz / 1e3)

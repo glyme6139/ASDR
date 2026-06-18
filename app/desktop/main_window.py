@@ -431,6 +431,8 @@ class ASURMainWindow(QMainWindow):
 
     def _on_vfo_bandwidth_update(self, vfo_id: int, bandwidth_hz: float):
         """Handle backend-initiated bandwidth change (e.g. TETRA auto-set)."""
+        if self.ctrl_panel.vfo_tab.is_vfo_locked(vfo_id):
+            return
         if vfo_id in self._vfo_state:
             self._vfo_state[vfo_id]['bandwidth_hz'] = bandwidth_hz
             freq_hz = self._vfo_state[vfo_id]['freq_hz']
@@ -451,6 +453,8 @@ class ASURMainWindow(QMainWindow):
         active_id = self.ctrl_panel.vfo_tab.active_vfo_id()
         if active_id is None:
             return
+        if self.ctrl_panel.vfo_tab.is_vfo_locked(active_id):
+            return
         self.ctrl_panel.vfo_tab.set_frequency(active_id, freq_hz)
         self.dsp.set_vfo_frequency(active_id, freq_hz)
         if active_id in self._vfo_state:
@@ -465,6 +469,8 @@ class ASURMainWindow(QMainWindow):
 
     def _on_vfo_marker_changed(self, vfo_id: int, freq_hz: float, bw_hz: float):
         """Apply freq/bw from a spectrum marker drag to the correct VFO."""
+        if self.ctrl_panel.vfo_tab.is_vfo_locked(vfo_id):
+            return
         self.ctrl_panel.vfo_tab.set_frequency(vfo_id, freq_hz)
         self.dsp.set_vfo_frequency(vfo_id, freq_hz)
         if vfo_id in self._vfo_state:
@@ -526,8 +532,8 @@ class ASURMainWindow(QMainWindow):
         self.signal_id_window.panel._do_search()
 
     def _on_signal_strength(self, updates: dict):
-        for vfo_id, (db, is_active) in updates.items():
-            self.ctrl_panel.vfo_tab.update_signal_strength(vfo_id, db, is_active)
+        for vfo_id, (db, is_active, snr, sinad) in updates.items():
+            self.ctrl_panel.vfo_tab.update_signal_strength(vfo_id, db, is_active, snr, sinad)
 
     def _on_signal_strength_fast(self, updates: dict):
         for vfo_id, db in updates.items():

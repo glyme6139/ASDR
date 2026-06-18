@@ -834,7 +834,7 @@ class DSPWorker:
             # Slow path (~150 ms): vfo.signal_db → squelch panels
             if now - self._last_sig_t >= 0.15:
                 self._last_sig_t = now
-                updates = {vfo.id: (vfo.signal_db, vfo.is_active)
+                updates = {vfo.id: (vfo.signal_db, vfo.is_active, vfo.snr, vfo.sinad)
                            for vfo in self.vfo_manager.get_all_vfos()}
                 if updates:
                     self._emit({'type': 'signal_strength', 'updates': updates})

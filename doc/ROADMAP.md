@@ -149,7 +149,6 @@ You can filter by category — a few highlights worth noting for your mountain c
 - [ ] Intermodulation analysis
 
 ### Tools
-- [ ] Spectrum analyzer mode
 - [ ] Network analyzer mode
 - [ ] Time-domain analysis
 - [ ] Frequency counter

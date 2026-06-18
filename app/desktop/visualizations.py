@@ -135,6 +135,9 @@ class SignalOverlay(QObject):
 
         self._hover_locked = False   # True while any annotation is hovered
 
+        # Reposition labels whenever the spectrum Y range auto-scales
+        plot.getViewBox().sigYRangeChanged.connect(self._reposition_labels)
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -164,6 +167,12 @@ class SignalOverlay(QObject):
         self._annotations.clear()
         self._tooltip.hide()
 
+    def _reposition_labels(self):
+        yr = self._plot.getViewBox().viewRange()[1]
+        for _, label in self._annotations:
+            x = label.pos().x()
+            label.setPos(x, yr[1])
+
     def _add(self, sig: dict, yr: tuple):
         center_mhz  = sig['center_hz'] / 1e6
         half_bw_mhz = sig['bandwidth_hz'] / 2e6
@@ -179,7 +188,8 @@ class SignalOverlay(QObject):
         label = pg.TextItem(
             text=sig['modulation_hint'],
             color=_ANNOTATION_COLOR,
-            anchor=(0.5, 1.0),
+            anchor=(0.5, 0.0),
+            fill=pg.mkBrush(10, 12, 20, 180),
         )
         label.setFont(_ANNOTATION_FONT)
         label.setPos(center_mhz, yr[1])
@@ -803,16 +813,18 @@ class WaterfallViewer:
 class MeasurementMarkers:
     """Draggable precision markers for the spectrum/waterfall display.
 
-    Right-click (spectrum or waterfall): cycle frequency markers M1→M2→clear.
-    Shift+right-click (waterfall only):  cycle time markers T1→T2→clear.
-    When two markers of the same type exist a Δ label appears.
+    Right-click spectrum:          cycle freq markers M1→M2→clear.
+    Right-click waterfall:         cycle time markers T1→T2→clear.
+    Shift+right-click waterfall:   cycle freq markers M1→M2→clear.
+    When two markers of the same type exist a Δ label appears inline and
+    the delta text is forwarded to on_delta_changed if provided.
     """
 
     _FREQ_COLORS = ('#ff4444', '#ff8800')  # M1 red, M2 orange
     _TIME_COLORS = ('#44ff44', '#00ff88')  # T1 green, T2 teal
 
     def __init__(self, spec_plot: pg.PlotItem, wf_plot: pg.PlotItem,
-                 waterfall: 'WaterfallViewer'):
+                 waterfall: 'WaterfallViewer', on_delta_changed=None):
         self._sp  = spec_plot
         self._wp  = wf_plot
         self._wf  = waterfall
@@ -821,6 +833,8 @@ class MeasurementMarkers:
         self._tmarkers: list[dict] = []
         self._fdelta: Optional[pg.TextItem] = None
         self._tdelta: Optional[pg.TextItem] = None
+        self._visible = True
+        self._on_delta_changed = on_delta_changed
 
         spec_plot.getViewBox().sigRangeChanged.connect(self._reposition_freq_labels)
         wf_plot.getViewBox().sigRangeChanged.connect(self._reposition_time_labels)
@@ -831,15 +845,42 @@ class MeasurementMarkers:
         """Dispatch a right-click to freq or time markers."""
         if in_waterfall and shift:
             pos = self._wp.getViewBox().mapSceneToView(scene_pos)
+            self._place_freq_marker(pos.x())
+        elif in_waterfall:
+            pos = self._wp.getViewBox().mapSceneToView(scene_pos)
             self._place_time_marker(pos.y())
         else:
-            vb  = self._wp.getViewBox() if in_waterfall else self._sp.getViewBox()
-            pos = vb.mapSceneToView(scene_pos)
+            pos = self._sp.getViewBox().mapSceneToView(scene_pos)
             self._place_freq_marker(pos.x())
 
     def clear_all(self):
         self._clear_freq()
         self._clear_time()
+
+    def set_visible(self, visible: bool):
+        self._visible = visible
+        for m in self._fmarkers:
+            for key in ('line_s', 'line_w', 'lbl_s', 'lbl_w'):
+                m[key].setVisible(visible)
+        for m in self._tmarkers:
+            m['line'].setVisible(visible)
+            m['lbl'].setVisible(visible)
+        if self._fdelta:
+            self._fdelta.setVisible(visible)
+        if self._tdelta:
+            self._tdelta.setVisible(visible)
+
+    def _fire_delta_cb(self):
+        if not self._on_delta_changed:
+            return
+        parts = []
+        if len(self._fmarkers) == 2:
+            f1, f2 = self._fmarkers[0]['freq_mhz'], self._fmarkers[1]['freq_mhz']
+            parts.append(f"Δf {_fmt_hz(abs(f1 - f2) * 1e6)}")
+        if len(self._tmarkers) == 2:
+            t1, t2 = self._tmarkers[0]['secs'], self._tmarkers[1]['secs']
+            parts.append(f"Δt {abs(t1 - t2):.3f}s")
+        self._on_delta_changed("   ".join(parts) if parts else "")
 
     # ------------------------------------------------------------------ freq markers
 
@@ -872,6 +913,10 @@ class MeasurementMarkers:
                  freq_mhz=freq_mhz, idx=idx)
         self._fmarkers.append(m)
 
+        if not self._visible:
+            for item in (line_s, line_w, lbl_s, lbl_w):
+                item.setVisible(False)
+
         line_s.sigPositionChanged.connect(lambda l, _m=m: self._sync_freq(_m, l.value(), from_wf=False))
         line_w.sigPositionChanged.connect(lambda l, _m=m: self._sync_freq(_m, l.value(), from_wf=True))
 
@@ -897,6 +942,7 @@ class MeasurementMarkers:
             self._sp.removeItem(self._fdelta)
             self._fdelta = None
         if len(self._fmarkers) != 2:
+            self._fire_delta_cb()
             return
         f1, f2 = self._fmarkers[0]['freq_mhz'], self._fmarkers[1]['freq_mhz']
         df_hz  = abs(f1 - f2) * 1e6
@@ -908,6 +954,9 @@ class MeasurementMarkers:
         self._fdelta.setZValue(22)
         self._fdelta.setPos(mid, yr[1])
         self._sp.addItem(self._fdelta)
+        if not self._visible:
+            self._fdelta.setVisible(False)
+        self._fire_delta_cb()
 
     def _clear_freq(self):
         for m in self._fmarkers:
@@ -917,6 +966,7 @@ class MeasurementMarkers:
         if self._fdelta:
             self._sp.removeItem(self._fdelta)
             self._fdelta = None
+        self._fire_delta_cb()
 
     def _reposition_freq_labels(self):
         yr = self._sp.getViewBox().viewRange()[1]
@@ -947,6 +997,10 @@ class MeasurementMarkers:
 
         self._wp.addItem(line);  self._wp.addItem(lbl)
 
+        if not self._visible:
+            line.setVisible(False)
+            lbl.setVisible(False)
+
         m = dict(line=line, lbl=lbl, row_y=row_y, secs=secs, idx=idx)
         self._tmarkers.append(m)
         line.sigPositionChanged.connect(lambda l, _m=m: self._sync_time(_m, l.value()))
@@ -965,6 +1019,7 @@ class MeasurementMarkers:
             self._wp.removeItem(self._tdelta)
             self._tdelta = None
         if len(self._tmarkers) != 2:
+            self._fire_delta_cb()
             return
         t1, t2 = self._tmarkers[0]['secs'],  self._tmarkers[1]['secs']
         y1, y2 = self._tmarkers[0]['row_y'], self._tmarkers[1]['row_y']
@@ -977,6 +1032,9 @@ class MeasurementMarkers:
         self._tdelta.setZValue(22)
         self._tdelta.setPos(xr[1], mid_y)
         self._wp.addItem(self._tdelta)
+        if not self._visible:
+            self._tdelta.setVisible(False)
+        self._fire_delta_cb()
 
     def _clear_time(self):
         for m in self._tmarkers:
@@ -985,6 +1043,7 @@ class MeasurementMarkers:
         if self._tdelta:
             self._wp.removeItem(self._tdelta)
             self._tdelta = None
+        self._fire_delta_cb()
 
     def _reposition_time_labels(self):
         xr = self._wp.getViewBox().viewRange()[0]
@@ -1046,10 +1105,31 @@ class VisualizationPanel(QWidget):
         self._pause_btn.clicked.connect(self.toggle_pause)
         bar.addWidget(self._pause_btn)
 
-        self._clear_markers_btn = QPushButton("✕ Markers")
-        self._clear_markers_btn.setFixedWidth(86)
-        self._clear_markers_btn.setToolTip("Clear all measurement markers")
-        bar.addWidget(self._clear_markers_btn)
+        self._markers_btn = QPushButton("◉ Markers")
+        self._markers_btn.setCheckable(True)
+        self._markers_btn.setChecked(True)
+        self._markers_btn.setFixedWidth(90)
+        self._markers_btn.setToolTip(
+            "Show/hide measurement markers\n"
+            "Right-click spectrum → freq marker (M1/M2)\n"
+            "Right-click waterfall → time marker (T1/T2)\n"
+            "Shift+right-click waterfall → freq marker"
+        )
+        bar.addWidget(self._markers_btn)
+
+        self._annot_btn = QPushButton("◈ Sig ID")
+        self._annot_btn.setCheckable(True)
+        self._annot_btn.setChecked(True)
+        self._annot_btn.setFixedWidth(76)
+        self._annot_btn.setToolTip("Show/hide auto-detected signal annotations on the spectrum")
+        self._annot_btn.toggled.connect(self._on_annotations_toggled)
+        bar.addWidget(self._annot_btn)
+
+        self._delta_label = QLabel("")
+        self._delta_label.setStyleSheet(
+            "color: #cccccc; font-family: monospace; font-size: 11px; padding: 0 4px;"
+        )
+        bar.addWidget(self._delta_label)
 
         bar.addStretch()
         bar.addWidget(QLabel("History:"))
@@ -1090,6 +1170,7 @@ class VisualizationPanel(QWidget):
         # Auto-detection overlay (sits below VFO markers in z-order)
         self._signal_overlay = SignalOverlay(spec_plot, parent=self)
         self._signal_overlay.annotation_clicked.connect(self.signal_annotation_clicked)
+        self._annotations_enabled = True
 
         self.spectrum.vfo_drag_active.connect(
             lambda vid, f, bw: self.waterfall.show_vfo_region(vid, f, bw)
@@ -1122,8 +1203,11 @@ class VisualizationPanel(QWidget):
         self._pause_label.raise_()
 
         # Measurement markers
-        self._markers = MeasurementMarkers(spec_plot, wf_plot, self.waterfall)
-        self._clear_markers_btn.clicked.connect(self._markers.clear_all)
+        self._markers = MeasurementMarkers(
+            spec_plot, wf_plot, self.waterfall,
+            on_delta_changed=self._delta_label.setText,
+        )
+        self._markers_btn.clicked.connect(self._toggle_markers)
 
         # Right-click → measurement markers
         self._glw.sigRightClicked.connect(self._on_right_click)
@@ -1247,6 +1331,10 @@ class VisualizationPanel(QWidget):
             self._pause_label.hide()
             self._pause_btn.setText("⏸  Pause")
 
+    def _toggle_markers(self, checked: bool):
+        self._markers.set_visible(checked)
+        self._markers_btn.setText("◉ Markers" if checked else "○ Markers")
+
     def _on_right_click(self, scene_x: float, scene_y: float, shift: bool):
         from PySide6.QtCore import QPointF
         scene_pos = QPointF(scene_x, scene_y)
@@ -1265,10 +1353,12 @@ class VisualizationPanel(QWidget):
         in_sp = (sp_xr[0] <= sp_pt.x() <= sp_xr[1] and
                  sp_yr[0] <= sp_pt.y() <= sp_yr[1])
 
+        # Waterfall right-click → time marker (time axis); shift → freq marker
+        # Spectrum right-click → freq marker
         if in_wf and shift:
-            self._markers._place_time_marker(wf_pt.y())
-        elif in_wf:
             self._markers._place_freq_marker(wf_pt.x())
+        elif in_wf:
+            self._markers._place_time_marker(wf_pt.y())
         elif in_sp:
             self._markers._place_freq_marker(sp_pt.x())
 
@@ -1312,8 +1402,15 @@ class VisualizationPanel(QWidget):
     # Signal auto-detection overlay
     # ------------------------------------------------------------------
 
+    def _on_annotations_toggled(self, enabled: bool):
+        self._annotations_enabled = enabled
+        if not enabled:
+            self._signal_overlay.clear()
+
     def update_signal_annotations(self, signals: list):
         """Refresh all auto-detected signal overlays on the spectrum plot."""
+        if not self._annotations_enabled:
+            return
         with self._profiler.measure("visual / signal annotations"):
             self._signal_overlay.update(signals)
 

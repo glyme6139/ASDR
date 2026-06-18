@@ -57,6 +57,8 @@ class VFO:
 
         self.signal_strength = -100.0
         self.signal_db       = -100.0   # current signal in dBFS (for UI polling)
+        self.snr             = 0.0      # SNR estimate (dB), updated each DSP block
+        self.sinad           = 0.0      # SINAD estimate (dB), updated each DSP block
         self.is_active       = False
         self._sq_state       = False    # hysteresis state: True = squelch open
 
@@ -284,12 +286,15 @@ class VFO:
         if self._iq_decim > 1:
             iq_filtered = iq_filtered[::self._iq_decim]
 
+        self.snr = self._compute_snr(iq_filtered)
+
         # 5. Demodulate at proc_rate
         audio = self._demodulate(iq_filtered)
         if audio is None:
             return None, []
 
         audio = audio * self.settings.volume
+        self.sinad = self._compute_sinad(audio)
 
         # 6. Resample proc_rate → AUDIO_RATE  (small ratio, fast)
         audio_resampled = self._resample_audio(audio)
@@ -366,6 +371,7 @@ class VFO:
         self.signal_strength = float(np.mean(np.abs(iq) ** 2)) * _norm
         signal_db = 10.0 * np.log10(max(self.signal_strength, 1e-10))
         self.signal_db = signal_db
+        self.snr = self._compute_snr(iq)
 
         if self.settings.squelch_enabled:
             was_open = self._sq_state
@@ -416,6 +422,7 @@ class VFO:
             audio = scipy_resample(audio, audio_target)
 
         audio = np.clip(audio, -1.0, 1.0).astype(np.float32)
+        self.sinad = self._compute_sinad(audio)
         self._update_spectrum(audio)
 
         # Run registered decoders on the audio (and optionally IQ).
@@ -439,6 +446,56 @@ class VFO:
                 logger.error(f"Decoder {decoder.name} error: {e}", exc_info=True)
 
         return audio, decoder_results
+
+    # ------------------------------------------------------------------
+    # Signal quality metrics
+    # ------------------------------------------------------------------
+
+    def _compute_snr(self, iq: np.ndarray) -> float:
+        """Estimate SNR (dB) from channel IQ via spectral analysis.
+
+        Noise floor is the mean of the lowest-power 25% of FFT bins; signal
+        level is the spectral peak.  Works for all modulation types because
+        signal energy always concentrates in fewer bins than broadband noise.
+        """
+        n = min(512, len(iq))
+        if n < 64:
+            return self.snr
+        psd = np.abs(np.fft.fft(iq[:n])) ** 2
+        psd_db = 10.0 * np.log10(np.maximum(psd, 1e-20))
+        sorted_db = np.sort(psd_db)
+        noise_floor = float(np.mean(sorted_db[:max(1, n // 4)]))
+        snr_raw = float(np.max(psd_db)) - noise_floor
+        # Exponential smoothing (α=0.3) to reduce frame-to-frame jitter
+        return float(0.7 * self.snr + 0.3 * max(0.0, snr_raw))
+
+    def _compute_sinad(self, audio: np.ndarray) -> float:
+        """Estimate SINAD (dB) from demodulated audio.
+
+        Approximates (S+N+D)/(N+D) by locating the dominant audio spectral
+        peak, notching it out, and measuring the residual power.  For a pure
+        test tone this equals true SINAD; for voice/music it gives a dynamic
+        audio-quality indicator that falls as noise rises.
+        """
+        if len(audio) < 128:
+            return self.sinad
+        total = float(np.mean(audio.astype(np.float64) ** 2))
+        if total < 1e-20:
+            return self.sinad
+        fft = np.fft.rfft(audio)
+        mag = np.abs(fft)
+        half = max(2, len(mag) // 2)
+        peak_bin = int(np.argmax(mag[1:half])) + 1  # skip DC
+        notched = fft.copy()
+        lo = max(1, peak_bin - 3)
+        hi = min(len(notched), peak_bin + 4)
+        notched[lo:hi] = 0.0
+        nd_power = float(np.mean(np.fft.irfft(notched, n=len(audio)) ** 2))
+        if nd_power < 1e-20:
+            sinad_raw = 60.0
+        else:
+            sinad_raw = float(np.clip(10.0 * np.log10(total / nd_power), 0.0, 60.0))
+        return float(0.7 * self.sinad + 0.3 * sinad_raw)
 
     # ------------------------------------------------------------------
     # Channel filter (I/Q separately to keep dtype simple)
@@ -558,6 +615,8 @@ class VFO:
             'squelch_enabled': self.settings.squelch_enabled,
             'enabled':         self.settings.enabled,
             'signal_strength': float(self.signal_strength),
+            'snr':             float(self.snr),
+            'sinad':           float(self.sinad),
             'is_active':       self.is_active,
             'bandwidth':       self.settings.bandwidth,
             'decoders':        [d.name for d in self.decoders],
