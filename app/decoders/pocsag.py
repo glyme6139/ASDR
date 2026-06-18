@@ -483,9 +483,9 @@ class _POCSAGSingleBaudTS:
         if self.batchCwIdx >= 16:
             self.state = 'hunt'
 
-    # Maximum page bits before force-emitting (~80 alpha chars = 560 bits).
+    # Maximum page bits before force-emitting (~400 alpha chars = 2800 bits).
     # Prevents a missed IDLE codeword from merging unrelated messages.
-    _MAX_PAGE_BITS = 560
+    _MAX_PAGE_BITS = 2800
 
     def _process_cw(self, cw: int, cw_idx: int) -> None:
         if ((cw >> 31) & 1) == 0:
